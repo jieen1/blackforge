@@ -18,10 +18,14 @@ class Qwen36Config:
     mtp_hidden_layers: int
     kv_heads: int
     head_dim: int
+    layer_types: tuple[str, ...]
 
     @property
     def is_hybrid(self) -> bool:
         return self.full_attention_layers > 0 and self.gdn_layers > 0
+
+    def layer_type(self, layer_id: int) -> str:
+        return self.layer_types[layer_id]
 
 
 def _text_config(raw: dict[str, Any]) -> dict[str, Any]:
@@ -60,6 +64,7 @@ def parse_qwen36_config(raw: dict[str, Any]) -> Qwen36Config:
         mtp_hidden_layers=int(text["mtp_num_hidden_layers"]),
         kv_heads=int(text["num_key_value_heads"]),
         head_dim=int(text["head_dim"]),
+        layer_types=tuple(str(layer_type) for layer_type in layer_types),
     )
 
 
