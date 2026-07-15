@@ -11,6 +11,7 @@ requires-python = ">=3.10"
 [project.optional-dependencies]
 cuda = ["numpy>=2,<3", "safetensors>=0.6.2", "torch==2.11.0"]
 dev = ["pytest>=8", "ruff>=0.8"]
+serving = ["requests>=2.31", "transformers>=4.45"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
