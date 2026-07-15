@@ -20,7 +20,17 @@ def main() -> None:
     index = load_checkpoint_index(arguments.model_dir)
     index.validate_files()
     index.validate_qwen36(config)
-    print(json.dumps({"checkpoint": index.summary(), "manifest": create_manifest(index, config).__dict__}, indent=2))
+    headers = index.validate_headers()
+    index.validate_nvfp4_companions()
+    print(
+        json.dumps(
+            {
+                "checkpoint": index.summary() | {"validated_header_tensors": len(headers)},
+                "manifest": create_manifest(index, config).__dict__,
+            },
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":

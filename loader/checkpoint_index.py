@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from loader.safetensors_header import TensorMetadata, read_safetensors_header
 from model.qwen36_config import Qwen36Config
 
 
@@ -41,6 +42,40 @@ class CheckpointIndex:
         missing = [name for name in self.shard_names if not (self.model_dir / name).is_file()]
         if missing:
             raise CheckpointError(f"checkpoint is missing shards: {', '.join(missing)}")
+
+    def validate_headers(self) -> dict[str, TensorMetadata]:
+        """Verify every indexed tensor is present in the claimed shard header."""
+        actual_by_shard = {
+            shard_name: read_safetensors_header(self.model_dir / shard_name)
+            for shard_name in self.shard_names
+        }
+        metadata: dict[str, TensorMetadata] = {}
+        for tensor_name, shard_name in self.weight_map.items():
+            try:
+                metadata[tensor_name] = actual_by_shard[shard_name][tensor_name]
+            except KeyError as error:
+                raise CheckpointError(
+                    f"index tensor {tensor_name} is absent from shard {shard_name}"
+                ) from error
+        unexpected = {
+            shard_name: sorted(set(header) - {name for name, shard in self.weight_map.items() if shard == shard_name})
+            for shard_name, header in actual_by_shard.items()
+        }
+        extras = [f"{shard}: {', '.join(names[:3])}" for shard, names in unexpected.items() if names]
+        if extras:
+            raise CheckpointError(f"shard headers contain unindexed tensors: {'; '.join(extras)}")
+        return metadata
+
+    def validate_nvfp4_companions(self) -> None:
+        """NVFP4 packed weights must retain their associated block-scale tensor."""
+        missing = []
+        for packed_name in self.weight_map:
+            if packed_name.endswith(".weight_packed"):
+                scale_name = packed_name.removesuffix(".weight_packed") + ".weight_scale"
+                if scale_name not in self.weight_map:
+                    missing.append(scale_name)
+        if missing:
+            raise CheckpointError(f"NVFP4 packed weights lack scales: {', '.join(missing[:8])}")
 
     def validate_qwen36(self, config: Qwen36Config) -> None:
         """Check names needed by loader work before any 23 GB shard is mapped."""
