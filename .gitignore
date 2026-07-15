@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+build/
+dist/
+*.egg-info/
+
+# Generated artifacts and local model data
+artifacts/
+profiles/*.nsys-rep
+benchmarks/baseline/*.json
+*.safetensors
+*.pt
