@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from collections import Counter
 from dataclasses import dataclass
-import json
 from pathlib import Path
 from typing import Any
 
@@ -57,11 +57,17 @@ class CheckpointIndex:
                 raise CheckpointError(
                     f"index tensor {tensor_name} is absent from shard {shard_name}"
                 ) from error
-        unexpected = {
-            shard_name: sorted(set(header) - {name for name, shard in self.weight_map.items() if shard == shard_name})
-            for shard_name, header in actual_by_shard.items()
-        }
-        extras = [f"{shard}: {', '.join(names[:3])}" for shard, names in unexpected.items() if names]
+        unexpected = {}
+        for shard_name, header in actual_by_shard.items():
+            indexed_names = {
+                name for name, shard in self.weight_map.items() if shard == shard_name
+            }
+            unexpected[shard_name] = sorted(set(header) - indexed_names)
+        extras = [
+            f"{shard}: {', '.join(names[:3])}"
+            for shard, names in unexpected.items()
+            if names
+        ]
         if extras:
             raise CheckpointError(f"shard headers contain unindexed tensors: {'; '.join(extras)}")
         return metadata
@@ -85,7 +91,9 @@ class CheckpointIndex:
         }
         missing_global = sorted(required_global - self.weight_map.keys())
         if missing_global:
-            raise CheckpointError(f"checkpoint is missing global tensors: {', '.join(missing_global)}")
+            raise CheckpointError(
+                f"checkpoint is missing global tensors: {', '.join(missing_global)}"
+            )
 
         missing: list[str] = []
         for layer_id in range(config.num_layers):
@@ -132,7 +140,11 @@ def load_checkpoint_index(model_dir: Path) -> CheckpointIndex:
         raise CheckpointError(f"invalid safetensors index: {index_path}") from error
     if not isinstance(metadata, dict) or not isinstance(weight_map, dict):
         raise CheckpointError("safetensors index must contain object metadata and weight_map")
-    if not all(isinstance(name, str) and isinstance(shard, str) for name, shard in weight_map.items()):
+    valid_weight_map = all(
+        isinstance(name, str) and isinstance(shard, str)
+        for name, shard in weight_map.items()
+    )
+    if not valid_weight_map:
         raise CheckpointError("safetensors weight_map must map tensor names to shard names")
     return CheckpointIndex(
         model_dir=model_dir,

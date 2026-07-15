@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import asdict, dataclass
 from hashlib import sha256
-import json
 from pathlib import Path
 
 from loader.checkpoint_index import CheckpointIndex
 from model.qwen36_config import Qwen36Config
-
 
 PACK_FORMAT_VERSION = 1
 

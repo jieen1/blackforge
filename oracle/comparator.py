@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from math import fsum, isfinite, sqrt
-from typing import Any, Iterable
+from typing import Any
 
 
 def _as_values(value: Any) -> list[float]:

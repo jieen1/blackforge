@@ -32,7 +32,13 @@ def _weight_map() -> dict[str, str]:
         weights[f"{prefix}input_layernorm.weight"] = "model-00001.safetensors"
         weights[f"{prefix}post_attention_layernorm.weight"] = "model-00001.safetensors"
         if layer_id < 48:
-            for name in ("in_proj_qkv.weight", "in_proj_z.weight", "out_proj.weight", "conv1d.weight", "A_log"):
+            for name in (
+                "in_proj_qkv.weight",
+                "in_proj_z.weight",
+                "out_proj.weight",
+                "conv1d.weight",
+                "A_log",
+            ):
                 weights[f"{prefix}linear_attn.{name}"] = "model-00001.safetensors"
         else:
             for name in ("q_proj.weight", "k_proj.weight", "v_proj.weight", "o_proj.weight"):
@@ -66,7 +72,12 @@ def test_index_validates_expected_qwen_topology(tmp_path: Path) -> None:
 def test_index_reports_missing_shards(tmp_path: Path) -> None:
     index_path = tmp_path / "model.safetensors.index.json"
     index_path.write_text(
-        json.dumps({"metadata": {"total_size": 1}, "weight_map": {"lm_head.weight": "missing.safetensors"}}),
+        json.dumps(
+            {
+                "metadata": {"total_size": 1},
+                "weight_map": {"lm_head.weight": "missing.safetensors"},
+            }
+        ),
         encoding="utf-8",
     )
 

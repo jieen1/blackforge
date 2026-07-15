@@ -1,6 +1,6 @@
 import json
-from pathlib import Path
 import struct
+from pathlib import Path
 
 import pytest
 
@@ -36,7 +36,10 @@ def test_header_rejects_truncated_file(tmp_path: Path) -> None:
 
 def test_checkpoint_index_validates_header_against_index(tmp_path: Path) -> None:
     shard = tmp_path / "model.safetensors"
-    _write_header(shard, {"lm_head.weight": {"dtype": "BF16", "shape": [2], "data_offsets": [0, 4]}})
+    _write_header(
+        shard,
+        {"lm_head.weight": {"dtype": "BF16", "shape": [2], "data_offsets": [0, 4]}},
+    )
     (tmp_path / "model.safetensors.index.json").write_text(
         json.dumps({"metadata": {"total_size": 4}, "weight_map": {"lm_head.weight": shard.name}}),
         encoding="utf-8",

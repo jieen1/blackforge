@@ -7,8 +7,8 @@ modified vLLM tree in its serving path.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
 import json
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 

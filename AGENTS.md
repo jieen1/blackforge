@@ -25,6 +25,7 @@ commands:
 
 ```bash
 python -m pip install -e '.[dev]'        # development dependencies
+python -m pip install -e '.[cuda]'       # PyTorch CUDA runtime
 python -m pytest -q                      # correctness suite
 python -m pytest tests/test_gdn.py -q   # focused regression
 python -m benchmarks.workloads            # print frozen W1/W2 contracts
