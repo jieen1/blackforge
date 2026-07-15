@@ -122,6 +122,60 @@ GEMM/launch-gap attribution) was deferred for this reason** and needs a
 dedicated GPU window (a fresh `nsys launch`-wrapped server start; nsys
 cannot attach retroactively to an already-running server).
 
+### Phase 3 continued — full-model nsys time breakdown (2026-07-15, later same day)
+
+Captured with `nsys launch --session-new=... --trace=cuda,osrt --cuda-graph-trace=node --
+python launch_test_server.py ...` (the isolated test server, decode v2 live via
+`SM120_GQA_USE_V2_DECODE_KERNEL=1`), then `nsys start`/`nsys stop` wrapped around
+`real_forward_smoke.py` tests 1+2 (one real prefill + ~46 real single-token
+decode steps against the actual model). Trace:
+`sm120-flash-attention/vllm_integration/profiles/qwenruntime_full_model_20260715_182606.nsys-rep`
+(11 MB, kept on disk).
+
+**GPU kernel time, by category (91,727 kernel launches, 904.76 ms total GPU-busy time):**
+
+| Category | Share | Time |
+|---|---:|---:|
+| GEMM (NVFP4/FP8 linear layers -- QKV/MLP/o_proj/lm_head) | **76.0%** | 687.2 ms |
+| Other (norm/elementwise/copy/misc fused epilogues) | 8.8% | 79.4 ms |
+| GDN (48 linear-attention layers: chunk/conv/delta-rule kernels) | 8.0% | 72.5 ms |
+| Sampling / logits / argmax | 3.7% | 33.1 ms |
+| NVFP4/FP4 quant-dequant (Triton fused epilogues, separate from the GEMM itself) | 2.0% | 18.1 ms |
+| Attention (16 full-attn layers, incl. decode v2) | 1.5% | 13.3 ms |
+| KV-cache / paged-attention scheduling infra | 0.1% | 1.2 ms |
+
+**GEMM dominates by a wide margin -- nearly 10x the next category.** This is
+consistent with this project's own established finding (see root CLAUDE.md's
+validation-methodology notes and the Phase 3 NVFP4 P-requantization work)
+that quantize/dequantize cost dominates over raw matmul on this hardware;
+here it shows up at the whole-model level, not just inside one attention
+kernel. Attention's 1.5% share is genuinely small in context -- decode v2's
+prior +8.6% end-to-end win was won by optimizing a category that was never
+going to move overall model latency by more than a couple of percent on its
+own; the ceiling for *any* further attention-kernel work is bounded by this
+1.5%, GDN's ceiling is bounded by 8.0%, and GEMM's is not meaningfully bounded
+at all by comparison.
+
+**CPU/launch gap: measured, but not at production scale -- flagged, not
+resolved.** GPU kernel busy time (904.76 ms) covers only ~14.7% of the
+captured wall-clock span (6.14 s); most of the remainder is real inter-kernel
+gaps (91,613 gaps under 2 ms each still sum to 4.36 s, dwarfing the 58 gaps
+over 2 ms that sum to 0.88 s -- so this is pervasive small per-kernel
+dispatch overhead, not a few big stalls). This capture used the correctness
+smoke test's workload: **single request, batch=1, qo_len=1 decode, no MTP**
+-- the worst case for launch-overhead-to-compute ratio, since real
+production traffic (concurrency=4, MTP K=3 -> qo_len=4 verify batches) does
+more GPU work per kernel launch, which should shrink this ratio. This number
+should **not** be read as "vLLM's real production CPU/launch gap is ~85%" --
+it is an upper bound from an unrepresentative micro-workload, and needs a
+dedicated concurrency=4/MTP-shaped capture before it can settle
+`项目实施规划.md`'s Phase 0 gate ("如果 CPU/launch gap <3%，不优先重写 C++ scheduler").
+
+**MTP verify/acceptance: not measured this round.** This capture deliberately
+avoided `--with-mtp` to keep the bridge's token-bookkeeping simple and
+reliable for a first real capture. No data exists yet on MTP's own kernel
+share or CPU overhead from this runtime.
+
 ## Verification
 
 - `./.venv/bin/python -m pytest -q`: 27 passed.
@@ -143,25 +197,63 @@ cannot attach retroactively to an already-running server).
 - Added `requests`/`transformers` as an optional `serving` dependency group
   in `pyproject.toml` for the bridge backend and smoke script.
 
+## "下一刀切哪" -- revisited against the real nsys data (2026-07-15)
+
+The candidate list was 48-layer GDN fusion / NVFP4 GEMM weight layout / MTP
+verify-acceptance / CPU launch-scheduling overhead. Against the real
+kernel-time breakdown above:
+
+- **NVFP4 GEMM / weight layout: confirmed as the clear top priority.** 76.0%
+  of GPU kernel time, ~10x every other category combined. Nothing else comes
+  close to this ceiling. This is now a data-backed conclusion, not a guess.
+- **48-layer GDN fusion: real, but demoted below GEMM.** 8.0% of GPU kernel
+  time -- a genuine opportunity (today's chunk_fwd/gated_delta_rule/conv/etc
+  are 9 separate kernel launches per layer), but its total ceiling (even a
+  100% reduction) caps out at 8% of whole-model GPU time. `项目实施规划.md`'s
+  own Phase 6 gate ("如果 profiling 证明 GDN 是主要时间占比，这一阶段的优先级
+  高于 NVFP4 attention") does not fire here: GDN is not the majority, GEMM is.
+- **MTP verify/acceptance: still an open question, not addressed by this
+  capture.** This round's trace deliberately avoided `--with-mtp`; there is
+  currently zero data on its kernel share or CPU overhead from this runtime.
+  Needs its own dedicated capture before it can be ranked.
+- **CPU launch/scheduling overhead: real signal, but from an
+  unrepresentative single-request/batch=1/no-MTP workload** (see above) --
+  neither confirmed nor ruled out as the top-line bottleneck at production
+  concurrency. Given GEMM's raw kernel-busy-time dominance holds even before
+  factoring in any launch gap, it does not currently outrank GEMM as the
+  next cut, but deserves a concurrency=4/MTP-shaped re-measurement rather
+  than being dismissed outright.
+
 ## Next Work, in priority order (real time/complexity estimate per item)
 
-1. **nsys full-model time breakdown** (deferred this round for GPU
-   contention, see above) -- relaunch the isolated test server wrapped in
-   `nsys launch --trace=cuda,osrt`, drive one representative decode/MTP step
-   through `real_forward_smoke.py`, and attribute time to
-   attention/GDN/NVFP4 GEMM/launch-gap per `项目实施规划.md`'s Phase 0 gate.
-   Small effort once GPU is free (~15-30 min).
-2. **Own the physical GPU KV/GDN state addresses directly** (the real
+1. **NVFP4 GEMM / weight layout work** -- now the data-confirmed top
+   priority (76.0% of GPU kernel time). Concretely: profile which specific
+   GEMM shapes dominate (QKV/MLP-gate-up/MLP-down/o_proj/lm_head -- the
+   kernel-name-level `cuda_gpu_kern_sum` report already distinguishes several
+   `cutlass::device_kernel` variants by shape/instance-count, a next capture
+   should break these out by call site), then evaluate `项目实施规划.md`'s
+   own Phase 7 priority order (input-proj > MLP gate-up > MLP down > o_proj
+   > MTP proj > lm_head) against those real shapes before picking one.
+2. **A concurrency=4/MTP-shaped nsys capture** to settle the CPU/launch-gap
+   question and get real MTP verify/acceptance kernel-time data -- both
+   currently open from this round's single-request/no-MTP capture. Needs (2)
+   below first (today's bridge cannot easily drive 4 real concurrent
+   MTP-shaped requests through the HTTP text API without a lot of extra
+   bookkeeping; `real_forward_smoke.py`'s existing 4-slot test proves the
+   mechanism but at max_new_tokens=1, not a real MTP verify batch).
+3. **Own the physical GPU KV/GDN state addresses directly** (the real
    remaining Phase 3 target) -- extract vLLM's `Qwen3_5Model` and
    `qwen_gdn_linear_attn.py` layer modules and drive their `forward()`
    directly against our `HybridCache`'s slot-addressed buffers, replacing
    today's HTTP bridge. This is substantial (multi-session) engineering, not
    a quick follow-on -- see "Real scope of this bridge" above for the exact
    files and why no existing vLLM harness shortcuts it.
-3. **Wire prefill v2 in** once it lands in `SM120GQABackend` on the
+4. **48-layer GDN fusion** -- real but secondary (8.0% ceiling); worth doing
+   once GEMM work is underway, not before.
+5. **Wire prefill v2 in** once it lands in `SM120GQABackend` on the
    sibling project (only decode v2 is registered there as of this round).
-4. Re-run `real_forward_smoke.py`'s continuous-generation check at the full
-   256-1000 token range once (1) or (2) removes the current bridge's
+6. Re-run `real_forward_smoke.py`'s continuous-generation check at the full
+   256-1000 token range once (2) or (3) removes the current bridge's
    per-step full-HTTP-roundtrip cost (today's design re-sends the whole
    growing prefix as text each step; prefix caching should make this cheap
    GPU-side, but the Python/HTTP/tokenizer overhead per call is real and
