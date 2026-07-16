@@ -62,6 +62,7 @@ def build_vllm_config(
         enforce_eager=True,
         disable_log_stats=True,
         language_model_only=True,
+        async_scheduling=False,
     )
     return args.create_engine_config()
 
@@ -295,7 +296,9 @@ class DirectModelRunner:
             attn_metadata_dict, self.vllm_config, slot_mapping=slot_mapping_dict
         ):
             hidden_states = self.model.forward(input_ids, positions)
+        torch.cuda.synchronize()
         logits = self.model.compute_logits(hidden_states)
+        torch.cuda.synchronize()
 
         self.slot_kv_len[slot] += num_new_tokens
         self.slot_gdn_initialized[slot] = True

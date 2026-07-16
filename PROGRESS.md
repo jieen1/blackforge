@@ -60,6 +60,27 @@ Concrete findings (full detail in the design doc's "Current state" section):
   next specific debugging steps, is in the design doc's "deep dive" section
   -- this is genuine, reportable progress (a real bug, isolated and
   partially characterized), not a dead end, but it is **not yet fixed**.
+- **Third pass (2026-07-16, same day, following the coordinator's exact
+  3-step order): a material revision, not a fix.** (1) An unrelated Triton
+  kernel run first does NOT warm up `causal_conv1d_fn`'s first call --
+  worse, it breaks every subsequent call too, ruling out "any GPU kernel
+  primes a global CUDA/Triton state." (2) Instrumented all 48 real GDN
+  layers within one actual forward pass: in one run, **every single
+  conv1d call was fully correct (non-zero) throughout the whole model** --
+  yet the final generated token was still wrong. This means the isolated
+  cold-start bug found earlier is likely **not, by itself, the cause of
+  the wrong output**. (3) A near-identical rerun with only *additional
+  read-only* instrumentation (checking `conv_state` before/after) flipped
+  to all-zero throughout -- a classic Heisenbug signature (behavior
+  changes under observation), pointing to a real race condition somewhere
+  in this stack rather than a deterministic missing-parameter bug. Tried
+  disabling `async_scheduling` + explicit `torch.cuda.synchronize()` as a
+  race-motivated fix -- did not change the (still wrong) output. **The
+  actual root cause of the wrong "Paris" answer remains unidentified** --
+  next step is `compute-sanitizer --tool racecheck` on a minimal repro
+  rather than continued print-based bisection, since instrumentation
+  itself has now been shown to change the outcome. Full detail in the
+  design doc's "third pass" section.
 
 **Do not read this as "single prefill+decode achieved."** The mechanism
 (model loading, KV/GDN tensor ownership, metadata plumbing) is real,

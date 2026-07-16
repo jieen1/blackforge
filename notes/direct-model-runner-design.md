@@ -347,3 +347,103 @@ version bumps.
    model -- that is the scenario this whole effort exists to get right
    (vLLM issue #37554's risk class); a mechanism that merely "runs" without
    that guarantee holding is not yet done.
+
+## 2026-07-16, third pass: followed the coordinator's exact 3-step order --
+## a major, honest revision, not a fix
+
+Ran all three steps as directed. The headline result: **the isolated
+cold-start bug is real, but this round found direct evidence it is
+probably NOT the (sole) cause of the wrong final output** -- a materially
+different, more sobering conclusion than the previous round's framing
+implied. Reporting the full picture, including the parts that don't add up
+cleanly yet.
+
+**Step 1 -- unrelated-Triton-kernel warmup**: ran a trivial, unrelated
+`@triton.jit` elementwise-add kernel first, then `causal_conv1d_fn`, in a
+fresh process. Result: the unrelated kernel does **not** fix
+`causal_conv1d_fn`'s first call (still all-zero) -- and, more surprising,
+it made every *subsequent* call zero too (previously, repeating the same
+causal_conv1d_fn call alone showed call#0 bad / call#1+ good). So "any GPU
+kernel warms up some global CUDA/Triton state" is **ruled out** -- whatever
+is happening is either specific to `causal_conv1d_fn`'s own kernel-variant
+cache, or an interfering-kernel-order effect, not a generic first-kernel-
+in-process phenomenon.
+
+**Step 2 -- instrumented all 48 real GDN-layer calls within one actual
+forward pass** (both the runner's own `_warmup()` prefill and the
+subsequent real "The capital of France is" prefill): every single one of
+the 96 total calls (48 in warmup + 48 in the real prefill) showed **fully
+non-zero, plausible output** (the ~31520/51200 pattern on roughly every
+4th GDN layer is consistent with real SiLU sparsity, not an error). In
+other words: **inside the real model, `causal_conv1d_fn` was working
+correctly the entire time in this run** -- and yet the model's final
+generated token was still wrong (the same `'东'` garbage as every previous
+round). This is the load-bearing finding of this pass: if conv1d's own
+output is fine throughout a run that still produces wrong text, the
+isolated cold-start bug found last round is **not, by itself, sufficient
+to explain the wrong output** -- it may be a real, independent bug that
+happens to coexist, not the root cause of the "Paris" failure.
+
+**Step 3 -- checked conv_state before/after on that same kind of run,
+separately**: here the results stopped agreeing with step 2. In a rerun
+with added before/after `conv_states.count_nonzero()` instrumentation
+(the *only* code difference from step 2's script -- purely additional
+reads, no writes), **all 48 real-prefill calls came back all-zero this
+time** (both `out` and `conv_state`), and the model's output changed too
+(`' is'` instead of `'东'` as the first token -- still wrong, just
+differently wrong). Rerunning nominally-identical code and getting
+opposite conv1d-output results, seemingly triggered by adding read-only
+diagnostic instrumentation, is a classic Heisenbug signature (behavior
+changes when observed) -- strong circumstantial evidence of a genuine race
+condition somewhere in this stack, not a deterministic missing-parameter
+bug. This also means **the isolated single-process repro from last round,
+while real and reproducible in isolation, does not behave identically
+inside the full 64-layer model** -- the two contexts are not interchangeable
+for debugging purposes.
+
+**Tried, as a race-condition-motivated hypothesis, and it did not fix the
+output**: set `EngineArgs(async_scheduling=False)` (this project's log
+output had shown "Asynchronous scheduling is enabled" -- a real vLLM
+feature this minimal runner does not otherwise replicate the careful
+buffer-lifetime handling for) and added explicit `torch.cuda.synchronize()`
+calls immediately after `model.forward()` and after `compute_logits()`.
+Result: identical wrong output (`'东Ё¨¨¨...'`) to before -- this specific
+async/sync hypothesis is now also ruled out, at least in this simple form.
+
+**Where this leaves the investigation, honestly**: three real, reproducible
+findings that do not yet form one coherent story:
+1. `causal_conv1d_fn`'s first-ever call in an isolated process is
+   deterministically all-zero (very reproducible, simple repro).
+2. Inside the real model, conv1d's own output has been observed BOTH
+   fully-correct-throughout (step 2) AND all-zero-throughout (step 3) across
+   different runs of what should be the same code path -- i.e. genuinely
+   non-deterministic at the full-model level, not just at cold-start.
+3. The model's *final* output has been wrong in every run so far
+   regardless of which of the above conv1d behaviors occurred in that run
+   -- meaning conv1d correctness this round did not correlate with output
+   correctness. The actual root cause of the wrong "Paris" answer is more
+   likely elsewhere (or is itself a manifestation of the same
+   non-determinism showing up in a different layer/kernel each run) --
+   **not yet identified**.
+
+**Next steps, revised given the non-determinism finding**:
+1. Stop trying to root-cause this with print/instrumentation-based
+   bisection -- this round's own step 2 vs step 3 contradiction shows that
+   approach can change the outcome being investigated. Use
+   `compute-sanitizer --tool racecheck` (this project's own established
+   heavy-but-authoritative tool, already used successfully in the sibling
+   project) against a minimal repro to get a real race-condition diagnosis
+   instead of continued black-box guessing. Expect it to be slow (10-50x
+   per this project's own prior experience) -- run it on the isolated
+   single-call repro, not the full 64-layer model, to keep it tractable.
+2. Once (1) either confirms or rules out a race condition, re-run the
+   exact step-2/step-3 scripts (kept as scratch content in this doc's
+   prior section, worth committing as permanent regression probes now)
+   several more times each to get an actual failure RATE, not just one
+   data point each way -- needed to tell "flaky" from "environment
+   changed between runs for an unrelated reason."
+3. Given conv1d correctness didn't correlate with output correctness this
+   round, broaden the search: instrument the ATTENTION layers' output
+   similarly (not just GDN/conv1d) across a couple of runs, to see if
+   non-determinism (or a deterministic bug) shows up there instead/also --
+   this round only looked at GDN.
