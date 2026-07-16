@@ -141,6 +141,57 @@ KV/GDN cache tensors) is established. The throwaway `SLOT=1` test file
 was deleted once the general fix landed in `direct_model_runner.py`
 itself; no separate hack file remains in the repo.
 
+### Phase 3, batch decode support (2026-07-16) — real batched metadata, batch=1 verified 19/20, batch>=2's "mismatch" traced to a pre-existing real-vLLM effect (not our bug)
+
+`decode_batch()` used to be a Python loop calling single-request
+`decode()` per slot -- not a real GPU batch. Replaced with genuinely
+batched metadata construction: new `build_attention_metadata_batch`/
+`build_gdn_metadata_batch` functions (kept separate from the
+single-request builders to avoid regressing the just-closed Stage C/D
+loop), generalizing the real `SM120GQAMetadataBuilder`/
+`GDNAttentionMetadataBuilder`'s own pure-decode-batch CSR construction
+(read directly from vLLM source to get the convention right) from one
+request to N requests across this project's fixed physical slots.
+`DirectModelRunner._forward_batch()`/`.decode_batch()` now issue exactly
+ONE `model.forward()` call for every listed slot. New test harness
+`benchmarks/batch_decode_regression.py`: prefills two independent,
+identically-initialized slot groups per test (avoids the confound of
+testing before/after on the same slot), decodes one via the
+already-verified single-request path and the other via one real batched
+call, and diffs logits bytewise (SHA-256 hash).
+
+**Batch=1: 19/20 PASS** (1 failure was an `hf-mirror.com` `504 Gateway
+Timeout` during model-config resolution, before any model/kernel code
+ran -- unrelated to decode_batch; worked around via `HF_HUB_OFFLINE=1`
+since the checkpoint is already fully cached locally).
+
+**Batch=2: initial result 0/2 bytewise match -- investigated, NOT a
+decode_batch bug.** Both rows (duplicate prompts, to rule out cross-row
+addressing) gave an identical wrong-vs-reference hash to each other (not
+request-order corruption, but genuinely different from the single-request
+value). Root-caused with a real-vLLM-only diagnostic (no code of ours):
+`LLM.generate()` on "The capital of France is" **alone** vs
+**concurrently with a second real request**, greedy (`temperature=0.0`),
+reproduced deterministically twice:
+
+```
+ALONE      : " Paris.\n\n<think>\nHere's a"
+TOGETHER[A]: " Paris.\n\n<think>\n\n</think>\n\nThat"
+```
+
+**This proves the numerical divergence is a pre-existing property of the
+real production stack (almost certainly floating-point non-associativity
+in batched GEMM -- different M-dimension kernel/tile selection changes
+summation order/rounding, a well-documented industry-wide "batch
+invariance" issue), not a bug in this round's hand-built batch metadata.**
+Consistent with batch=1 passing cleanly (no alternate M-dimension path
+exists at batch=1). **Practical implication**: requiring bytewise-identical
+logits between single-request and N-request-batched paths is not an
+achievable bar -- not even vLLM's own real production path meets it. This
+is a methodology decision (what tolerance/metric should replace bytewise
+match for steps 2-8 of the validation ladder) flagged to the coordinator
+rather than decided unilaterally before proceeding further.
+
 ### Phase 3, main-line redirect (2026-07-16) — direct model runner, replacing the HTTP bridge
 
 The sibling `sm120-flash-attention` project's attention-kernel-tuning main
