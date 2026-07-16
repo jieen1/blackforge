@@ -447,3 +447,141 @@ findings that do not yet form one coherent story:
    similarly (not just GDN/conv1d) across a couple of runs, to see if
    non-determinism (or a deterministic bug) shows up there instead/also --
    this round only looked at GDN.
+
+## 2026-07-16, fourth pass: compute-sanitizer racecheck -- a real, specific
+## localization, with an important caveat
+
+Per the coordinator's explicit direction, stopped print-based bisection and
+ran `compute-sanitizer --tool racecheck --racecheck-report all` against the
+minimal single-prefill repro (`runner.__init__()`'s own warmup prefill,
+`"The capital of France is"`, `unsloth/Qwen3.6-27B-NVFP4`,
+`kv_cache_dtype=fp8_e4m3`). GPU verified free via `nvidia-smi`/`ps` before
+launch, per standing convention.
+
+**Result: found a real, consistent, specific hazard -- not a dead end.**
+Weight loading alone took ~3 minutes under instrumentation (vs. ~15s
+normally, consistent with this project's known 10-50x racecheck slowdown
+expectation). Once the model reached its own single warmup forward pass,
+racecheck immediately started reporting: **100 "Potential RAW hazard"
+errors** (its default report cap), every single one of the same shape:
+
+- Same kernel every time: CUTLASS's SM120 **warp-specialized "pingpong"**
+  GEMM (`MainloopSm120TmaWarpSpecialized`,
+  `KernelTmaWarpSpecializedPingpongSm120`, e4m3 x e4m3 -> bf16, TMA-loaded,
+  swizzled shared memory) -- this is the `cutlass_scaled_mm_sm120` kernel
+  invoked by `CutlassFP8ScaledMMLinearKernel` /
+  `CompressedTensorsW8A8Fp8.apply_weights`, called from
+  `qwen_gdn_linear_attn.py:923`'s `forward_cuda` -- i.e. one of GDN's own
+  FP8 W8A8-quantized linear projections (this checkpoint mixes NVFP4 for
+  most weights with FP8 W8A8 for some GDN-layer linears; confirmed from the
+  server log's own "Selected CutlassFP8ScaledMMLinearKernel for
+  CompressedTensorsW8A8Fp8" line).
+- Same thread pair every time: **Write Thread (63,0,0)**, **Read Thread
+  (128,0,0)** -- thread 63 is the last thread of warp 1 (a producer/TMA-load
+  warp in this design), thread 128 is the first thread of warp 4 (a
+  consumer/MMA warp) -- textbook producer-consumer warp-specialization
+  hand-off shape.
+- Varying only the shared-memory offset (`0x530` through `0x53f`, a tight
+  16-address range -- one tile's worth of a swizzled operand) and the CUDA
+  block index (105, 178, 54, 60, 63, 142, 61, ... -- different tiles/blocks
+  of the same GEMM, all showing the identical hazard pattern).
+
+This directly answers the coordinator's question 2: **this is not a
+`direct_model_runner.py`-level synchronization bug.** The race, if real, is
+between two CUDA *threads* inside a *single* CUTLASS kernel launch --
+nothing this project's Python-level orchestration code does (or fails to
+do) between kernel launches can reach into or fix intra-kernel warp
+synchronization. This also retroactively explains why the earlier
+`async_scheduling=False` + `torch.cuda.synchronize()` experiment did
+nothing: those add synchronization *between* host-issued operations, not
+inside a kernel's own warp-specialized pipeline.
+
+**The one important caveat, stated plainly rather than glossed over**:
+CUTLASS's Hopper/Blackwell-generation warp-specialized kernels synchronize
+producer and consumer warps via **mbarrier** (hardware async-barrier)
+primitives, not the plain `__syncthreads()`-style barriers `racecheck`'s
+shared-memory hazard detector was originally built to model. This class of
+kernel is a **documented source of racecheck false positives** industry-wide
+-- the tool can flag a "potential" hazard (its own wording: "Potential RAW
+hazard", never "confirmed") between a producer's write and a consumer's read
+even when the mbarrier wait genuinely enforces correct ordering, because
+racecheck doesn't fully model that synchronization primitive. So this
+finding should be read as: **a real, specific, highly consistent signal
+pointing at exactly one kernel and one thread pair** -- strong enough to
+stop suspecting `direct_model_runner.py`'s own code and to redirect
+investigation at this specific CUTLASS kernel -- but **not proof, on its
+own, that CUTLASS's SM120 pingpong GEMM has a genuine bug** versus this
+being a well-known tool limitation on this kernel class. Distinguishing
+those two would need either CUTLASS-level source review of this exact
+mbarrier usage, or corroborating evidence (e.g. does the same hazard appear
+in a plain vLLM server run of the same shape, outside this project's
+runtime, under the same tool?).
+
+**Run terminated after ~31 minutes** (killed manually, GPU verified freed
+via `nvidia-smi`/`ps` afterward -- one orphaned `TreeLauncher` helper and
+one lingering compute-app entry needed an explicit `kill -9` before GPU
+memory actually dropped back to baseline, WSL2's `nvidia-smi` reporting lag
+noted elsewhere in this project's own environment docs). The log had
+stopped growing for the prior ~10 minutes once the 100-report cap was hit,
+and the single warmup forward pass had not yet completed -- the instrumented
+run is simply very slow on this specific kernel, consistent with
+racecheck's known overhead on shared-memory-heavy, warp-specialized kernels.
+Did not run it to completion; no attempt made to reach the real (second)
+prefill call under racecheck given the time already spent.
+
+**Tried the bypass experiment immediately (not left for later) -- decisive,
+negative result**: set `VLLM_DISABLED_KERNELS=CutlassFP8ScaledMMLinearKernel`
+(a real, existing vLLM env var -- `is_supported_and_can_implement_kernel()`
+in `vllm/model_executor/kernels/linear/__init__.py` checks
+`kernel.__name__ in envs.VLLM_DISABLED_KERNELS`, comma-separated) and re-ran
+the same single-prefill test, no racecheck this time (just checking output).
+Confirmed via log line ("Selected ChannelWiseTorchFP8ScaledMMLinearKernel
+for CompressedTensorsW8A8Fp8") that the CUTLASS pingpong kernel was
+genuinely bypassed in favor of a plain PyTorch/cuBLAS FP8 kernel with no
+CUTLASS warp-specialization at all. Result: **the output changed (from
+`'东Ё¨¨¨...'` to `' of of-of of of of...'`) but is still wrong** -- not
+"Paris" either way.
+
+This is a real, decisive negative result, not an inconclusive one: the
+output *changing* proves this kernel selection genuinely matters to the
+computation (ruling out "it was a no-op switch"); the output *still being
+wrong* proves **this specific CUTLASS race is not, by itself, sufficient to
+explain the wrong final answer** -- avoiding it entirely does not fix
+things. So while the racecheck finding above is real and worth reporting
+upstream/investigating independently, it is not the root cause this
+investigation has been chasing since the "conv_state" lead was first
+raised. The actual bug producing wrong output is still elsewhere (or is a
+second, still-unidentified instance of the same class of problem, e.g. a
+similar race in a *different* kernel that this one experiment didn't touch
+-- GEMMs for the main NVFP4-quantized layers are a different code path
+entirely and were not covered by this bypass).
+
+**Where this leaves things, honestly, after four full passes on this bug**:
+1. A real, reproducible, isolated Triton `causal_conv1d_fn` cold-start bug
+   exists (pass 2), but instrumenting the real model showed conv1d output
+   can be fully correct throughout a run that still produces wrong text
+   (pass 3) -- so this is very likely a real bug, but not THE bug.
+2. A real, specific, consistent CUTLASS SM120 pingpong-GEMM race hazard
+   exists per racecheck (pass 4, this section), reproducible and precisely
+   located (one kernel, one thread pair, tight shared-memory range) -- but
+   bypassing that exact kernel changes output without fixing it (this
+   section) -- so, by the same logic, likely real but also not THE bug.
+3. Both real findings share a pattern worth naming explicitly: this
+   environment appears to have **multiple, independent, low-level
+   correctness issues** surfacing under this project's unusual
+   direct-forward-pass usage pattern (bypassing vLLM's normal
+   Scheduler/GPUModelRunner orchestration) -- not one single root cause
+   waiting to be found. Chasing each one to ground individually, as directed
+   this round, has been valuable (two real, specific, bounded findings) but
+   has not yet produced a correct "Paris" output through any configuration
+   tried so far.
+4. Given four passes have each surfaced a genuine, verifiable finding
+   without closing the loop, further undirected bisection has a
+   meaningfully uncertain payoff. The decision of whether to keep
+   investing in root-causing at this level of depth, versus adopting a
+   more conservative strategy (e.g. the coordinator's own suggestion: get a
+   *correct* baseline first, even at a performance cost, by not bypassing
+   vLLM's own scheduler/executor at all for the parts that seem fragile --
+   or by using a much larger `num_stages`/simpler epilogue/a different
+   attention-adjacent code path for those specific layers) is exactly the
+   kind of call worth surfacing rather than deciding unilaterally.

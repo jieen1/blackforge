@@ -81,6 +81,38 @@ Concrete findings (full detail in the design doc's "Current state" section):
   rather than continued print-based bisection, since instrumentation
   itself has now been shown to change the outcome. Full detail in the
   design doc's "third pass" section.
+- **Fourth pass (2026-07-16, same day): ran racecheck, found a real
+  specific hazard, then disproved it as the root cause -- decisive but
+  still not a fix.** `compute-sanitizer --tool racecheck` on the minimal
+  single-prefill repro found **100 consistent "Potential RAW hazard"
+  reports**, every one in the *same* kernel and thread pair: CUTLASS's
+  SM120 warp-specialized "pingpong" GEMM (`cutlass_scaled_mm_sm120`, used
+  by `CutlassFP8ScaledMMLinearKernel` for one of GDN's FP8 W8A8-quantized
+  linear projections), Write Thread 63 racing Read Thread 128 across many
+  shared-memory tiles. This is a real, specific, reproducible localization
+  -- and it directly rules out a `direct_model_runner.py`-level
+  synchronization bug (the race is between two CUDA threads *inside one
+  kernel launch*; nothing at the Python orchestration level can reach
+  intra-kernel warp synchronization). One caveat: TMA/mbarrier-synchronized
+  warp-specialized kernels are a documented source of racecheck false
+  positives, so this alone doesn't prove a genuine CUTLASS bug.
+  **Immediately tried the obvious bypass**: `VLLM_DISABLED_KERNELS=CutlassFP8ScaledMMLinearKernel`
+  forced a fallback to a plain PyTorch FP8 kernel (confirmed via log:
+  "Selected ChannelWiseTorchFP8ScaledMMLinearKernel"). Result: **the output
+  changed (proving this kernel matters) but is still wrong** (still not
+  "Paris", just differently wrong) -- **decisive evidence this specific
+  race, real as it is, is not the (sole) root cause**. After four full
+  passes, two independent, real, specific low-level findings have been
+  surfaced (the conv1d cold-start bug, this CUTLASS race) and both have
+  been shown to be real but insufficient to explain the wrong output alone
+  -- suggesting multiple independent issues in this unusual
+  direct-forward-pass usage pattern, not one single root cause. Full
+  detail, including exact repro commands, in the design doc's "fourth
+  pass" section -- **this is the point to decide, with the coordinator,
+  whether to keep root-causing at this depth or pivot to a more
+  conservative strategy** (e.g. a correctness-first baseline that doesn't
+  bypass vLLM's own scheduler/executor for the fragile parts, even at a
+  performance cost).
 
 **Do not read this as "single prefill+decode achieved."** The mechanism
 (model loading, KV/GDN tensor ownership, metadata plumbing) is real,
