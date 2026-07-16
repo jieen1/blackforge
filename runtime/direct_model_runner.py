@@ -792,10 +792,12 @@ class DirectModelRunner:
 
 
 class CapturedBatchDecodeGraph:
-    """CUDA-graph-captured qo_len=1 batch decode for a FIXED batch size,
-    replayable at ANY per-slot kv_len up to this runtime's per-slot
-    capacity (``blocks_per_slot * block_size``) -- not just whatever
-    dummy shape was used at capture time.
+    """CUDA-graph-captured batch decode/verify for a FIXED batch size and
+    FIXED ``qo_len`` (1 = pure decode, >1 = MTP/speculative-decode verify,
+    e.g. 4 for K=3 draft + 1 bonus token), replayable at ANY per-slot
+    kv_len up to this runtime's per-slot capacity (``blocks_per_slot *
+    block_size``) -- not just whatever dummy shape was used at capture
+    time.
 
     2026-07-16, CUDA Graph round: this project's own read of
     ``vllm/v1/attention/backends/sm120_gqa.py``'s documented history (a
@@ -819,6 +821,21 @@ class CapturedBatchDecodeGraph:
        bounds every real kv_len up to that capacity, not just the
        capture-time value.
 
+    2026-07-16, MTP extension (qo_len>1): GDN's chunked/"prefill" metadata
+    fields (``chunk_indices``/``chunk_offsets``/``nums_dict``/
+    ``batch_ptr``/``token_chunk_offset_ptr``/``has_initial_state``) depend
+    ONLY on the query-length structure (how many tokens per request), not
+    on which physical slot each request maps to or on kv_len -- so for a
+    FIXED (batch_size, qo_len) graph they are genuinely CONSTANT across
+    every replay (unlike ``kv_page_indices``/``state_indices``, which
+    depend on live kv_len/slot identity and must be refilled every
+    replay). Computed once in ``__init__`` via
+    ``build_gdn_metadata_batch(..., slot_initialized=[True]*batch_size)``
+    and reused as-is -- fixed address by construction of never being
+    recreated, no ``.copy_()`` needed. ``has_initial_state=True`` for
+    every slot is this class's scope: MTP verify only ever happens after
+    a slot's own prior prefill/decode has established real context.
+
     A replayed CUDA graph is a pre-recorded sequence of GPU kernel
     launches, NOT a re-execution of Python control flow -- ``model
     .forward()`` (the Python function) is only ever actually called
@@ -834,12 +851,6 @@ class CapturedBatchDecodeGraph:
     TARGET_SPLITS = 16
 
     def __init__(self, runner: "DirectModelRunner", batch_size: int, qo_len: int = 1) -> None:
-        if qo_len != 1:
-            raise NotImplementedError(
-                "CapturedBatchDecodeGraph currently only supports qo_len=1 "
-                "(pure decode, non-spec GDN path) -- MTP (qo_len>1) capture "
-                "is a separate, not-yet-implemented follow-on step"
-            )
         self.runner = runner
         self.batch_size = batch_size
         self.qo_len = qo_len
@@ -851,31 +862,50 @@ class CapturedBatchDecodeGraph:
         self.fixed_max_num_splits = self.TARGET_SPLITS
 
         num_reqs = batch_size
+        n_tokens = num_reqs * qo_len
 
         # Attention metadata static buffers -- worst-case sized (a request
         # could in principle use this slot's entire page capacity).
-        # qo_indptr is CONSTANT for a fixed (batch_size, qo_len=1) pair
-        # (just [0, 1, 2, ..., num_reqs]) -- computed once, never refilled.
-        self.static_qo_indptr = torch.arange(0, num_reqs + 1, dtype=torch.int32, device=device)
+        # qo_indptr is CONSTANT for a fixed (batch_size, qo_len) pair
+        # ([0, qo_len, 2*qo_len, ..., num_reqs*qo_len]) -- computed once,
+        # never refilled.
+        self.static_qo_indptr = torch.arange(0, num_reqs + 1, dtype=torch.int32, device=device) * qo_len
         self.static_kv_page_indptr = torch.zeros(num_reqs + 1, dtype=torch.int32, device=device)
         self.static_kv_page_indices = torch.zeros(num_reqs * blocks_per_slot, dtype=torch.int32, device=device)
         self.static_kv_last_page_len = torch.zeros(num_reqs, dtype=torch.int32, device=device)
 
-        # GDN metadata static buffers (qo_len=1 non-spec-decode path only).
-        # non_spec_query_start_loc is likewise constant.
+        # GDN metadata static buffers. non_spec_query_start_loc is
+        # likewise constant; state_indices is per-replay-filled (depends
+        # on slot_ids, not just batch_size/qo_len).
         self.static_state_indices = torch.zeros(num_reqs, dtype=torch.int32, device=device)
-        self.static_non_spec_qsl = torch.arange(0, num_reqs + 1, dtype=torch.int32, device=device)
+        self.static_non_spec_qsl = torch.arange(0, num_reqs + 1, dtype=torch.int32, device=device) * qo_len
 
         # Model I/O static buffers.
-        self.static_input_ids = torch.zeros(num_reqs, dtype=torch.long, device=device)
-        self.static_positions = torch.zeros(num_reqs, dtype=torch.long, device=device)
-        self.static_slot_mapping = torch.zeros(num_reqs, dtype=torch.long, device=device)
+        self.static_input_ids = torch.zeros(n_tokens, dtype=torch.long, device=device)
+        self.static_positions = torch.zeros(n_tokens, dtype=torch.long, device=device)
+        self.static_slot_mapping = torch.zeros(n_tokens, dtype=torch.long, device=device)
+
+        # MTP-only (qo_len>1): the chunked/"prefill" GDN fields that
+        # depend only on query-length structure -- computed once, see the
+        # class docstring's "MTP extension" section.
+        self._const_gdn_extra: GDNAttentionMetadata | None = None
+        if qo_len > 1:
+            self._const_gdn_extra = build_gdn_metadata_batch(
+                slots=list(range(num_reqs)),
+                device=device,
+                qo_len=qo_len,
+                slot_initialized=[True] * num_reqs,
+            )
 
         self._graph: torch.cuda.CUDAGraph | None = None
         self._static_logits: torch.Tensor | None = None
 
-    def _fill_buffers(self, slot_ids: list[int], token_ids: list[int], kv_lengths: list[int]) -> None:
+    def _fill_buffers(self, slot_ids: list[int], token_ids, kv_lengths: list[int]) -> None:
         runner = self.runner
+        if self.qo_len == 1:
+            flat_token_ids = token_ids
+        else:
+            flat_token_ids = [tok for slot_tokens in token_ids for tok in slot_tokens]
         attn_meta = build_attention_metadata_batch(
             slots=slot_ids,
             prior_kv_lens=kv_lengths,
@@ -886,7 +916,12 @@ class CapturedBatchDecodeGraph:
             fixed_kv_split_size=self.fixed_kv_split_size,
             fixed_max_num_splits=self.fixed_max_num_splits,
         )
-        gdn_meta = build_gdn_metadata_batch(slots=slot_ids, device=runner.device, qo_len=self.qo_len)
+        gdn_meta = build_gdn_metadata_batch(
+            slots=slot_ids,
+            device=runner.device,
+            qo_len=self.qo_len,
+            slot_initialized=[True] * self.batch_size if self.qo_len > 1 else None,
+        )
         slot_mapping = runner._slot_mapping_batch(slot_ids, kv_lengths, qo_len=self.qo_len)
 
         self.static_kv_page_indptr.copy_(attn_meta.kv_page_indptr)
@@ -894,36 +929,67 @@ class CapturedBatchDecodeGraph:
         self.static_kv_page_indices[: attn_meta.kv_page_indices.shape[0]].copy_(attn_meta.kv_page_indices)
         self.static_kv_last_page_len.copy_(attn_meta.kv_last_page_len)
         self.static_state_indices.copy_(gdn_meta.non_spec_state_indices_tensor)
-        self.static_input_ids.copy_(torch.tensor(token_ids, dtype=torch.long, device=runner.device))
-        self.static_positions.copy_(torch.tensor(kv_lengths, dtype=torch.long, device=runner.device))
+        self.static_input_ids.copy_(torch.tensor(flat_token_ids, dtype=torch.long, device=runner.device))
+        self.static_positions.copy_(
+            torch.tensor(
+                [kv_len + j for kv_len in kv_lengths for j in range(self.qo_len)],
+                dtype=torch.long,
+                device=runner.device,
+            )
+        )
         self.static_slot_mapping.copy_(slot_mapping)
 
     def _static_metadata_dicts(self) -> tuple[dict, dict]:
         runner = self.runner
+        n_tokens = self.batch_size * self.qo_len
         attn_meta = SM120GQAMetadata(
-            num_actual_tokens=self.batch_size,
+            num_actual_tokens=n_tokens,
             num_reqs=self.batch_size,
             qo_indptr=self.static_qo_indptr,
             kv_page_indptr=self.static_kv_page_indptr,
             kv_page_indices=self.static_kv_page_indices,
             kv_last_page_len=self.static_kv_last_page_len,
             page_size=runner.block_size,
-            is_pure_decode=True,
+            is_pure_decode=(self.qo_len == 1),
             kv_split_size=self.fixed_kv_split_size,
             max_num_splits=self.fixed_max_num_splits,
-            decode_qo_len=1,
+            decode_qo_len=self.qo_len,
         )
-        gdn_meta = GDNAttentionMetadata(
-            num_prefills=0,
-            num_prefill_tokens=0,
-            num_decodes=self.batch_size,
-            num_decode_tokens=self.batch_size,
-            num_spec_decodes=0,
-            num_spec_decode_tokens=0,
-            num_actual_tokens=self.batch_size,
-            non_spec_query_start_loc=self.static_non_spec_qsl,
-            non_spec_state_indices_tensor=self.static_state_indices,
-        )
+        if self.qo_len == 1:
+            gdn_meta = GDNAttentionMetadata(
+                num_prefills=0,
+                num_prefill_tokens=0,
+                num_decodes=self.batch_size,
+                num_decode_tokens=self.batch_size,
+                num_spec_decodes=0,
+                num_spec_decode_tokens=0,
+                num_actual_tokens=self.batch_size,
+                non_spec_query_start_loc=self.static_non_spec_qsl,
+                non_spec_state_indices_tensor=self.static_state_indices,
+            )
+        else:
+            extra = self._const_gdn_extra
+            assert extra is not None
+            gdn_meta = GDNAttentionMetadata(
+                num_prefills=self.batch_size,
+                num_prefill_tokens=n_tokens,
+                num_decodes=0,
+                num_decode_tokens=0,
+                num_spec_decodes=0,
+                num_spec_decode_tokens=0,
+                num_actual_tokens=n_tokens,
+                has_initial_state=extra.has_initial_state,
+                non_spec_query_start_loc=self.static_non_spec_qsl,
+                non_spec_state_indices_tensor=self.static_state_indices,
+                chunk_indices=extra.chunk_indices,
+                chunk_offsets=extra.chunk_offsets,
+                prefill_query_start_loc=self.static_non_spec_qsl,
+                prefill_state_indices=self.static_state_indices,
+                prefill_has_initial_state=extra.prefill_has_initial_state,
+                nums_dict=extra.nums_dict,
+                batch_ptr=extra.batch_ptr,
+                token_chunk_offset_ptr=extra.token_chunk_offset_ptr,
+            )
         attn_metadata_dict = {name: attn_meta for name in runner.attn_layer_names}
         attn_metadata_dict.update({name: gdn_meta for name in runner.gdn_layer_names})
         slot_mapping_dict = {name: self.static_slot_mapping for name in runner.attn_layer_names}
@@ -942,7 +1008,7 @@ class CapturedBatchDecodeGraph:
             hidden_states = runner.model.forward(self.static_input_ids, self.static_positions)
         return runner.model.compute_logits(hidden_states)
 
-    def capture(self, slot_ids: list[int], warmup_token_ids: list[int], warmup_kv_lengths: list[int]) -> None:
+    def capture(self, slot_ids: list[int], warmup_token_ids, warmup_kv_lengths: list[int]) -> None:
         """Warm up (uncaptured, on a side stream -- required by
         ``torch.cuda.graph`` before capture) then capture the graph, using
         ``(slot_ids, warmup_token_ids, warmup_kv_lengths)`` as the
@@ -950,7 +1016,8 @@ class CapturedBatchDecodeGraph:
         contract -- the whole point of fixed-sizing kv_split_size/
         max_num_splits is that the real kv_len distribution replay() sees
         is expected to differ, often drastically, from whatever's used
-        here."""
+        here. ``warmup_token_ids`` is a flat list when ``qo_len=1``, or a
+        list of per-slot ``qo_len``-length draft-token lists otherwise."""
         if self._graph is not None:
             raise RuntimeError("already captured")
         if not (len(slot_ids) == self.batch_size == len(warmup_token_ids) == len(warmup_kv_lengths)):
@@ -970,12 +1037,13 @@ class CapturedBatchDecodeGraph:
             self._static_logits = self._forward_no_sync()
         self._graph = g
 
-    def replay(self, slot_ids: list[int], token_ids: list[int], kv_lengths: list[int]) -> torch.Tensor:
+    def replay(self, slot_ids: list[int], token_ids, kv_lengths: list[int]) -> torch.Tensor:
         """Replay the captured graph at REAL (slot_ids, token_ids,
         kv_lengths) data -- may (and, per this round's explicit test
         scope, deliberately does) differ drastically from capture()'s
         warmup data, including kv_len values much larger or smaller than
-        whatever was used at capture time."""
+        whatever was used at capture time. Returns logits shaped
+        ``[batch_size * qo_len, vocab]`` (request-then-position order)."""
         if self._graph is None:
             raise RuntimeError("capture() must be called first")
         if not (len(slot_ids) == self.batch_size == len(token_ids) == len(kv_lengths)):

@@ -371,6 +371,59 @@ round's new code specifically, after genuine, sustained effort across
 four distinct configurations -- flagged as an open item for a coordinator
 decision on how to proceed, not silently marked done.
 
+**Coordinator decision: accept the uninstrumented verification for this
+round; compute-sanitizer stays a tracked open item, no further time spent
+chasing pre-existing cold-start defects.** Proceeded to MTP CUDA Graph
+capture.
+
+### Phase 3, CUDA Graph capture/replay step 2 (qo_len=4 MTP verify) (2026-07-16) — implemented, 3/3 PASS
+
+Generalized `CapturedBatchDecodeGraph` in place (not a new class) to
+`qo_len>1`: static buffers sized `batch_size*qo_len`, and GDN's chunked
+metadata fields (`chunk_indices`/`chunk_offsets`/`nums_dict`/`batch_ptr`/
+`token_chunk_offset_ptr`/`has_initial_state`) computed ONCE in `__init__`
+since they depend only on query-length structure, never on kv_len or
+slot identity -- genuinely constant across every replay for a fixed
+(batch_size, qo_len) graph. At qo_len=1 every formula reduces exactly to
+the previous values (confirmed via regression rerun, identical output).
+
+**Found and fixed a second, more consequential methodology issue before
+it could produce a false result**: `capture()`'s 3 real warmup executions
+(on a side stream, before the graph trace -- the trace itself executes
+nothing) are NOT safe to run against the same slots later checked via
+`replay()`, because GDN's recurrent/chunked state update is not
+idempotent under repeated identical input (unlike attention's KV cache).
+This is a real imprecision in the ALREADY-COMMITTED qo_len=1 test too
+(reused the same slots for warmup and its first replay check) -- not
+retroactively fixed there (its 3/3 PASS, including the 96%-capacity case,
+stands as real evidence; likely didn't surface because `capture()`'s
+`slot_ids` need not match `replay()`'s, and this signal-probe task is
+likely dominated by full-attention layers rather than GDN). Fixed
+properly in the new MTP test via dedicated, disposable `ref_slots`
+(establish drafts + serve as warmup data, spent afterward) kept strictly
+separate from `graph_slots` (touched by nothing but their own prefill
+until the real replay calls).
+
+Also caught a test-design bug (not a decode_batch bug): chaining a second
+"extreme" verify as a continuation of the first replay's own predictions
+fed mismatched content (a verify's output isn't the same thing as a new
+draft for a follow-on step, which needs real accept/reject bookkeeping --
+out of scope this round). Fixed by making the extreme check a fully
+independent single-shot verify instead.
+
+**Results, 1 sanity + 3/3 repeat**: small-shape replay (self-consistency
+held, zero crosstalk, confirmed `v2 decode kernel path HIT (qo_len=4)` in
+logs) and an independent extreme-shape replay (3 slots short, 1 slot at
+**1961/2048 tokens, 96% of hard capacity**) -- every slot recovered its
+own identity with zero leakage, same captured graph both times. **3/3
+PASS, zero crashes.**
+
+**This completes CUDA Graph capture/replay for both scopes asked for**
+(qo_len=1 batch decode, qo_len=4 MTP verify). Not done: compute-sanitizer
+(tracked open item) and accept/reject sampling (out of scope). Next: real
+W1/W2/concurrency=4/MTP-K=3 performance comparison against native
+FlashInfer.
+
 ### Phase 3, main-line redirect (2026-07-16) — direct model runner, replacing the HTTP bridge
 
 The sibling `sm120-flash-attention` project's attention-kernel-tuning main

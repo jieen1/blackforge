@@ -1389,3 +1389,107 @@ behavior before ever reaching the capture()/replay() calls under test.
 This is flagged as an open item requiring a coordinator decision on how
 to proceed (see the concise status report delivered alongside this
 commit), not silently marked done.
+
+**Coordinator decision (2026-07-16): accept the uninstrumented
+verification for this round; compute-sanitizer stays a known, explicitly
+tracked open item; don't spend further time chasing pre-existing
+cold-start defects.** Proceeding to MTP (qo_len=4) CUDA Graph capture.
+
+## CUDA Graph capture/replay, step 2 (qo_len=4 MTP verify): implemented, verified via signal-probe, 3/3 PASS
+
+Generalized `CapturedBatchDecodeGraph` in place (not a new class) to
+accept `qo_len>1`, reusing the class's existing design points:
+- `static_qo_indptr`/`static_non_spec_qsl` generalize to
+  `arange(0, num_reqs+1) * qo_len` (constant for a fixed (batch_size,
+  qo_len) pair, same as the qo_len=1 case).
+- `static_input_ids`/`static_positions`/`static_slot_mapping` sized
+  `batch_size * qo_len` instead of `batch_size`.
+- GDN's chunked/"prefill" metadata fields (`chunk_indices`/
+  `chunk_offsets`/`nums_dict`/`batch_ptr`/`token_chunk_offset_ptr`/
+  `has_initial_state`) depend ONLY on query-length structure (how many
+  tokens per request), never on kv_len or which physical slot -- so for
+  a FIXED (batch_size, qo_len) graph they are genuinely constant across
+  every replay, unlike `kv_page_indices`/`state_indices` (which depend on
+  live kv_len/slot identity and must still be refilled every replay via
+  `.copy_()`). Computed ONCE in `__init__` via
+  `build_gdn_metadata_batch(..., slot_initialized=[True]*batch_size)`
+  and reused as-is -- fixed address by construction of never being
+  recreated, no extra per-replay work needed. `has_initial_state=True`
+  for every slot is this class's explicit scope: MTP verify only ever
+  happens after a slot's own prior prefill/decode has established real
+  context.
+- At `qo_len=1` every new formula reduces exactly to the previous
+  values -- confirmed via a direct regression rerun of
+  `cudagraph_decode_regression.py` after the generalization, byte-for-byte
+  identical output to before the change.
+
+**A second, more consequential methodology issue found and fixed BEFORE
+it could produce a false result** (building on the "GDN state can't be
+cheaply rewound" lesson from the non-graph MTP verify round): `capture()`
+performs 3 REAL warmup executions on a side stream before the graph
+trace (the trace itself, inside `with torch.cuda.graph(g):`, does NOT
+execute anything -- confirmed against the sibling project's own
+kernel-level CUDA-graph test, which documents this precisely). Naively
+passing the SAME slots to `capture()`'s warmup as the slots later checked
+via `replay()` means those 3 warmup executions redundantly apply the
+capture-time draft tokens to the SAME GDN recurrent state 3 extra times
+before any real replay happens -- and unlike attention's paged KV
+(content-addressed, safe to overwrite with identical values repeatedly),
+a chunked/recurrent GDN state update is NOT idempotent under repeated
+identical input (a linear recurrence applied to the same input N times
+does not equal applying it once). This is a genuine imprecision in the
+ALREADY-COMMITTED qo_len=1 test's methodology too (it reused the same
+`slots` for both `capture()`'s warmup and the "replay@capture-time-shape"
+check) -- caught here while designing the MTP test, not retroactively
+fixed in the qo_len=1 test (its empirical 3/3 PASS result, including the
+96%-capacity extreme case, stands as real evidence; the likely reason
+this imprecision didn't surface as an observable defect there is that
+`capture()`'s `slot_ids` parameter does NOT need to match a later
+`replay()` call's `slot_ids` -- both independently recompute addressing
+fresh each call, no class-level fix needed -- combined with this specific
+signal-probe task likely being dominated by the model's full-attention
+layers' copy-mechanism rather than GDN's contribution, masking a state
+perturbation that a GDN-sensitive task might not tolerate).
+
+**Fix applied to the new MTP test's methodology** (`benchmarks/
+cudagraph_mtp_regression.py`): dedicated, disposable `ref_slots` for
+establishing trusted draft tokens AND serving as `capture()`'s warmup
+data source (spent/discarded afterward, reset+reused for a second,
+independent check later) -- kept strictly separate from `graph_slots`,
+the slots actually checked via `replay()`, which are touched by nothing
+except their own prefill until the real replay calls.
+
+**Also found and fixed a test-design bug** (not a decode_batch/graph
+bug): an early draft of this test tried to chain a second "extreme"
+verify as a continuation of the first replay's own predicted tokens --
+but a verify call's *output* (what comes after position p) is not the
+same content as a *new draft* for a follow-on step (which would need the
+accepted continuation plus a fresh bonus token, i.e. real MTP accept/
+reject bookkeeping, explicitly out of scope this round). Feeding
+mismatched content produced plausible-looking but wrong-looking text
+("81.17" instead of a number) that had nothing to do with cross-slot
+addressing. Fixed by making the extreme-shape check a fully INDEPENDENT
+single-shot verify (fresh prefills, fresh trusted drafts via `ref_slots`,
+one decisive replay) rather than a continuation of the first.
+
+**Results, 1 sanity run + 3/3 repeat, both replays checked via signal-probe
+per run:**
+- `replay@capture-time-shape` (small, ~15-20-token prompts, all 4 slots):
+  self-consistency held (slots 0 and 3, a duplicate-number pair, produced
+  identical text) and every slot recovered its own number prefix with
+  zero cross-slot leakage. Confirmed `v2 decode kernel path HIT (qo_len=4)`
+  in the logs -- the real production kernel, no kernel changes needed.
+- `replay@extreme-mixed-kv_len(MTP)` (independent re-prefill: 3 slots
+  short again, 1 slot pushed to **1961/2048 tokens, 96% of hard
+  capacity**): every slot, including the 96%-capacity one, still
+  correctly recovered its own number prefix with zero leakage, using the
+  SAME captured graph from the small-shape scenario above.
+- **3/3 independent repeats, all PASS, zero crashes.**
+
+**This completes the CUDA Graph capture/replay work for both scopes the
+coordinator asked for** (qo_len=1 batch decode and qo_len=4 MTP verify).
+Explicitly not done: compute-sanitizer verification (tracked open item,
+see above) and accept/reject sampling logic (out of scope per the
+coordinator's own MTP-batch-support round). Next: the real W1/W2/
+concurrency=4/MTP-K=3 performance comparison against native FlashInfer,
+using the sibling project's established benchmark methodology.
