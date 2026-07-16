@@ -1330,17 +1330,62 @@ instruction not to skip or fake this step:
   `--print-limit` within a single forward pass) drowns out any signal
   from the actual capture/replay code before the sanitizer's report cap
   is ever reached.
-- Working around this now via `--kernel-name-exclude
-  kernel_substring=causal_conv1d` (excludes the known-noisy kernel from
-  analysis, not from execution) to let `initcheck` reach the actual
-  `CapturedBatchDecodeGraph.capture()`/`replay()` calls -- launched, not
-  yet complete at the time of a machine reboot that killed the prior
-  attempt (see PROGRESS.md for the restart).
+- Worked around via `--kernel-name-exclude kernel_substring=causal_conv1d`
+  (excludes the known-noisy kernel from analysis, not from execution) --
+  a machine reboot killed the first attempt at this mid-run (all
+  working-tree changes were preserved on disk; confirmed via a fresh
+  `git status`/`nvidia-smi`/`ps` check that no GPU/process state survived,
+  as expected). Restarted after the reboot, at the ORIGINAL batch_size=4
+  scope: still made no visible progress in 20+ minutes past the
+  now-excluded causal_conv1d issue.
+- Cut further to a genuinely minimal, sanitizer-specific script
+  (`benchmarks/cudagraph_sanitizer_micro.py`, batch_size=2, exactly ONE
+  replay directly at an extreme/near-capacity kv_len -- 7 total
+  forward-pass-equivalent calls, verified correct and fast (~20s)
+  uninstrumented first). Under `initcheck` with the same causal_conv1d
+  exclusion: weight loading returned to normal speed (~11s), but the
+  SAME pre-existing `_warmup()` call now surfaced **a second, different,
+  previously-undocumented-in-this-project uninitialized-read report**
+  (100 instances, the default print-limit) -- this time in
+  `qwen_gdn_linear_attn.py`'s `_output_projection`/`forward_cuda`, a
+  DIFFERENT kernel from causal_conv1d. Still 100% confined to the same
+  `__init__` -> `_warmup()` -> `prefill()` call stack (line 69 of the
+  micro script, i.e. `DirectModelRunner(...)` construction itself) --
+  not this round's new code. After exhausting that report cap the
+  process continued running (silently, past the print-limit) for another
+  20+ minutes with zero further log output, still stuck within that SAME
+  first forward pass.
 
-**Honest status**: the capture/replay mechanism itself is solidly
-verified through extensive real, uninstrumented testing (not "looks
-correct" -- specifically probed the exact failure modes this project's
-own sibling documented: address staleness and split-size staleness under
-kv_len far exceeding capture-time data). The compute-sanitizer 0-errors
-gate the coordinator required has NOT yet been satisfied -- this is
-reported as incomplete, not glossed over, and is the immediate next step.
+**Pattern across all four attempts (full memcheck x2, initcheck at
+batch=4, initcheck at batch=2)**: every single one stalled or flooded
+inside `DirectModelRunner.__init__`'s own pre-existing `_warmup()`
+mechanism -- a call this round's CUDA Graph code doesn't even touch yet
+(capture/replay only run AFTER `__init__` completes). This warmup exists
+specifically because the model's own kernels (now confirmed: at least
+TWO distinct ones, `causal_conv1d` and something in
+`qwen_gdn_linear_attn.py`'s output projection) behave abnormally on the
+literal first-ever forward call in a fresh process -- an already
+partially-documented, pre-existing property of this model/kernel stack,
+not something introduced by or specific to CUDA Graph capture. Since
+warmup is unavoidably the FIRST real GPU work in any fresh process
+(disabling it would just move the same cold-start cost onto whatever
+call becomes "first" instead, per this project's own established
+finding, and would also invalidate the whole point of `_warmup()`
+existing), this makes the underlying model+kernel stack itself
+fundamentally expensive to sanitizer-instrument from a cold process
+start, independent of anything CUDA-Graph-specific.
+
+**Honest status, reported plainly rather than glossed over**: the
+`CapturedBatchDecodeGraph` capture/replay mechanism itself is solidly
+verified through extensive real, uninstrumented testing that specifically
+targeted the exact failure modes this project's own sibling documented
+(address staleness, split-size staleness under kv_len far exceeding
+capture-time data) -- 3/3 clean passes, zero crashes, including a
+96%-of-hard-capacity extreme case. The coordinator's compute-sanitizer
+0-errors gate has NOT been satisfied for this round's new code
+specifically -- every attempt's error budget/wall-clock was consumed by a
+real but PRE-EXISTING, UNRELATED defect in the model's own cold-start
+behavior before ever reaching the capture()/replay() calls under test.
+This is flagged as an open item requiring a coordinator decision on how
+to proceed (see the concise status report delivered alongside this
+commit), not silently marked done.

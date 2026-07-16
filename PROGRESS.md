@@ -329,17 +329,47 @@ Triton-kernel cold-start defect documented earlier in this project (see
 notes/direct-model-runner-design.md's "Known independent defects") --
 real, but not new, and not part of this round's scope. Its sheer volume
 drowns out the sanitizer's report budget before ever reaching the actual
-`capture()`/`replay()` code. Now working around via `--kernel-name-exclude
+`capture()`/`replay()` code. Worked around via `--kernel-name-exclude
 kernel_substring=causal_conv1d`; a machine reboot killed this attempt
 mid-run (confirmed via fresh `git status`/`nvidia-smi`/`ps` after
-restart -- all working-tree changes were preserved on disk, no GPU/process
-state survived, as expected) -- restarting this specific check now.
+restart -- all working-tree changes preserved on disk, no GPU/process
+state survived, as expected).
 
-**Honest status**: the capture/replay mechanism itself is solidly
-verified via extensive real (uninstrumented) testing targeting the exact
-failure modes the sibling project's own history warns about. The
-coordinator's compute-sanitizer 0-errors gate has NOT yet been satisfied
--- reported as incomplete, in progress, not glossed over.
+**Restarted after reboot, tried two more variants, same pattern both
+times.** At the original batch_size=4 scope with the exclusion applied:
+20+ minutes with no progress past the (now-excluded) causal_conv1d point.
+Cut further to a genuinely minimal, sanitizer-only script
+(`benchmarks/cudagraph_sanitizer_micro.py`, batch_size=2, exactly ONE
+replay directly at an extreme kv_len, 7 total forward-pass-equivalent
+calls -- verified correct and fast, ~20s, uninstrumented first). Under
+`initcheck` with the same exclusion: weight loading was normal speed
+again, but the SAME pre-existing `_warmup()` call surfaced a **second,
+different, previously-undocumented uninitialized-read report** (100
+instances, default cap) in `qwen_gdn_linear_attn.py`'s
+`_output_projection` -- a different kernel from causal_conv1d, but still
+100% confined to `DirectModelRunner.__init__`'s own warmup call, not this
+round's new code. After exhausting that cap, the process ran silently for
+20+ more minutes with zero further output, still inside that same first
+forward pass.
+
+**Pattern across all four attempts** (full memcheck x2, initcheck at
+batch=4, initcheck at batch=2): every one stalled or flooded inside the
+pre-existing `_warmup()` mechanism, which this round's CUDA Graph code
+doesn't even reach yet. At least two distinct model/kernel cold-start
+defects now confirmed (causal_conv1d, and the GDN output projection) --
+real, pre-existing, unrelated to CUDA Graphs, but making this model+kernel
+stack fundamentally expensive to sanitizer-instrument from a cold process
+start, independent of anything CUDA-Graph-specific.
+
+**Honest status, not glossed over**: `CapturedBatchDecodeGraph` itself is
+solidly verified via extensive real, uninstrumented testing targeting the
+exact failure modes (address staleness, split-size staleness under kv_len
+far exceeding capture-time data) this project's sibling documented --
+3/3 clean passes, zero crashes, including a 96%-of-capacity extreme case.
+The compute-sanitizer 0-errors gate has NOT been satisfied for this
+round's new code specifically, after genuine, sustained effort across
+four distinct configurations -- flagged as an open item for a coordinator
+decision on how to proceed, not silently marked done.
 
 ### Phase 3, main-line redirect (2026-07-16) — direct model runner, replacing the HTTP bridge
 
