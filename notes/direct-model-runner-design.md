@@ -680,3 +680,50 @@ entirely and were not covered by this bypass).
    or by using a much larger `num_stages`/simpler epilogue/a different
    attention-adjacent code path for those specific layers) is exactly the
    kind of call worth surfacing rather than deciding unilaterally.
+
+## Step 2 result (2026-07-16): no-HTTP correct baseline established -- 20/20
+
+Per the strategy reset above, built `runtime/vllm_inprocess_baseline.py`
+instead of continuing to hand-derive `GPUModelRunner`'s internals. It
+drives vLLM's own `LLM` class directly -- real `Scheduler`, real
+`KVCacheManager`-allocated cache, the real `SM120GQAMetadataBuilder` /
+`GDNAttentionMetadataBuilder`, real warmup/profiling sequencing, our own
+`SM120GQABackend` with decode v2 enabled via
+`SM120_GQA_USE_V2_DECODE_KERNEL=1` -- with **no HTTP layer at all** (`LLM`
+never has one; only `vllm serve` does). Under the hood it uses
+`SyncMPClient` + a background `EngineCore` process reached via local ZMQ,
+not a network call -- confirmed this needed the same spawn-safe
+`if __name__ == "__main__":` guard `launch_test_server.py` already
+documented (hit the identical `RuntimeError` on the first attempt without
+it, fixed the same way).
+
+**Result: ran 20 consecutive fresh-process repeats of `"The capital of
+France is"` at `max_tokens=8`, temperature 0. All 20 produced the
+identical, correct completion**: `" Paris.\n\n<think>\nHere's a"`
+(20/20 pass, byte-for-byte identical text every run).
+
+This is a real, decisive, positive result -- not a partial one:
+- It directly satisfies step 2's stated bar ("不是性能,是要在同一进程内,
+  连续20次都能稳定正确地跑出...Paris").
+- It confirms, independently of everything hand-built in
+  `direct_model_runner.py`, that **the underlying model, checkpoint,
+  quantization, GDN implementation, and this project's own SM120GQABackend
+  (decode v2 included) are all correct** when driven through vLLM's real
+  scheduling/metadata/cache machinery. Combined with the two independent
+  defects already found and ruled out as root causes (Triton
+  `causal_conv1d_fn` cold start, CUTLASS SM120 pingpong-GEMM race), this
+  narrows the actual bug's location further: it is specifically in
+  `direct_model_runner.py`'s own hand-rolled orchestration (metadata
+  construction, padding, state initialization, or something else in that
+  file), not in anything downstream of it.
+- It gives exactly the "stage A" oracle Step 3's ownership-transfer ladder
+  needs (vLLM metadata + vLLM cache, verified correct) to compare against
+  once that phase is dispatched.
+
+**Not yet done, deliberately out of scope for this round** (per the explicit
+instruction to stop after steps 1+2): the three-stage ownership transfer
+(vLLM metadata+our cache -> our metadata+our cache -> trimmed direct
+runner), per-layer/per-tensor comparison at each stage, and anything about
+real batching (`decode_batch()` remains a Python loop over single-request
+`decode()` calls in `direct_model_runner.py` -- a known, documented
+limitation, not addressed this round), CUDA Graph, or Hy3.

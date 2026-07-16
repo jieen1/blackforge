@@ -30,9 +30,26 @@ mismatch** (wrong metadata field, padding convention, or state
 initialization vs. what real `GPUModelRunner` does) as the more likely
 root cause, which is exactly what step 2 targets.
 
-**Step 2 (this round, in progress): building a no-HTTP correct baseline
-that reuses vLLM's real `GPUModelRunner`/`Scheduler`/`KVCacheManager`
-in-process** (HTTP removed, nothing else) -- see below for progress.
+**Step 2 (this round, DONE): no-HTTP correct baseline established, 20/20.**
+Built `runtime/vllm_inprocess_baseline.py`, driving vLLM's own `LLM` class
+directly instead of hand-deriving `GPUModelRunner`'s internals -- real
+`Scheduler`, real `KVCacheManager`-allocated cache, the real
+`SM120GQAMetadataBuilder`/`GDNAttentionMetadataBuilder`, real
+warmup/profiling sequencing, our own `SM120GQABackend` with decode v2 --
+with **no HTTP layer at all** (`LLM` never has one; only `vllm serve` does;
+under the hood it's `SyncMPClient` + a background `EngineCore` reached via
+local ZMQ, not a network call). **Ran 20 consecutive fresh-process repeats
+of "The capital of France is": all 20 produced the identical, correct**
+`" Paris.\n\n<think>\nHere's a"` **(20/20 pass).** This is a decisive,
+positive result: it confirms the model/checkpoint/quantization/GDN/our own
+SM120GQABackend (decode v2 included) are all correct when driven through
+vLLM's real machinery -- combined with the two independent defects already
+ruled out as root causes, this narrows the actual bug specifically to
+`direct_model_runner.py`'s own hand-rolled orchestration, not anything
+downstream of it. Full detail in the design doc's "Step 2 result" section.
+Step 3 (the three-stage ownership-transfer ladder to localize exactly what
+in that hand-rolled orchestration is wrong) is deliberately NOT started
+this round, per the explicit instruction to stop after steps 1+2.
 
 ### Phase 3, main-line redirect (2026-07-16) — direct model runner, replacing the HTTP bridge
 
