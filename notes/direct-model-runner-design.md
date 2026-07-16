@@ -1039,3 +1039,99 @@ distinguishing "slightly different rounding" from "reading the wrong
 slot's data entirely"). This is a methodology decision, flagged to the
 coordinator rather than decided unilaterally, before continuing to
 batch=4/variable-length/slot-reuse/continuous-generation/no-crosstalk.
+
+**Coordinator decision (2026-07-16): new acceptance criteria adopted**,
+replacing bytewise-identical-vs-run-alone:
+1. Argmax/token-sequence plausibility (fluent, non-garbage output).
+2. Signal-probe/marker-token crosstalk detection as the primary
+   bug-catching tool -- distinguishes genuine cross-slot data leakage
+   from ordinary floating-point noise.
+3. Same-batch internal self-consistency (two identical prompts in the
+   SAME batch call must produce bytewise-identical results to each
+   other) as the correctness reference, replacing "run alone".
+
+## Batch decode ladder, steps 2-6 (2026-07-16): all pass under the new criteria
+
+New harness `benchmarks/batch_decode_signal_probe.py`, replacing
+`batch_decode_regression.py`'s now-obsolete run-alone-reference approach.
+Each active slot's prompt is `"{filler}The value of X is {number}. The
+value of X is"` -- a strong in-context copy cue the model reliably
+completes with its own number regardless of instruction-following
+ability. For batch >= 3, the last slot duplicates the first slot's number
+(and, for the varlen variant, its filler length too -- see below) to give
+a same-batch self-consistency pair, while every other slot gets a
+distinct number for crosstalk detection. Every step's `_forward_batch()`
+call is checked two ways: (a) do slot 0 and the duplicate slot's logits
+hash-match exactly (self-consistency), and (b) after `steps` rounds, does
+each slot's decoded text contain its OWN number and NONE of the other
+slots' numbers (signal-probe crosstalk detection).
+
+**Step 2, batch=3 (re-verified under the new criteria, not re-litigating
+bytewise): 1 sanity run + 3/3 repeat, all PASS.** Self-consistency held
+every step; each slot recovered exactly its own number with zero leakage.
+
+**Step 3, batch=4: 1 sanity run + 3/3 repeat, all PASS.** Same result
+pattern as batch=3.
+
+**Step 4, variable-length requests (batch=4, each slot given a different
+filler-sentence-repeat count so `prior_kv_len`/page count differs across
+the batch): first attempt FAILED self-consistency 3/3 -- but this was a
+TEST HARNESS bug, not a decode_batch bug.** The duplicate-number pair
+(slots 0 and 3) had been given *different* filler lengths (`i` per slot
+index), so their prompts weren't actually identical -- comparing their
+logits was comparing two genuinely different inputs, not testing
+self-consistency at all. Diagnostic: `signal_ok` was `True` in all 3
+"failing" runs (each slot still recovered its own number correctly, e.g.
+slot 2's `' 71053. The weather'` vs slot 0/3's `' 84317. The value'`) --
+confirming no real crosstalk/addressing bug, just a broken test premise.
+Fixed by adding `_assign_filler_repeats()`: the self-consistency pair
+(slots 0 and batch-1) now shares BOTH number and filler length, while
+interior slots still get distinct lengths for the varlen coverage this
+step is meant to exercise. **After the fix: 3/3 PASS**, self-consistency
+held and no crosstalk, confirming `build_attention_metadata_batch`'s
+per-request CSR construction (heterogeneous page counts per request in
+one batched call) is correct.
+
+**Step 5, slot release + reuse (batch=3, `--reuse`): 3/3 PASS.** After 8
+decode rounds, slot 0 is released (`reset_slot`) and immediately
+re-prefilled with a brand-new number (91827, disjoint from the batch's
+numbers) while slots 1/2 remain untouched; 8 further decode-only steps on
+slot 0 alone recover exactly the new number with zero residue from either
+its own prior occupant or the still-active other slots -- confirming
+`reset_slot`'s "don't zero tensors, rely on kv_len=0 +
+`has_initial_state`/`slot_gdn_initialized`=False" convention still holds
+correctly under the batched decode path, not just the original
+single-request path it was designed for.
+
+**Step 6, continuous 256-token generation (batch=4, `steps=256`): 2/2
+PASS.** 256 sequential real `_forward_batch()` calls per run (512 total
+across both repeats) with no crash, and the signal-probe/self-consistency
+checks (evaluated against the FULL 257-token generated text, not just the
+first few tokens) still passed cleanly -- no drift or leakage emerging
+only after sustained multi-step generation.
+
+**Signal-probe no-crosstalk (cross-cutting, not a separate scenario)**:
+every single run above -- batch=2/3/4, varlen, reuse, and the 256-token
+continuous run, 1 initial + repeats -- reported `signal_ok: true` with
+zero leaked-other-slot's-number instances. This is the primary evidence
+that `decode_batch`'s physical-slot addressing (the exact class of bug
+the 2026-07-16 slot-0-reservation root-cause work fixed for the
+single-request path) generalizes correctly to the real N-request batched
+path.
+
+**Repeat count note**: used 3x (2x for the more expensive 256-step run)
+rather than 20x for these deterministic single-process checks -- reasoned
+explicitly, not just cost-cut: unlike the earlier cross-process bytewise
+hash comparisons (sensitive to legitimate floating-point noise across
+independent process launches), a genuine addressing/crosstalk bug here is
+a deterministic logic error that would manifest on the very first run,
+not a rare hardware race; repeats mainly guard against the kind of rare
+CUTLASS-kernel race already investigated and ruled out as this bug's root
+cause earlier in this project. 3x was judged sufficient for that residual
+risk given every run already passed cleanly.
+
+**Not attempted this round (correctly out of scope, per the ladder's own
+"MTP排最后" ordering)**: MTP/speculative-decode batched verification --
+needs multi-token-per-request query support in the batch metadata
+builders, a substantially larger feature than single-token decode
+batching, left for its own dedicated round once requested.

@@ -192,6 +192,49 @@ is a methodology decision (what tolerance/metric should replace bytewise
 match for steps 2-8 of the validation ladder) flagged to the coordinator
 rather than decided unilaterally before proceeding further.
 
+**Coordinator decision: new acceptance criteria adopted** (1) argmax/token
+plausibility, (2) signal-probe/marker-token crosstalk detection as the
+primary bug-catching tool, (3) same-batch internal self-consistency
+(identical prompts in one batch call must match bytewise) replacing
+"run alone" as the reference.
+
+### Phase 3, batch decode ladder steps 2-6 (2026-07-16) — all PASS under the new criteria
+
+New harness `benchmarks/batch_decode_signal_probe.py`: each slot's prompt
+is `"{filler}The value of X is {number}. The value of X is"` (a strong
+in-context copy cue), with a duplicate number+filler pair (slots 0 and
+batch-1, batch>=3) for self-consistency and distinct numbers elsewhere
+for crosstalk detection.
+
+- **batch=3**: 1 sanity + 3/3 repeat, all PASS.
+- **batch=4**: 1 sanity + 3/3 repeat, all PASS.
+- **variable-length (batch=4)**: first attempt failed self-consistency
+  3/3, but this was a TEST HARNESS bug (the duplicate pair had different
+  filler lengths, so their prompts weren't actually identical) -- not a
+  decode_batch bug (`signal_ok` was already `True` in every "failing" run,
+  i.e. no real crosstalk). Fixed the harness (`_assign_filler_repeats`
+  keeps the self-consistency pair's filler length matched) and reran:
+  **3/3 PASS**.
+- **slot release + reuse (batch=3)**: 3/3 PASS -- after 8 decode rounds,
+  slot 0 released and re-prefilled with a brand-new, disjoint number;
+  8 further decode-only steps recover exactly the new number with zero
+  residue from its prior occupant or the still-active other slots.
+- **continuous 256-token generation (batch=4)**: 2/2 PASS -- 512 total
+  real `_forward_batch()` calls across both repeats, no crash, checks
+  still clean against the full generated text.
+- **Signal-probe no-crosstalk**: cross-cutting, `signal_ok: true` with
+  zero leaked-number instances across every run above -- the primary
+  evidence that `decode_batch`'s physical-slot addressing generalizes
+  correctly from the single-request path to real N-request batches.
+
+Used 3x repeats (2x for the 256-step run) rather than 20x: a genuine
+addressing bug here is a deterministic logic error that would show up on
+the first run, not a rare hardware race (unlike the earlier cross-process
+bytewise-hash comparisons, which were sensitive to legitimate
+floating-point noise) -- judged sufficient given every run passed
+cleanly. MTP is correctly NOT attempted this round (explicitly last in
+the coordinator's ladder ordering) -- left for its own round.
+
 ### Phase 3, main-line redirect (2026-07-16) — direct model runner, replacing the HTTP bridge
 
 The sibling `sm120-flash-attention` project's attention-kernel-tuning main
