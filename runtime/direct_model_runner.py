@@ -45,6 +45,61 @@ def _ensure_sm120_backend_registered() -> None:
     register_backend(AttentionBackendEnum.CUSTOM, _SM120_BACKEND_PATH)
 
 
+def allocate_fixed_slot_kv_caches(
+    static_forward_context: dict,
+    vllm_config: VllmConfig,
+    device: torch.device,
+    *,
+    num_slots: int,
+    block_size: int,
+    blocks_per_slot: int,
+) -> dict[str, object]:
+    """Allocate our own num_slots-fixed-slot KV (attention) and state (GDN)
+    tensors and bind them via vLLM's own real ``bind_kv_cache()`` -- shared
+    between ``DirectModelRunner`` (hand-built metadata) and
+    ``runtime/vllm_stage_b_baseline.py`` (real vLLM metadata/scheduler,
+    Stage B of the 2026-07-16 ownership-transfer ladder: this is the ONLY
+    thing that differs from vLLM's own tensor allocation -- everything else
+    stays real). Returns the same ``dict[str, tensor|tuple]`` bind_kv_cache
+    expects, keyed by layer name.
+    """
+    attn_layer_names = []
+    gdn_layer_names = []
+    for name, layer in static_forward_context.items():
+        if hasattr(layer, "get_state_shape"):
+            gdn_layer_names.append(name)
+        else:
+            attn_layer_names.append(name)
+
+    kv_caches: dict[str, object] = {}
+
+    if attn_layer_names:
+        any_attn = static_forward_context[attn_layer_names[0]]
+        backend_cls = any_attn.get_attn_backend()
+        num_kv_heads = any_attn.num_kv_heads
+        head_size = any_attn.head_size
+        cache_dtype_str = vllm_config.cache_config.cache_dtype
+        num_blocks = num_slots * blocks_per_slot
+        shape = backend_cls.get_kv_cache_shape(
+            num_blocks, block_size, num_kv_heads, head_size, cache_dtype_str
+        )
+        torch_dtype = any_attn.kv_cache_torch_dtype
+        for name in attn_layer_names:
+            kv_caches[name] = torch.zeros(shape, dtype=torch_dtype, device=device)
+
+    for name in gdn_layer_names:
+        layer = static_forward_context[name]
+        conv_shape, ssm_shape = layer.get_state_shape()
+        conv_dtype, ssm_dtype = layer.get_state_dtype()
+        conv_state = torch.zeros((num_slots, *conv_shape), dtype=conv_dtype, device=device)
+        ssm_state = torch.zeros((num_slots, *ssm_shape), dtype=ssm_dtype, device=device)
+        kv_caches[name] = (conv_state, ssm_state)
+
+    runner_kv_caches: list[torch.Tensor] = []
+    bind_kv_cache(kv_caches, static_forward_context, runner_kv_caches)
+    return kv_caches
+
+
 def build_vllm_config(
     *,
     model: str,
@@ -140,36 +195,14 @@ class DirectModelRunner:
             self.reset_slot(0)
 
     def _allocate_and_bind_kv_caches(self) -> None:
-        kv_caches: dict[str, object] = {}
-
-        any_attn = self.static_forward_context[self.attn_layer_names[0]]
-        backend_cls = any_attn.get_attn_backend()
-        num_kv_heads = any_attn.num_kv_heads
-        head_size = any_attn.head_size
-        cache_dtype_str = self.vllm_config.cache_config.cache_dtype
-        num_blocks = self.num_slots * self.blocks_per_slot
-        shape = backend_cls.get_kv_cache_shape(
-            num_blocks, self.block_size, num_kv_heads, head_size, cache_dtype_str
+        self.kv_caches = allocate_fixed_slot_kv_caches(
+            self.static_forward_context,
+            self.vllm_config,
+            self.device,
+            num_slots=self.num_slots,
+            block_size=self.block_size,
+            blocks_per_slot=self.blocks_per_slot,
         )
-        torch_dtype = any_attn.kv_cache_torch_dtype
-        for name in self.attn_layer_names:
-            kv_caches[name] = torch.zeros(shape, dtype=torch_dtype, device=self.device)
-
-        for name in self.gdn_layer_names:
-            layer = self.static_forward_context[name]
-            conv_shape, ssm_shape = layer.get_state_shape()
-            conv_dtype, ssm_dtype = layer.get_state_dtype()
-            conv_state = torch.zeros(
-                (self.num_slots, *conv_shape), dtype=conv_dtype, device=self.device
-            )
-            ssm_state = torch.zeros(
-                (self.num_slots, *ssm_shape), dtype=ssm_dtype, device=self.device
-            )
-            kv_caches[name] = (conv_state, ssm_state)
-
-        runner_kv_caches: list[torch.Tensor] = []
-        bind_kv_cache(kv_caches, self.static_forward_context, runner_kv_caches)
-        self.kv_caches = kv_caches
 
     def _attention_metadata(
         self, slot: int, *, num_new_tokens: int, is_decode: bool

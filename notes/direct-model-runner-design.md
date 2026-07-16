@@ -727,3 +727,44 @@ runner), per-layer/per-tensor comparison at each stage, and anything about
 real batching (`decode_batch()` remains a Python loop over single-request
 `decode()` calls in `direct_model_runner.py` -- a known, documented
 limitation, not addressed this round), CUDA Graph, or Hy3.
+
+## Stage B result (2026-07-16): our own cache is exonerated -- 20/20
+
+Per the three-stage ownership-transfer ladder, built
+`runtime/vllm_stage_b_baseline.py`: real vLLM `Scheduler`/`GPUModelRunner`/
+metadata builders/warmup, UNCHANGED, with exactly one substitution --
+`GPUModelRunner.initialize_kv_cache_tensors` is monkey-patched to call
+`runtime.direct_model_runner.allocate_fixed_slot_kv_caches` (extracted as a
+shared helper from `DirectModelRunner._allocate_and_bind_kv_caches`, used
+identically by both -- confirmed behavior-preserving by re-running
+`benchmarks/single_prefill_regression.py` post-refactor and getting the
+*exact same* logits hash as before, `720406302a42f76f`) instead of vLLM's
+own `_allocate_kv_cache_tensors`/`_reshape_kv_cache_tensors`. Everything
+else -- `initialize_attn_backend`, `initialize_metadata_builders`, the real
+`Scheduler`, the real warmup -- is untouched.
+
+**Result: 20/20 identical PASS**, same completion every run
+(`" Paris.\n\n<think>\nThe user has"`). No crash, no shape assertion, no
+divergence from Stage A's correct behavior.
+
+**This exonerates the cache layer**: our own 4-fixed-slot KV
+(attention)/state (GDN) tensor allocation, shape derivation
+(`get_kv_cache_shape()`/`get_state_shape()`), and `bind_kv_cache()` wiring
+are all correct when driven by real vLLM scheduling. Per the ownership-
+transfer ladder's decision rule, the bug is **not** in cache
+shape/binding/slot-mapping/state-initialization -- it narrows specifically
+to Stage C (this project's own hand-built attention/GDN metadata
+construction in `DirectModelRunner._attention_metadata`/`_gdn_metadata`),
+which is the next stage.
+
+**One known gap, not exercised by this narrow test, worth flagging**: the
+real `Scheduler`'s `kv_cache_config` still reflects vLLM's own large,
+profiled block-pool size (~200K tokens here) even though the substituted
+tensor only has capacity for `4 slots x 128 blocks x 16 tokens = 8192`
+tokens total. This round's single short request (~13 tokens) never
+approaches that limit, so the mismatch never manifested -- but this is a
+real latent gap (not a "pass," an "untested corner") that would need
+addressing (e.g. forcing the scheduler's own block-count belief down to
+match, via a smaller profiled `gpu_memory_utilization`/explicit
+`kv_cache_memory`) before Stage B could be trusted for anything beyond this
+narrow smoke test.

@@ -47,9 +47,26 @@ vLLM's real machinery -- combined with the two independent defects already
 ruled out as root causes, this narrows the actual bug specifically to
 `direct_model_runner.py`'s own hand-rolled orchestration, not anything
 downstream of it. Full detail in the design doc's "Step 2 result" section.
-Step 3 (the three-stage ownership-transfer ladder to localize exactly what
-in that hand-rolled orchestration is wrong) is deliberately NOT started
-this round, per the explicit instruction to stop after steps 1+2.
+**Step 3, Stage B (this round, DONE): our own cache exonerated, 20/20.**
+Built `runtime/vllm_stage_b_baseline.py`: real vLLM `Scheduler`/
+`GPUModelRunner`/metadata builders/warmup, unchanged, with exactly one
+substitution -- monkey-patched `GPUModelRunner.initialize_kv_cache_tensors`
+to call a newly-extracted shared helper,
+`runtime.direct_model_runner.allocate_fixed_slot_kv_caches` (the *same*
+4-fixed-slot allocation/binding logic `DirectModelRunner` itself uses,
+confirmed behavior-preserving via the regression script's unchanged logits
+hash after the refactor), instead of vLLM's own cache tensor allocation.
+**Ran 20 consecutive fresh-process repeats: 20/20 identical PASS**, same
+correct completion every time. **This exonerates the cache layer** -- our
+own KV/GDN state tensor shape, allocation, and `bind_kv_cache()` binding are
+all correct under real vLLM scheduling. The bug narrows specifically to
+Stage C (this project's own hand-built attention/GDN metadata
+construction), not cache shape/binding/slot-mapping/state-init. One noted
+gap (not a failure, an untested corner): the real scheduler's block-pool
+size belief (~200K tokens) still exceeds the substituted tensor's real
+capacity (~8192 tokens) -- never manifested in this narrow single-short-
+request test, but would need reconciling before trusting Stage B beyond
+this smoke test. Full detail in the design doc's "Stage B result" section.
 
 ### Phase 3, main-line redirect (2026-07-16) — direct model runner, replacing the HTTP bridge
 
