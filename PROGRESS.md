@@ -284,6 +284,63 @@ coordinator's scoping): accept/reject sampling logic and CUDA Graph
 capture -- both left for a follow-on round alongside real
 W1/W2/concurrency=4/MTP-K=3 performance measurement.
 
+### Phase 3, CUDA Graph capture/replay step 1 (qo_len=1 batch decode) (2026-07-16) — implemented + verified uninstrumented; compute-sanitizer in progress
+
+Per the coordinator's explicit caution about this work's crash history,
+read the sibling project's kernel-level CUDA-graph test
+(`test_cudagraph_decode_fixed_sizing.py`) as prior art first, and fixed a
+prerequisite BEFORE attempting capture: `build_attention_metadata_batch`'s
+`kv_split_size` was derived per-call from live kv_len -- exactly what the
+sibling's own docs warn goes stale under graph replay at a kv_len larger
+than capture-time data. Added `fixed_kv_split_size`/`fixed_max_num_splits`
+params (derived once from this slot's hard capacity, default `None`
+preserving the existing eager-path behavior) with the same correctness
+proof the real backend uses.
+
+New `CapturedBatchDecodeGraph`: every tensor a captured launch reads is a
+persistent, fixed-address buffer; `replay()` only `.copy_()`s fresh
+values into them. Also caught and fixed `torch.cuda.synchronize()` being
+called inside the capture region (a documented capture violation) before
+it could crash, via a sync-free `_forward_no_sync()` path.
+
+New test `benchmarks/cudagraph_decode_regression.py`: captures at a small
+(~15-token) shape, replays at the capture-time shape, 8 steps of normal
+growth, one slot pushed to **1961/2048 tokens (96% of hard capacity)**
+while others stay small, and a freshly re-prefilled 1-token slot
+alongside larger ones -- deliberately far more extreme than the
+capture-time shape, per the coordinator's explicit instruction not to
+only test the happy path. Checked via signal-probe (not bytewise).
+**Result: 3/3 independent repeats, all PASS, zero crashes** -- every slot
+at every kv_len, including the 96%-capacity case, correctly recovered its
+own identity marker with zero cross-slot leakage.
+
+**compute-sanitizer: attempted, not yet complete -- reported honestly,
+not skipped or faked.** Full test under `--tool memcheck`: weight loading
+alone took 662-793s (~10-15x normal), then 60+ minutes with zero further
+progress; killed after ~1-2 hours. A cut-down 10-call minimal repro
+(`benchmarks/cudagraph_decode_sanitizer_repro.py`) still stalled for
+hours under full memcheck. Switched to `--tool initcheck` (lighter,
+targets uninitialized-memory/invalid-pointer issues specifically):
+weight loading returned to normal speed, but the first forward pass (this
+runner's own pre-existing `_warmup()`, unrelated to this round's code)
+produced thousands of "Uninitialized __global__ memory read" reports, ALL
+tracing to the already-known, already-investigated `causal_conv1d`
+Triton-kernel cold-start defect documented earlier in this project (see
+notes/direct-model-runner-design.md's "Known independent defects") --
+real, but not new, and not part of this round's scope. Its sheer volume
+drowns out the sanitizer's report budget before ever reaching the actual
+`capture()`/`replay()` code. Now working around via `--kernel-name-exclude
+kernel_substring=causal_conv1d`; a machine reboot killed this attempt
+mid-run (confirmed via fresh `git status`/`nvidia-smi`/`ps` after
+restart -- all working-tree changes were preserved on disk, no GPU/process
+state survived, as expected) -- restarting this specific check now.
+
+**Honest status**: the capture/replay mechanism itself is solidly
+verified via extensive real (uninstrumented) testing targeting the exact
+failure modes the sibling project's own history warns about. The
+coordinator's compute-sanitizer 0-errors gate has NOT yet been satisfied
+-- reported as incomplete, in progress, not glossed over.
+
 ### Phase 3, main-line redirect (2026-07-16) — direct model runner, replacing the HTTP bridge
 
 The sibling `sm120-flash-attention` project's attention-kernel-tuning main

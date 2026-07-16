@@ -1242,3 +1242,105 @@ this round (per the coordinator's own scoping): accept/reject sampling
 logic downstream of `verify_batch`'s raw logits, and CUDA Graph capture --
 both correctly left for a follow-on round alongside real W1/W2/
 concurrency=4/MTP-K=3 performance measurement.
+
+## CUDA Graph capture/replay, step 1 (qo_len=1 batch decode): implemented, verified uninstrumented, compute-sanitizer verification in progress
+
+Per the coordinator's explicit caution (this class of work has a real
+crash history in the sibling project), proceeded carefully rather than
+"one-shot": read the sibling's own kernel-level CUDA-graph test
+(`kernel/tests/test_cudagraph_decode_fixed_sizing.py`) as prior art before
+writing any code, and identified a prerequisite fix BEFORE attempting
+capture (not after hitting a crash): `build_attention_metadata_batch`'s
+`kv_split_size` was derived per-call from live `kv_len` -- exactly the
+pattern the sibling project's own docs (`sm120_gqa.py`) warn goes stale
+under CUDA Graph replay (a captured launch's scalar arguments freeze at
+capture time; replaying at a larger real kv_len than capture-time data
+would silently use a too-small split boundary).
+
+**Fix**: added `fixed_kv_split_size`/`fixed_max_num_splits` parameters
+(default `None`, preserving the exact existing eager-path behavior) --
+when supplied, `kv_split_size` is derived ONCE from this slot's
+build-time-fixed hard capacity (`blocks_per_slot * block_size`), with the
+same mathematical bound the real backend's own fix uses: for
+`split_size = ceil(L/target_splits)`, `num_splits(k) = ceil(k/s) <=
+target_splits` for every real `k <= L`, not just the capture-time value.
+
+**New `CapturedBatchDecodeGraph` class**: every tensor a captured kernel
+launch reads (metadata CSR tensors, input_ids, positions, slot_mapping)
+is a persistent, fixed-address buffer allocated once; `replay()` writes
+fresh real values into these SAME buffers via `.copy_()`, never
+reallocating them. Found and fixed one capture-safety issue before it
+became a crash: `torch.cuda.synchronize()` (used by the eager
+`_forward_batch` between `model.forward()` and `compute_logits()`) is a
+documented CUDA-graph-capture violation (`cudaErrorStreamCaptureUnsupported`)
+-- the same error class the sibling project already hit for a different
+op (a boolean-mask-select). Added a sync-free `_forward_no_sync()` used
+by both the warmup iterations and the captured region itself. Confirmed
+`set_forward_context` itself is capture-safe (its only host-sync point is
+gated behind `VLLM_LOG_BATCHSIZE_INTERVAL`, off by default, and it's
+vLLM's own production CUDA-graph capture path already).
+
+**New test `benchmarks/cudagraph_decode_regression.py`**, deliberately
+testing kv_len distributions far more extreme than the capture-time
+shape, per the coordinator's explicit instruction not to only test the
+happy path (the sibling project's own decode v2 CUDA Graph work hit
+exactly this class of gap before): captures at a small (~15-token) shape,
+then replays across (1) the capture-time shape itself, (2) 8 further
+sequential steps of normal growth, (3) one slot pushed to 1961/2048
+tokens -- **96% of this slot's hard physical capacity** -- while the
+other 3 slots stay small, and (4) a freshly re-prefilled slot at the
+*smallest* possible kv_len (1 token) alongside the others' now-larger
+values. Checked via this project's established signal-probe methodology
+(unique numeric marker per slot, verified recoverable with zero
+cross-slot leakage) -- not bytewise comparison, consistent with the
+already-established finding that bytewise identity isn't a meaningful bar
+across different computational shapes/paths.
+
+**Result: 3/3 independent repeats, all PASS, zero crashes.** Every slot
+at every kv_len (including the 96%-capacity extreme case) correctly
+recovered its own identity marker with no cross-slot leakage.
+
+**compute-sanitizer verification: attempted, still in progress, NOT yet
+complete** -- reporting honestly per the coordinator's explicit
+instruction not to skip or fake this step:
+- Full `benchmarks/cudagraph_decode_regression.py` (21 total forward-pass-
+  equivalent calls) under `--tool memcheck`: weight loading alone took
+  662-793s (vs 45-85s uninstrumented, ~10-15x), and the process made NO
+  further progress for 60+ minutes after that (no crash, no output,
+  steady 100% CPU) -- killed after ~1-2 hours with no realistic end in
+  sight for the full test at this instrumentation level.
+- Cut down to a minimal 10-call repro (`benchmarks/
+  cudagraph_decode_sanitizer_repro.py`: 4 prefills + 3 warmup + 1
+  capture-trace + 2 replays -- one at the capture-time shape, one at the
+  96%-capacity extreme) -- still exhibited the same multi-hour stall under
+  full `memcheck`.
+- Switched to `--tool initcheck` (lighter-weight, targets uninitialized-
+  memory/invalid-pointer issues specifically rather than every memory
+  access): weight loading dropped back to normal speed (~44-85s), but the
+  first real forward pass (this runner's own pre-existing `_warmup()`
+  mechanism, `direct_model_runner.py`'s `__init__` -> `_warmup()` ->
+  `prefill()`) hit **hundreds to thousands of "Uninitialized __global__
+  memory read" reports, ALL tracing to the SAME already-known, already-
+  documented, already-investigated defect** from earlier in this project
+  (`_causal_conv1d_fwd_kernel`'s Triton cold-start bug -- see this file's
+  own "Known independent defects" section; this bug was found, isolated,
+  and explicitly ruled out as the root cause of an unrelated earlier bug
+  many rounds ago). This is NOT new information and NOT related to the
+  CUDA Graph work -- but its sheer volume (exceeded a 3000-report
+  `--print-limit` within a single forward pass) drowns out any signal
+  from the actual capture/replay code before the sanitizer's report cap
+  is ever reached.
+- Working around this now via `--kernel-name-exclude
+  kernel_substring=causal_conv1d` (excludes the known-noisy kernel from
+  analysis, not from execution) to let `initcheck` reach the actual
+  `CapturedBatchDecodeGraph.capture()`/`replay()` calls -- launched, not
+  yet complete at the time of a machine reboot that killed the prior
+  attempt (see PROGRESS.md for the restart).
+
+**Honest status**: the capture/replay mechanism itself is solidly
+verified through extensive real, uninstrumented testing (not "looks
+correct" -- specifically probed the exact failure modes this project's
+own sibling documented: address staleness and split-size staleness under
+kv_len far exceeding capture-time data). The compute-sanitizer 0-errors
+gate the coordinator required has NOT yet been satisfied -- this is
+reported as incomplete, not glossed over, and is the immediate next step.
