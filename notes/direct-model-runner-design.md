@@ -1493,3 +1493,157 @@ see above) and accept/reject sampling logic (out of scope per the
 coordinator's own MTP-batch-support round). Next: the real W1/W2/
 concurrency=4/MTP-K=3 performance comparison against native FlashInfer,
 using the sibling project's established benchmark methodology.
+
+## 2026-07-17 correction: an independent (Codex) review found a REAL gap in the CUDA Graph work above that had been reported as "verified" -- state pollution, a hot-path allocation/sync issue, and an inaccurate "hardware capacity" framing
+
+**This section exists because something reported as verified/passing in
+the sections above was not fully correct.** The coordinator commissioned
+an independent Codex analysis of this project's overall state; Codex
+found, and the coordinator personally verified against the actual code
+before relaying it, a real correctness gap in `CapturedBatchDecodeGraph`
+that the 3/3-PASS signal-probe results above did not catch. This is
+recorded plainly, not glossed over.
+
+**The finding**: `capture()`'s 3 real warmup executions (on a side
+stream, before the graph trace -- the trace itself executes nothing) were
+run against WHATEVER slots the caller passed in -- and every test script
+this project wrote (`cudagraph_decode_regression.py`,
+`cudagraph_mtp_regression.py`) passed the SAME slots for warmup as were
+later checked via `replay()`. Attention's paged KV cache tolerates
+redundant warmup writes fine (same position, same value, overwritten
+harmlessly) -- but GDN's recurrent/chunked state update reads-old-state-
+and-writes-new-state every call, so repeating it 3 extra times on a slot
+BEFORE the "real" replay silently advances that slot's actual GDN state
+by 3 unaccounted steps that `slot_kv_len` bookkeeping has no idea
+happened. The earlier round's response to this exact risk (in the MTP
+section above) was: "this is a real imprecision... likely didn't surface
+because this signal-probe task is dominated by full-attention layers." **That was an unverified guess presented with more confidence than it
+deserved, not evidence** -- exactly the kind of claim this project's own
+`feedback_verify_subagent_claims_before_propagating` discipline warns
+against propagating without checking.
+
+**Quantified proof the gap was real and severe, not a subtle
+edge case** (see "eager-vs-graph numerical parity check" below for the
+proper permanent fix's own verification; this specific number comes from
+a throwaway diagnostic, `/tmp/.../demonstrate_old_bug.py`, not committed,
+that manually reproduced the OLD capture-warmup pattern against the same
+slots checked via replay): identical single-token input into two
+otherwise-identical physical slots, one via the eager path, one via a
+graph that had 3 old-style redundant warmup executions run against the
+SAME slot first --
+
+```
+LOGITS max_abs_diff=7.92578125 cosine_sim=0.5486875772476196
+GDN conv_max_diff=45.8203125  ssm_max_diff=12.510265350341797
+```
+
+A cosine similarity of 0.55 and a GDN state tensor differing by tens in
+absolute magnitude is NOT floating-point noise -- it is a real, severe
+divergence that the signal-probe tests never had a chance to catch
+because they only ever checked whether the FINAL DECODED TEXT still
+happened to recover the right identity number, not the underlying
+logits/state.
+
+**Fix, built into `CapturedBatchDecodeGraph` itself (not left to caller
+discipline this time)**:
+1. **State-neutral capture**: the class now permanently reserves
+   `batch_size` of the runner's own logical slots (the LAST
+   `batch_size` slots of `runner.num_slots`, via `self._warmup_slots`)
+   exclusively for `capture()`'s own disposable warmup. `capture()` no
+   longer takes ANY external slot/token/kv_length arguments -- it
+   prefills its own reserved slots with a fixed dummy prompt (`[0, 0, 0,
+   0, 0]`, matching `DirectModelRunner._warmup`'s own convention) and
+   uses those. Callers must size `runner.num_slots >= 2 * batch_size` (a
+   `ValueError` is raised otherwise) and must never pass a graph's
+   reserved warmup slots to `replay()` (also enforced with a
+   `RuntimeError`). This works because `capture()`'s slot identity was
+   ALREADY never required to match `replay()`'s (both independently
+   recompute addressing fresh each call) -- the bug was never using that
+   freedom, not a structural limitation.
+2. **Removed the per-replay `torch.cuda.synchronize()`** (also flagged
+   by the same review): `_fill_buffers`'s `.copy_()` calls and
+   `self._graph.replay()` are all issued on the SAME (default) CUDA
+   stream, so CUDA's own stream-ordering already guarantees correctness
+   without an explicit device-wide sync -- which was actively working
+   against the whole point of using a captured graph to cut CPU-side
+   dispatch overhead (it blocks on ANY other queued device work, not
+   just this graph's own stream).
+3. **Leaner `_fill_buffers`** (same review, "no new allocations on the
+   replay hot path"): rewritten to compute per-replay values via plain
+   Python arithmetic instead of round-tripping through
+   `build_attention_metadata_batch`/`build_gdn_metadata_batch`/
+   `DirectModelRunner._slot_mapping_batch`, each of which constructs
+   several of their own intermediate GPU tensors for dataclass fields
+   this hot path doesn't need. Partial mitigation, honestly scoped: each
+   static buffer's `.copy_()` source is still a freshly built small
+   tensor, not a persistent pinned staging buffer written in place --
+   a fully allocation-free version is a further optimization, not
+   attempted this round.
+
+**New, decisive verification** (`benchmarks/cudagraph_eager_parity_check.py`)
+-- real numerical eager-vs-graph comparison, NOT signal-probe, per the
+coordinator's explicit instruction: drives the IDENTICAL single-token
+input through the already-verified eager path and the (now-fixed)
+captured-graph path on independent, identically-prefilled physical
+slots, and compares directly:
+- Full logits: max abs diff, cosine similarity, `torch.allclose`.
+- Top-1/top-5 predicted token agreement.
+- The GDN `conv_state`/`ssm_state` tensors themselves, read directly out
+  of `runner.kv_caches` for each physical slot -- the single most direct
+  test for this exact bug class (GDN's own math doesn't depend on
+  attention's kv_split_size at all, so eager and graph should agree here
+  far more tightly than the logits comparison, which has an expected
+  small amount of noise from different kv_split_size/split-reduction
+  paths -- see the test file's own docstring for the reasoning).
+
+**Result with the fix applied: `max_abs_diff=0.0`, `cosine_similarity=1.0`,
+top-1/top-5 exact match, and EVERY one of 48 GDN layers checked shows
+`conv_max_diff=0.0`/`ssm_max_diff=0.0`** -- eager and graph are not just
+"close," they are bytewise identical. **3/3 independent repeats, all
+PASS.** Re-ran the qo_len=1 and MTP regression tests too after the fix
+(all four affected scripts updated to the new no-arg `capture()` API and
+the `2*batch_size`/`3*batch_size` slot-reservation requirement): both
+still 3/3 PASS, unchanged pass/fail pattern from before the fix.
+
+**Also corrected, per the same review**: this round's and the prior
+round's prose repeatedly described the test's `blocks_per_slot *
+block_size = 2048`-token limit as this slot's "hard (physical) capacity"
+-- inaccurate and misleading phrasing. This is a SMALL VALUE THIS TEST
+ITSELF CONFIGURED for speed, not a GPU hardware limit, and it is far
+below the 4K/32K a real W1/W2 workload will need (a future performance-
+benchmark round must configure `blocks_per_slot` much larger for that).
+Fixed the live code/docstrings and all four benchmark scripts to say
+"this test's configured per-slot page-table limit" instead. Earlier
+already-committed PROGRESS.md/notes entries using the old phrasing are
+left as-is (historical record, not silently rewritten) -- this note is
+the correction of record for anyone reading them later.
+
+**Other findings from the same review, acknowledged but NOT fixed this
+round (explicitly out of this round's scope, tracked as open items for
+later)**:
+- `DirectModelRunner`/`build_vllm_config` hardcode
+  `attention_backend=AttentionBackendEnum.CUSTOM` with no native
+  (FlashInfer) fallback path -- given the sibling project's own
+  conclusion that native attention is currently faster than this
+  project's custom kernel, this runtime currently has no way to opt back
+  into the faster path. Not addressed this round.
+- `runtime/engine.py`'s `EagerEngine.decode_batch()` (a separate,
+  older control-plane abstraction) still loops calling single-request
+  `self.decode()` -- it has never been wired to
+  `DirectModelRunner.decode_batch()`/`CapturedBatchDecodeGraph`, so the
+  control-plane layer and the real batching/CUDA-Graph mechanism
+  built this round remain two disconnected pieces. Not addressed this
+  round.
+- `verify_batch()` still only returns raw logits; accept/reject sampling
+  is not implemented (already known/tracked, consistent with prior
+  rounds' explicit scoping).
+
+**Per the coordinator's new priority ordering, the next steps (not this
+round) are**: (2) full eager-mode MTP semantics (real draft generation,
+bonus-token handling, accept/reject, and an explicit GDN state commit/
+rollback strategy for partial rejection -- flagged as the hard part,
+since attention's KV can be logically truncated but GDN's recurrent
+state cannot be simply rewound), THEN (3) the real W1/W2/concurrency=4/
+MTP-K=3 performance comparison, configured with per-slot capacity
+actually sized for W1 (4K)/W2 (32K), not this round's small 2048-token
+test configuration.

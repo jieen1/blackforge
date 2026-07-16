@@ -424,6 +424,70 @@ PASS, zero crashes.**
 W1/W2/concurrency=4/MTP-K=3 performance comparison against native
 FlashInfer.
 
+### Phase 3, correction (2026-07-17) — an independent review found the CUDA Graph work above had a REAL, unfixed gap; now fixed with quantified before/after proof
+
+**This corrects something reported as verified/passing above.** The
+coordinator commissioned an independent Codex analysis, personally
+verified it against the actual code, and found: `capture()`'s 3 real
+warmup executions ran against the SAME slots every test script here
+later checked via `replay()`. Attention's KV cache tolerates redundant
+warmup writes harmlessly; GDN's recurrent/chunked state does NOT (it
+reads-old-state-writes-new-state every call, not idempotent under
+repeated identical input) -- so those slots' real GDN state silently
+advanced 3 extra unaccounted steps before any "real" replay. The earlier
+round's guess that this "likely didn't surface because full-attention
+layers dominate the signal-probe task" was an **unverified guess stated
+with more confidence than earned, not evidence**.
+
+**Quantified proof the gap was real and severe**: a throwaway diagnostic
+reproducing the old pattern (identical single-token input, eager vs a
+graph with old-style same-slot warmup) measured `logits max_abs_diff=
+7.93`, `cosine_sim=0.55`, GDN `conv_max_diff=45.8`, `ssm_max_diff=12.5`
+-- not floating-point noise, a real divergence the signal-probe (which
+only checks whether decoded TEXT still recovers the right identity
+number) never had a chance to catch.
+
+**Fix, built into the class itself**: `CapturedBatchDecodeGraph` now
+permanently reserves `batch_size` of the runner's own slots exclusively
+for `capture()`'s disposable warmup (`capture()` takes no external
+arguments anymore); callers must size `num_slots >= 2*batch_size` and
+never pass a graph's reserved slots to `replay()` (both enforced with
+errors). Also removed a per-replay `torch.cuda.synchronize()` (stream
+ordering already guarantees correctness; the blanket device-wide sync
+was actively working against the point of using a graph to cut CPU
+dispatch overhead) and made `_fill_buffers` compute values via plain
+Python arithmetic instead of round-tripping through the shared metadata-
+builder functions (real, partially-mitigated per-replay allocation
+overhead -- not fully eliminated, a further optimization for later).
+
+**New decisive verification** (`benchmarks/cudagraph_eager_parity_check.py`,
+real numerical comparison, not signal-probe): identical input through
+eager vs the fixed graph path, comparing full logits AND the GDN
+`conv_state`/`ssm_state` tensors directly. **Result: `max_abs_diff=0.0`,
+`cosine_similarity=1.0`, top-1/top-5 exact match, all 48 GDN layers
+checked show 0.0 diff -- eager and graph are bytewise identical, not
+just close. 3/3 repeats PASS.** Re-ran the qo_len=1 and MTP regression
+tests too (all 4 affected scripts updated to the new API): both still
+3/3 PASS.
+
+**Also corrected**: prior wording describing this test's small
+`blocks_per_slot*block_size=2048`-token limit as "hard (physical)
+capacity" was inaccurate -- it's a value THIS TEST configured for speed,
+not a GPU hardware limit, and far below what a real W1(4K)/W2(32K)
+workload needs. Fixed in live code/docstrings; already-committed
+historical entries using the old phrasing are left as-is (this note is
+the correction of record).
+
+**Acknowledged but NOT fixed this round** (tracked open items): no
+native-attention-backend fallback path, `engine.py`'s `decode_batch()`
+still disconnected from the real batching/CUDA-Graph mechanism,
+accept/reject sampling still not implemented. Per the coordinator's
+priority order, next is full eager-mode MTP semantics (real draft
+generation, accept/reject, a GDN state commit/rollback strategy for
+partial rejection), THEN the real W1/W2 performance comparison
+(configured with actually-sized per-slot capacity, not this round's
+small test value).
+
 ### Phase 3, main-line redirect (2026-07-16) — direct model runner, replacing the HTTP bridge
 
 The sibling `sm120-flash-attention` project's attention-kernel-tuning main

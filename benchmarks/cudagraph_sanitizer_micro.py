@@ -8,7 +8,8 @@ further:
     mechanism being checked doesn't depend on batch size -- 4-slot
     correctness is already independently verified via extensive
     uninstrumented testing in cudagraph_decode_regression.py, 3/3 PASS
-    including a 96%-capacity extreme case).
+    including a case near this test's own configured per-slot page-table
+    limit, not a GPU hardware limit).
   - Exactly ONE replay, directly at an extreme (near-capacity) kv_len --
     the single most decisive check (capture-time shape vs a drastically
     different replay-time shape) -- instead of a small-shape sanity
@@ -64,9 +65,14 @@ def main() -> int:
         model=MODEL, kv_cache_dtype="fp8_e4m3", max_model_len=2048, gpu_memory_utilization=0.5
     )
     block_size, blocks_per_slot = 16, 128
-    capacity = block_size * blocks_per_slot
+    capacity = block_size * blocks_per_slot  # this test's configured per-slot page-table limit, not a GPU hardware limit
     batch = 2
-    runner = DirectModelRunner(vllm_config, num_slots=batch, block_size=block_size, blocks_per_slot=blocks_per_slot)
+    # 2*batch: batch real slots under test + batch permanently reserved for
+    # CapturedBatchDecodeGraph's own disposable capture() warmup (2026-07-17
+    # state-neutral-capture fix).
+    runner = DirectModelRunner(
+        vllm_config, num_slots=2 * batch, block_size=block_size, blocks_per_slot=blocks_per_slot
+    )
     tok = AutoTokenizer.from_pretrained(MODEL)
     slots = list(range(batch))
 
@@ -78,10 +84,10 @@ def main() -> int:
     kv_lengths = [runner.slot_kv_len[s] for s in slots]
 
     graph = CapturedBatchDecodeGraph(runner, batch_size=batch, qo_len=1)
-    graph.capture(slots, next_tokens, kv_lengths)
+    graph.capture()  # self-contained, uses its own reserved warmup slots
     print("CAPTURE_OK")
 
-    # Push slot 1 to near this slot's hard capacity in ONE prefill, then
+    # Push slot 1 to near this test's configured per-slot limit in ONE prefill, then
     # replay the captured graph directly at this extreme, mixed kv_len
     # distribution (slot 0 still small, slot 1 near-max) -- the single
     # most decisive test of address/split-size staleness under replay.

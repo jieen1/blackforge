@@ -16,9 +16,12 @@ against, not just "does it look right once":
 Per the coordinator's explicit instruction, this test deliberately
 captures at a SMALL kv_len (a realistic "just prefilled" shape) and then
 replays at kv_len distributions FAR more extreme than that -- including a
-slot pushed to within a few pages of this runtime's hard per-slot
-capacity (``blocks_per_slot * block_size``) -- not just the happy path of
-replaying near the capture-time shape.
+slot pushed to within a few pages of this test's OWN configured per-slot
+page-table limit (``blocks_per_slot * block_size`` = 2048 tokens here --
+a small value chosen for this correctness test's speed, NOT a GPU
+hardware limit, and far below the 4K/32K a real W1/W2 workload would
+need; a performance-benchmark round would configure this much larger) --
+not just the happy path of replaying near the capture-time shape.
 
 Correctness is checked via this project's established signal-probe
 methodology (a unique numeric marker per slot, verified recoverable with
@@ -55,7 +58,8 @@ def _make_prompt(number: int, filler_tokens_target: int = 0, tok=None) -> str:
     # Repeat the filler sentence enough times to exceed the target token
     # count, then let the tokenizer re-tokenize the whole prompt (we only
     # need to be IN THE NEIGHBORHOOD of the target -- exact length doesn't
-    # matter for this test, just "near this slot's hard capacity").
+    # matter for this test, just "near this test's configured per-slot
+    # page-table limit").
     repeats = max(1, filler_tokens_target // 8)
     filler = FILLER_SENTENCE * repeats
     return f"{filler}The value of X is {number}. The value of X is"
@@ -88,10 +92,14 @@ def _run_once() -> dict:
         gpu_memory_utilization=0.5,
     )
     block_size, blocks_per_slot = 16, 128
-    capacity = block_size * blocks_per_slot  # 2048 tokens/slot
+    capacity = block_size * blocks_per_slot  # this test's configured per-slot page-table limit (2048 tokens)
     batch = 4
+    # 2*batch: batch real slots under test + batch permanently reserved for
+    # CapturedBatchDecodeGraph's own disposable capture() warmup (see that
+    # class's docstring's "state-neutral capture" section -- 2026-07-17
+    # correctness fix).
     runner = DirectModelRunner(
-        vllm_config, num_slots=batch, block_size=block_size, blocks_per_slot=blocks_per_slot
+        vllm_config, num_slots=2 * batch, block_size=block_size, blocks_per_slot=blocks_per_slot
     )
     tok = AutoTokenizer.from_pretrained(MODEL)
 
@@ -124,7 +132,10 @@ def _run_once() -> dict:
 
     # --- Step 2: capture the graph at this small shape. ---
     graph = CapturedBatchDecodeGraph(runner, batch_size=batch, qo_len=1)
-    graph.capture(slots, next_tokens, kv_lengths)
+    # capture() is now self-contained (2026-07-17 state-neutral-capture
+    # fix): it uses its own permanently reserved warmup slots internally,
+    # never touching `slots` (the ones actually checked below).
+    graph.capture()
 
     # --- Step 3: replay AT THE CAPTURE-TIME SHAPE first (sanity). ---
     cur_tokens = list(next_tokens)

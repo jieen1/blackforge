@@ -282,9 +282,11 @@ def build_attention_metadata_batch(
     use a stale, too-small split boundary -- the real backend's own fix
     (and this project's, when these are supplied) is to derive
     kv_split_size ONCE from a build-time-fixed upper bound L (this
-    project's own ``blocks_per_slot * block_size``, i.e. this slot's
-    hard physical capacity -- already enforced by the RuntimeError check
-    below) via ``kv_split_size = ceil(L / target_splits)``,
+    project's own ``blocks_per_slot * block_size``, i.e. the per-slot
+    page-table limit THIS RUNTIME'S CALLER configured when constructing
+    ``DirectModelRunner`` -- a software-chosen ceiling, not a GPU hardware
+    limit; already enforced by the RuntimeError check below) via
+    ``kv_split_size = ceil(L / target_splits)``,
     ``max_num_splits = target_splits``. Proof this stays correct for
     EVERY real kv_len from 1 up to L, not just the capture-time value:
     for split_size s = ceil(L/target_splits) and any real kv_len k <= L,
@@ -814,12 +816,14 @@ class CapturedBatchDecodeGraph:
        it never reallocates them. This is what makes replaying at a
        kv_len the buffers were never filled with at capture time safe.
     2. ``kv_split_size``/``max_num_splits`` are derived ONCE from this
-       slot's build-time-fixed hard capacity (``blocks_per_slot *
-       block_size``), via ``build_attention_metadata_batch``'s
-       ``fixed_kv_split_size``/``fixed_max_num_splits`` parameters -- see
-       that function's docstring for the correctness proof that this
-       bounds every real kv_len up to that capacity, not just the
-       capture-time value.
+       runtime's configured per-slot page-table limit (``blocks_per_slot *
+       block_size`` -- a software ceiling the caller chose when
+       constructing ``DirectModelRunner``, NOT a GPU hardware limit), via
+       ``build_attention_metadata_batch``'s ``fixed_kv_split_size``/
+       ``fixed_max_num_splits`` parameters -- see that function's
+       docstring for the correctness proof that this bounds every real
+       kv_len up to that configured limit, not just the capture-time
+       value.
 
     2026-07-16, MTP extension (qo_len>1): GDN's chunked/"prefill" metadata
     fields (``chunk_indices``/``chunk_offsets``/``nums_dict``/
@@ -846,20 +850,80 @@ class CapturedBatchDecodeGraph:
     kv_len this graph will ever replay at -- true here because dispatch
     depends only on ``qo_len``/kv-cache dtype/model config, all fixed for
     a given (batch_size, qo_len) graph, never on the live kv_len itself.
+
+    2026-07-17, state-neutral capture (correctness fix, found via an
+    independent review this project's coordinator commissioned and
+    personally verified): ``capture()``'s warmup runs 3 REAL executions
+    on a side stream before the graph trace (the trace itself, inside
+    ``with torch.cuda.graph(g):``, executes nothing -- confirmed against
+    the sibling project's own kernel-level CUDA-graph test). Attention's
+    paged KV cache tolerates redundant warmup writes fine (same position,
+    same value, overwritten harmlessly) -- but GDN's recurrent/chunked
+    state update reads-old-state-and-writes-new-state each call, so it is
+    NOT idempotent under repeated identical input; running warmup against
+    slots a caller will later actually replay against silently advances
+    those slots' real GDN state by 3 extra (unaccounted, un-bookkept)
+    applications before any real replay happens. This was a genuine gap
+    in this project's own initial qo_len=1/MTP test scripts (both reused
+    real/twin-established slots for warmup) -- their empirical PASS
+    results are not proof this doesn't matter, only evidence it didn't
+    surface for that specific signal-probe task (plausibly because
+    full-attention layers dominate identity recall, masking a GDN
+    perturbation a GDN-sensitive task might not tolerate).
+
+    Fix: this class now reserves ``batch_size`` of the runner's logical
+    slots PERMANENTLY for its own exclusive, disposable warmup use (the
+    LAST ``batch_size`` slots of ``runner.num_slots`` -- see
+    ``self._warmup_slots``) -- ``capture()`` takes no external slot/token/
+    kv_length arguments at all anymore, so this can no longer depend on
+    caller discipline the way the original design implicitly did. Callers
+    must size ``runner.num_slots >= 2 * batch_size`` and never pass this
+    graph's reserved warmup slots to ``replay()`` or any other runner
+    method.
+
+    Also fixed the same round: ``replay()`` no longer calls
+    ``torch.cuda.synchronize()`` (see that method's docstring for why this
+    is safe and why the removed blanket device-wide sync worked against
+    the whole point of using a captured graph to cut CPU-side dispatch
+    overhead), and ``_fill_buffers`` now computes per-replay values via
+    plain Python arithmetic instead of round-tripping through
+    ``build_attention_metadata_batch``/``build_gdn_metadata_batch``/
+    ``DirectModelRunner._slot_mapping_batch`` (which each construct several
+    of their own intermediate GPU tensors -- real, avoidable per-replay
+    allocation overhead on what should be a lean hot path). This is a
+    partial mitigation (each static buffer's ``.copy_()`` source is still
+    a freshly constructed small tensor, not a persistent pinned staging
+    buffer written in place) -- a fully allocation-free version is a
+    further optimization, not attempted this round.
     """
 
     TARGET_SPLITS = 16
 
     def __init__(self, runner: "DirectModelRunner", batch_size: int, qo_len: int = 1) -> None:
+        if runner.num_slots < 2 * batch_size:
+            raise ValueError(
+                f"runner.num_slots={runner.num_slots} must be >= 2*batch_size "
+                f"({2 * batch_size}): {batch_size} logical slots for real "
+                f"replay() traffic plus {batch_size} PERMANENTLY RESERVED for "
+                "capture()'s own disposable warmup (never exposed to real "
+                "callers) -- see the class docstring's 'state-neutral "
+                "capture' section for why this is required, not optional."
+            )
         self.runner = runner
         self.batch_size = batch_size
         self.qo_len = qo_len
         device = runner.device
         block_size = runner.block_size
         blocks_per_slot = runner.blocks_per_slot
-        capacity = blocks_per_slot * block_size  # this slot's hard physical capacity
+        capacity = blocks_per_slot * block_size  # configured per-slot page-table limit (software, not GPU hardware)
         self.fixed_kv_split_size = max(1, -(-capacity // self.TARGET_SPLITS))
         self.fixed_max_num_splits = self.TARGET_SPLITS
+
+        # Permanently reserved for THIS graph object's own capture()
+        # warmup -- the last batch_size logical slots of the runner.
+        # Callers must never pass these to replay() or any other runner
+        # method; doing so would defeat the whole point of reserving them.
+        self._warmup_slots = list(range(runner.num_slots - batch_size, runner.num_slots))
 
         num_reqs = batch_size
         n_tokens = num_reqs * qo_len
@@ -901,43 +965,72 @@ class CapturedBatchDecodeGraph:
         self._static_logits: torch.Tensor | None = None
 
     def _fill_buffers(self, slot_ids: list[int], token_ids, kv_lengths: list[int]) -> None:
+        """Write real, per-replay-varying values into the persistent static
+        buffers. Computes everything via plain Python arithmetic (CPU-only,
+        no GPU allocation) instead of calling
+        ``build_attention_metadata_batch``/``build_gdn_metadata_batch``/
+        ``DirectModelRunner._slot_mapping_batch`` -- those each construct
+        several of their own intermediate GPU tensors (dataclass fields the
+        caller doesn't need here), real avoidable overhead on a hot path
+        meant to be lean. Each static buffer's ``.copy_()`` source below is
+        still a freshly built small tensor (a partial mitigation, not a
+        fully allocation-free design -- see the class docstring)."""
         runner = self.runner
-        if self.qo_len == 1:
+        device = runner.device
+        qo_len = self.qo_len
+        block_size = runner.block_size
+        blocks_per_slot = runner.blocks_per_slot
+
+        if qo_len == 1:
             flat_token_ids = token_ids
         else:
             flat_token_ids = [tok for slot_tokens in token_ids for tok in slot_tokens]
-        attn_meta = build_attention_metadata_batch(
-            slots=slot_ids,
-            prior_kv_lens=kv_lengths,
-            block_size=runner.block_size,
-            blocks_per_slot=runner.blocks_per_slot,
-            device=runner.device,
-            qo_len=self.qo_len,
-            fixed_kv_split_size=self.fixed_kv_split_size,
-            fixed_max_num_splits=self.fixed_max_num_splits,
-        )
-        gdn_meta = build_gdn_metadata_batch(
-            slots=slot_ids,
-            device=runner.device,
-            qo_len=self.qo_len,
-            slot_initialized=[True] * self.batch_size if self.qo_len > 1 else None,
-        )
-        slot_mapping = runner._slot_mapping_batch(slot_ids, kv_lengths, qo_len=self.qo_len)
 
-        self.static_kv_page_indptr.copy_(attn_meta.kv_page_indptr)
+        new_kv_lens = [kv_len + qo_len for kv_len in kv_lengths]
+        num_pages_per_req = [(kv_len + block_size - 1) // block_size for kv_len in new_kv_lens]
+        for slot, kv_len, num_pages in zip(slot_ids, new_kv_lens, num_pages_per_req):
+            if num_pages > blocks_per_slot:
+                raise RuntimeError(
+                    f"slot {slot} kv_len {kv_len} exceeds this slot's "
+                    f"{blocks_per_slot * block_size}-token capacity"
+                )
+
+        kv_page_indptr_list = [0]
+        for num_pages in num_pages_per_req:
+            kv_page_indptr_list.append(kv_page_indptr_list[-1] + num_pages)
+
+        page_indices_list: list[int] = []
+        for slot, num_pages in zip(slot_ids, num_pages_per_req):
+            first_block = _physical_slot(slot) * blocks_per_slot
+            page_indices_list.extend(range(first_block, first_block + num_pages))
+
+        last_page_len_list = [
+            kv_len - (num_pages - 1) * block_size
+            for kv_len, num_pages in zip(new_kv_lens, num_pages_per_req)
+        ]
+        state_indices_list = [_physical_slot(slot) for slot in slot_ids]
+        positions_list = [kv_len + j for kv_len in kv_lengths for j in range(qo_len)]
+
+        slot_mapping_list: list[int] = []
+        for slot, kv_len in zip(slot_ids, kv_lengths):
+            first_block = _physical_slot(slot) * blocks_per_slot
+            for j in range(qo_len):
+                pos = kv_len + j
+                block_id = first_block + pos // block_size
+                offset = pos % block_size
+                slot_mapping_list.append(block_id * block_size + offset)
+
+        self.static_kv_page_indptr.copy_(torch.tensor(kv_page_indptr_list, dtype=torch.int32, device=device))
         self.static_kv_page_indices.zero_()
-        self.static_kv_page_indices[: attn_meta.kv_page_indices.shape[0]].copy_(attn_meta.kv_page_indices)
-        self.static_kv_last_page_len.copy_(attn_meta.kv_last_page_len)
-        self.static_state_indices.copy_(gdn_meta.non_spec_state_indices_tensor)
-        self.static_input_ids.copy_(torch.tensor(flat_token_ids, dtype=torch.long, device=runner.device))
-        self.static_positions.copy_(
-            torch.tensor(
-                [kv_len + j for kv_len in kv_lengths for j in range(self.qo_len)],
-                dtype=torch.long,
-                device=runner.device,
+        if page_indices_list:
+            self.static_kv_page_indices[: len(page_indices_list)].copy_(
+                torch.tensor(page_indices_list, dtype=torch.int32, device=device)
             )
-        )
-        self.static_slot_mapping.copy_(slot_mapping)
+        self.static_kv_last_page_len.copy_(torch.tensor(last_page_len_list, dtype=torch.int32, device=device))
+        self.static_state_indices.copy_(torch.tensor(state_indices_list, dtype=torch.int32, device=device))
+        self.static_input_ids.copy_(torch.tensor(flat_token_ids, dtype=torch.long, device=device))
+        self.static_positions.copy_(torch.tensor(positions_list, dtype=torch.long, device=device))
+        self.static_slot_mapping.copy_(torch.tensor(slot_mapping_list, dtype=torch.long, device=device))
 
     def _static_metadata_dicts(self) -> tuple[dict, dict]:
         runner = self.runner
@@ -1008,21 +1101,41 @@ class CapturedBatchDecodeGraph:
             hidden_states = runner.model.forward(self.static_input_ids, self.static_positions)
         return runner.model.compute_logits(hidden_states)
 
-    def capture(self, slot_ids: list[int], warmup_token_ids, warmup_kv_lengths: list[int]) -> None:
+    def capture(self) -> None:
         """Warm up (uncaptured, on a side stream -- required by
         ``torch.cuda.graph`` before capture) then capture the graph, using
-        ``(slot_ids, warmup_token_ids, warmup_kv_lengths)`` as the
-        one-time capture-time data. This is NOT part of any replay
-        contract -- the whole point of fixed-sizing kv_split_size/
-        max_num_splits is that the real kv_len distribution replay() sees
-        is expected to differ, often drastically, from whatever's used
-        here. ``warmup_token_ids`` is a flat list when ``qo_len=1``, or a
-        list of per-slot ``qo_len``-length draft-token lists otherwise."""
+        this object's OWN permanently reserved, disposable warmup slots
+        (``self._warmup_slots``) -- NEVER any slot a caller will later pass
+        to ``replay()``. This is what makes capture state-neutral for real
+        traffic: the only slots capture()'s 3 real warmup executions (plus
+        the graph-trace call, which itself executes nothing -- see the
+        class docstring) can touch are these reserved slots.
+
+        Warmup content is disposable and never checked for correctness --
+        any valid token id works, so a fixed dummy prompt is used (``[0,
+        0, 0, 0, 0]``, matching ``DirectModelRunner._warmup``'s own
+        convention). This is also why fixed-sizing kv_split_size/
+        max_num_splits is required in the first place: the real kv_len
+        distribution ``replay()`` sees is expected to differ, often
+        drastically, from this disposable warmup shape."""
         if self._graph is not None:
             raise RuntimeError("already captured")
-        if not (len(slot_ids) == self.batch_size == len(warmup_token_ids) == len(warmup_kv_lengths)):
-            raise ValueError("slot_ids/warmup_token_ids/warmup_kv_lengths must match batch_size")
-        self._fill_buffers(slot_ids, warmup_token_ids, warmup_kv_lengths)
+        runner = self.runner
+        warmup_slots = self._warmup_slots
+        for slot in warmup_slots:
+            if runner.slot_kv_len[slot] != 0:
+                raise RuntimeError(
+                    f"reserved warmup slot {slot} is not fresh -- capture() "
+                    "must run before anything else touches this graph's "
+                    "own warmup slots, and exactly once per graph object"
+                )
+            runner.prefill(slot, [0, 0, 0, 0, 0])
+        warmup_kv_lengths = [runner.slot_kv_len[s] for s in warmup_slots]
+        if self.qo_len == 1:
+            warmup_token_ids = [0] * self.batch_size
+        else:
+            warmup_token_ids = [[0] * self.qo_len for _ in range(self.batch_size)]
+        self._fill_buffers(warmup_slots, warmup_token_ids, warmup_kv_lengths)
 
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
@@ -1043,7 +1156,28 @@ class CapturedBatchDecodeGraph:
         scope, deliberately does) differ drastically from capture()'s
         warmup data, including kv_len values much larger or smaller than
         whatever was used at capture time. Returns logits shaped
-        ``[batch_size * qo_len, vocab]`` (request-then-position order)."""
+        ``[batch_size * qo_len, vocab]`` (request-then-position order).
+
+        No ``torch.cuda.synchronize()`` here (removed 2026-07-17, a
+        correctness-review finding): ``_fill_buffers``'s ``.copy_()`` calls
+        and ``self._graph.replay()`` are all issued on the SAME (default)
+        CUDA stream, so CUDA's own stream-ordering already guarantees the
+        graph's kernels observe the freshly-copied buffer contents, and
+        that the NEXT call's ``_fill_buffers`` won't overwrite data this
+        replay is still reading -- no explicit device-wide sync is needed
+        for that. The caller gets an implicit, narrowly-scoped sync for
+        free the moment it actually reads back a value (e.g.
+        ``.argmax(dim=-1).item()`` on the returned logits). A blanket
+        ``torch.cuda.synchronize()`` here would additionally block on any
+        OTHER unrelated work queued on the device -- directly working
+        against the whole point of using a captured graph to cut CPU-side
+        launch/dispatch overhead."""
+        if slot_ids == self._warmup_slots or set(slot_ids) & set(self._warmup_slots):
+            raise RuntimeError(
+                f"slot(s) {set(slot_ids) & set(self._warmup_slots)} are this "
+                "graph's own reserved warmup slots -- never replay() against "
+                "them, they exist solely for capture()'s internal use"
+            )
         if self._graph is None:
             raise RuntimeError("capture() must be called first")
         if not (len(slot_ids) == self.batch_size == len(token_ids) == len(kv_lengths)):
@@ -1058,7 +1192,6 @@ class CapturedBatchDecodeGraph:
                 raise RuntimeError(f"slot {slot} has no GDN state yet (needs a prior prefill)")
         self._fill_buffers(slot_ids, token_ids, kv_lengths)
         self._graph.replay()
-        torch.cuda.synchronize()
         for slot in slot_ids:
             self.runner.slot_kv_len[slot] += self.qo_len
             self.runner.slot_gdn_initialized[slot] = True

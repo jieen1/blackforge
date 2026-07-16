@@ -6,26 +6,27 @@ capture/replay, step 1" and its MTP-extension follow-up).
 Same discipline as the qo_len=1 test
 (``cudagraph_decode_regression.py``): capture at a small (~15-token)
 shape, then replay at kv_len distributions FAR more extreme than that --
-including a slot pushed to within a few pages of this runtime's hard
-per-slot capacity -- checked via signal-probe (unique numeric marker per
-slot, verified recoverable with zero cross-slot leakage), not bytewise
-comparison.
+including a slot pushed to within a few pages of this test's OWN
+configured per-slot page-table limit (2048 tokens here, a small value
+chosen for this correctness test's speed, NOT a GPU hardware limit) --
+checked via signal-probe (unique numeric marker per slot, verified
+recoverable with zero cross-slot leakage), not bytewise comparison.
 
-Methodology refinement over the qo_len=1 test (found while designing
-this one, see notes/direct-model-runner-design.md for the full writeup):
+State-neutral capture (2026-07-17, a correctness fix now built into
+``CapturedBatchDecodeGraph`` itself, found while designing this test --
+see notes/direct-model-runner-design.md for the full writeup):
 ``capture()``'s warmup (3 REAL executions on a side stream before the
 graph trace -- the trace itself, inside ``with torch.cuda.graph(g):``,
 does NOT execute anything, only records; confirmed against the sibling
 project's own kernel-level CUDA-graph test) is not idempotent for GDN's
 recurrent/chunked state update under repeated identical input (unlike
 attention's KV cache, where writing the same value at the same position
-repeatedly is harmless). ``capture()``'s ``slot_ids`` parameter does NOT
-need to match a later ``replay()`` call's ``slot_ids`` -- both
-independently recompute addressing fresh from whatever slots are passed
--- so this test uses DEDICATED, disposable warmup/draft-establishing
-slots for ``capture()``, keeping the actual slots under test (``graph_
-slots``) genuinely untouched by anything except their own prefill until
-the real ``replay()`` calls below.
+repeatedly is harmless). ``capture()`` now reserves its OWN dedicated,
+disposable warmup slots internally (never any slot a caller passes to
+``replay()``) -- it takes no external slot/token/kv_length arguments at
+all. This test still uses a SEPARATE ``ref_slots`` group of its own, for
+a different, legitimate purpose: establishing trusted draft tokens fed
+into the real ``replay()`` checks below (not capture warmup).
 
 Usage:
     python -m benchmarks.cudagraph_mtp_regression
@@ -96,22 +97,25 @@ def _run_once() -> dict:
         model=MODEL, kv_cache_dtype="fp8_e4m3", max_model_len=2048, gpu_memory_utilization=0.5
     )
     block_size, blocks_per_slot = 16, 128
-    capacity = block_size * blocks_per_slot
+    capacity = block_size * blocks_per_slot  # this test's configured per-slot page-table limit (2048 tokens)
     batch = 4
     qo_len = 4  # K=3 draft + 1 bonus token, the real production MTP shape
 
     # Dedicated slot groups, kept strictly separate by purpose:
-    #   ref_slots    -- establish trusted draft tokens + serve as capture()'s
-    #                   disposable warmup data source (spent afterward, and
-    #                   reset+reused for the second, independent extreme-shape
-    #                   check below).
+    #   ref_slots    -- establish trusted draft tokens for the real replay()
+    #                   checks below (spent afterward, and reset+reused for
+    #                   the second, independent extreme-shape check).
     #   graph_slots  -- the ACTUAL slots checked via the captured graph;
     #                   touched by nothing except their own prefill until
     #                   the real replay() calls below.
+    # A THIRD, separate batch of slots is reserved internally by
+    # CapturedBatchDecodeGraph itself for capture()'s own disposable
+    # warmup (2026-07-17 state-neutral-capture fix -- capture() no longer
+    # takes external slot/token/kv_length args at all), hence 3*batch.
     ref_slots = list(range(batch))
     graph_slots = list(range(batch, 2 * batch))
     runner = DirectModelRunner(
-        vllm_config, num_slots=2 * batch, block_size=block_size, blocks_per_slot=blocks_per_slot
+        vllm_config, num_slots=3 * batch, block_size=block_size, blocks_per_slot=blocks_per_slot
     )
     tok = AutoTokenizer.from_pretrained(MODEL)
 
@@ -135,10 +139,11 @@ def _run_once() -> dict:
         return {"passed": False, "error": "prefill greedy tokens diverged between ref_slots and graph_slots"}
     graph_kv = [runner.slot_kv_len[s] for s in graph_slots]
 
-    # --- Capture using ref_slots' (now-spent, disposable) state+draft as
-    # warmup data -- never touches graph_slots. ---
+    # --- Capture: self-contained, uses CapturedBatchDecodeGraph's own
+    # internally reserved warmup slots -- never touches ref_slots or
+    # graph_slots (2026-07-17 state-neutral-capture fix). ---
     graph = CapturedBatchDecodeGraph(runner, batch_size=batch, qo_len=qo_len)
-    graph.capture(ref_slots, ref_draft, ref_kv_before)
+    graph.capture()
     print("CAPTURE_OK")
 
     steps_log: list[dict] = []

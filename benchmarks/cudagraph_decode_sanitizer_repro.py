@@ -54,9 +54,14 @@ def main() -> int:
         model=MODEL, kv_cache_dtype="fp8_e4m3", max_model_len=2048, gpu_memory_utilization=0.5
     )
     block_size, blocks_per_slot = 16, 128
-    capacity = block_size * blocks_per_slot
+    capacity = block_size * blocks_per_slot  # this test's configured per-slot page-table limit, not a GPU hardware limit
     batch = 4
-    runner = DirectModelRunner(vllm_config, num_slots=batch, block_size=block_size, blocks_per_slot=blocks_per_slot)
+    # 2*batch: batch real slots under test + batch permanently reserved for
+    # CapturedBatchDecodeGraph's own disposable capture() warmup (2026-07-17
+    # state-neutral-capture fix).
+    runner = DirectModelRunner(
+        vllm_config, num_slots=2 * batch, block_size=block_size, blocks_per_slot=blocks_per_slot
+    )
     tok = AutoTokenizer.from_pretrained(MODEL)
     slots = list(range(batch))
 
@@ -65,7 +70,7 @@ def main() -> int:
     kv_lengths = [runner.slot_kv_len[s] for s in slots]
 
     graph = CapturedBatchDecodeGraph(runner, batch_size=batch, qo_len=1)
-    graph.capture(slots, next_tokens, kv_lengths)
+    graph.capture()  # self-contained, uses its own reserved warmup slots
     print("CAPTURE_OK")
 
     logits = graph.replay(slots, next_tokens, kv_lengths)
