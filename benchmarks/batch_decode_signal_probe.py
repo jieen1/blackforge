@@ -89,7 +89,7 @@ def _assign_filler_repeats(batch: int, varlen: bool) -> list[int]:
     return fillers
 
 
-def _run_once(batch: int, varlen: bool, steps: int, reuse: bool) -> dict:
+def _run_once(batch: int, varlen: bool, steps: int, reuse: bool, mtp_qo_len: int = 0) -> dict:
     import torch
 
     sys.path.insert(0, SM120_VLLM_INTEGRATION)
@@ -104,7 +104,16 @@ def _run_once(batch: int, varlen: bool, steps: int, reuse: bool) -> dict:
         max_model_len=2048,
         gpu_memory_utilization=0.5,
     )
-    runner = DirectModelRunner(vllm_config, num_slots=batch, block_size=16, blocks_per_slot=128)
+    # When testing MTP verify, allocate a second, independent twin group of
+    # slots (mirrors batch_decode_regression.py's original approach): the
+    # verify test needs slots whose GDN recurrent state is still pristine
+    # ("as of right after prefill"), which the REF group's slots no longer
+    # are once the `steps` real decode rounds below have run -- unlike
+    # attention's paged KV, GDN's linear-attention state can't be cheaply
+    # "rewound" to an earlier point, so reusing the REF slots after the
+    # fact would silently verify against the WRONG (too-advanced) state.
+    total_slots = batch * 2 if mtp_qo_len > 1 else batch
+    runner = DirectModelRunner(vllm_config, num_slots=total_slots, block_size=16, blocks_per_slot=128)
     tok = AutoTokenizer.from_pretrained(MODEL)
 
     numbers = _assign_numbers(batch)
@@ -176,10 +185,79 @@ def _run_once(batch: int, varlen: bool, steps: int, reuse: bool) -> dict:
         result["reuse_check"] = {"text": text_new, "reuse_ok": reuse_ok}
         result["passed"] = result["passed"] and reuse_ok
 
+    if mtp_qo_len > 1:
+        if steps < mtp_qo_len:
+            raise ValueError("steps must be >= mtp_qo_len (need enough established tokens for the draft)")
+        mtp_slots = list(range(batch, 2 * batch))
+        mtp_next_tokens = [runner.prefill(slot, ids) for slot, ids in zip(mtp_slots, prompt_ids)]
+        if mtp_next_tokens != next_tokens:
+            result["passed"] = False
+            result["mtp"] = {"error": "prefill greedy tokens diverged between REF and MTP twin groups"}
+        else:
+            mtp_kv_lengths = [runner.slot_kv_len[s] for s in mtp_slots]
+            # The draft submitted to verify is the REF group's own REAL,
+            # established continuation (from the trusted qo_len=1 loop
+            # above) -- a fully causally-coherent real token sequence, not
+            # an arbitrary placeholder, so every position's causal context
+            # within the verify call is genuine.
+            draft = [generated[i][:mtp_qo_len] for i in range(batch)]
+            verify_logits = runner.verify_batch(mtp_slots, draft, mtp_kv_lengths)
+
+            mtp_self_consistent = True
+            if batch >= 3:
+                for p in range(mtp_qo_len):
+                    if _hash(verify_logits[0 * mtp_qo_len + p]) != _hash(verify_logits[(batch - 1) * mtp_qo_len + p]):
+                        mtp_self_consistent = False
+
+            predicted = [
+                [int(verify_logits[i * mtp_qo_len + p].argmax(dim=-1).item()) for p in range(mtp_qo_len)]
+                for i in range(batch)
+            ]
+            mtp_texts = [tok.decode(generated[i][:1] + predicted[i]) for i in range(batch)]
+
+            # generated[i][0] is always the leading space token before the
+            # first digit (confirmed empirically), so `mtp_qo_len` newly
+            # predicted positions can only recover `mtp_qo_len` digits, not
+            # the full 5-digit number when mtp_qo_len<=4 (the real
+            # production MTP shape, deliberately kept <=4 here so the v2
+            # decode kernel's qo_len-2..4 dispatch range is actually
+            # exercised, not the qo_len>4 fallback kernel). Compare a
+            # length-matched prefix instead of the full number -- still a
+            # valid crosstalk detector, since these prefixes don't overlap
+            # across NUMBERS (checked: 8431/5296/7105/3964/6028/1739/2847/9385).
+            mtp_crosstalk = []
+            mtp_signal_ok = True
+            for i in range(batch):
+                text = mtp_texts[i]
+                own = str(numbers[i])[:mtp_qo_len]
+                contains_own = own in text
+                leaked_other = any(
+                    str(numbers[j])[:mtp_qo_len] in text for j in range(batch) if numbers[j] != numbers[i]
+                )
+                mtp_crosstalk.append(
+                    {
+                        "slot": i,
+                        "number": numbers[i],
+                        "text": text,
+                        "contains_own": contains_own,
+                        "leaked_other": leaked_other,
+                    }
+                )
+                if leaked_other or not contains_own:
+                    mtp_signal_ok = False
+
+            result["mtp"] = {
+                "qo_len": mtp_qo_len,
+                "self_consistent": mtp_self_consistent,
+                "signal_ok": mtp_signal_ok,
+                "crosstalk": mtp_crosstalk,
+            }
+            result["passed"] = result["passed"] and mtp_self_consistent and mtp_signal_ok
+
     return result
 
 
-def _run_subprocess(batch: int, varlen: bool, steps: int, reuse: bool) -> dict:
+def _run_subprocess(batch: int, varlen: bool, steps: int, reuse: bool, mtp_qo_len: int) -> dict:
     args = [
         sys.executable,
         "-m",
@@ -194,6 +272,8 @@ def _run_subprocess(batch: int, varlen: bool, steps: int, reuse: bool) -> dict:
         args.append("--varlen")
     if reuse:
         args.append("--reuse")
+    if mtp_qo_len:
+        args += ["--mtp-qo-len", str(mtp_qo_len)]
     proc = subprocess.run(
         args,
         cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -220,6 +300,7 @@ def main() -> int:
     parser.add_argument("--varlen", action="store_true")
     parser.add_argument("--steps", type=int, default=8)
     parser.add_argument("--reuse", action="store_true")
+    parser.add_argument("--mtp-qo-len", type=int, default=0, help="MTP verify: draft+bonus tokens per request (0=disabled)")
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--single-run-json", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -227,16 +308,19 @@ def main() -> int:
     if args.single_run_json:
         import json
 
-        result = _run_once(args.batch, args.varlen, args.steps, args.reuse)
+        result = _run_once(args.batch, args.varlen, args.steps, args.reuse, args.mtp_qo_len)
         print(f"SINGLE_RUN_RESULT: {json.dumps(result)}")
         return 0 if result["passed"] else 1
 
     if args.repeat == 1:
-        result = _run_once(args.batch, args.varlen, args.steps, args.reuse)
+        result = _run_once(args.batch, args.varlen, args.steps, args.reuse, args.mtp_qo_len)
         print(result)
         return 0 if result["passed"] else 1
 
-    results = [_run_subprocess(args.batch, args.varlen, args.steps, args.reuse) for _ in range(args.repeat)]
+    results = [
+        _run_subprocess(args.batch, args.varlen, args.steps, args.reuse, args.mtp_qo_len)
+        for _ in range(args.repeat)
+    ]
     for i, r in enumerate(results):
         status = "PASS" if r.get("passed") else "FAIL"
         print(f"run {i + 1}/{args.repeat}: {status}")
@@ -246,7 +330,8 @@ def main() -> int:
     n_pass = sum(1 for r in results if r.get("passed"))
     print(
         f"\n=== {n_pass}/{args.repeat} passed "
-        f"(batch={args.batch}, varlen={args.varlen}, steps={args.steps}, reuse={args.reuse}) ==="
+        f"(batch={args.batch}, varlen={args.varlen}, steps={args.steps}, reuse={args.reuse}, "
+        f"mtp_qo_len={args.mtp_qo_len}) ==="
     )
     return 0 if n_pass == args.repeat else 1
 

@@ -235,6 +235,55 @@ floating-point noise) -- judged sufficient given every run passed
 cleanly. MTP is correctly NOT attempted this round (explicitly last in
 the coordinator's ladder ordering) -- left for its own round.
 
+### Phase 3, batch decode ladder final step: MTP verify (2026-07-16)
+
+Generalized `build_attention_metadata_batch`/`build_gdn_metadata_batch`
+from `qo_len=1`-only to a `qo_len` parameter (uniform across the batch,
+matching real MTP usage), so `decode_batch` can also drive MTP verify
+(K draft + 1 bonus token per request, e.g. qo_len=4 for K=3). Attention
+side reuses the exact same CSR-construction logic generalized by
+`qo_len` (byte-identical at `qo_len=1`); this is what routes calls to the
+real production `flash_attn_sm120_fwd_v2_decode_fp8kv_paged` kernel
+(already hardened for qo_len 2-4, no kernel changes made) -- confirmed
+directly via the backend's own log line `v2 decode kernel path HIT
+(qo_len=4)` in every test run. GDN side reuses `build_gdn_metadata`'s
+existing chunked/"prefill" branch (not the real builder's much more
+involved spec-decode branch, which is out of scope this round) since it's
+numerically correct for an ordinary multi-token continuation regardless
+of whether the caller calls it "MTP" or not. New `DirectModelRunner
+.verify_batch()` wraps `_forward_batch(qo_len=...)`; accept/reject
+sampling on the raw returned logits is explicitly left for a follow-on
+round.
+
+Caught a real test-design flaw before it became a false bug report:
+"rewinding" a slot's kv_len bookkeeping to re-verify already-decoded
+tokens would be unsound, because GDN's recurrent state (unlike paged
+attention's content-addressed KV) can't be cheaply rewound -- fixed by
+using an independent twin slot group instead (mirrors the earlier
+batch=1 equivalence test's approach). Also found and fixed a test-harness
+scoping issue: the prompt's very first generated token is always a
+leading space, not a digit, so `qo_len=4` (kept deliberately small to hit
+the real v2 kernel's qo_len 2-4 range) can only recover 4 of a 5-digit
+number's digits -- confirmed via a direct diagnostic that `verify_batch`'s
+raw predictions are bit-for-bit identical to the trusted single-token
+path at the same positions, then fixed the crosstalk check to compare a
+length-matched number prefix instead of requiring the full number.
+
+**Results at qo_len=4 (real production MTP shape), 1 sanity + 3/3 repeat
+each: batch=1 PASS, batch=2 PASS, batch=4 PASS** (self-consistency and
+zero crosstalk held throughout). One batch=4 repeat run hit a 600s
+timeout under 96.8GiB GPU memory pressure -- traced via `ps -ef` to a
+COMPLETELY UNRELATED concurrent session's own `llama.cpp` benchmark on
+this shared machine, not a bug in this round's code; waited for that
+job's own timeout to elapse naturally (never touched a process this
+session didn't own) and retried cleanly for 3/3.
+
+**This completes the core "direct model runner supports 4-slot fixed
+batch + MTP" mechanism.** Explicitly not done this round (per the
+coordinator's scoping): accept/reject sampling logic and CUDA Graph
+capture -- both left for a follow-on round alongside real
+W1/W2/concurrency=4/MTP-K=3 performance measurement.
+
 ### Phase 3, main-line redirect (2026-07-16) — direct model runner, replacing the HTTP bridge
 
 The sibling `sm120-flash-attention` project's attention-kernel-tuning main

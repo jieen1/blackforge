@@ -1135,3 +1135,110 @@ risk given every run already passed cleanly.
 needs multi-token-per-request query support in the batch metadata
 builders, a substantially larger feature than single-token decode
 batching, left for its own dedicated round once requested.
+
+## Batch decode ladder, last step: MTP verify support (2026-07-16)
+
+Generalized both batch metadata builders from `qo_len=1`-only to a
+`qo_len` parameter (uniform across the batch, matching real production
+usage since `num_speculative_tokens` is a global engine config, not
+per-request) so `decode_batch` can also drive MTP/speculative-decode
+verify (K draft tokens + 1 bonus position per request, e.g. qo_len=4 for
+K=3).
+
+**Attention side** (`build_attention_metadata_batch`): `qo_indptr`,
+`new_kv_len`, `is_pure_decode`, `decode_qo_len` all generalized to
+`qo_len`; at `qo_len=1` every formula reduces exactly to the
+previously-verified values (a generalization, not a parallel
+implementation -- confirmed via a same-day regression rerun of the
+batch=3 signal-probe test, identical result to before the refactor).
+This is what makes the real production `flash_attn_sm120_fwd_v2_decode_
+fp8kv_paged` kernel (already hardened for qo_len 2-4) get dispatched --
+no kernel changes were made or needed, only correct metadata; confirmed
+directly via the real backend's own log line, `SM120_GQA: v2 decode
+kernel path HIT (qo_len=4)`, appearing in every qo_len=4 test run below.
+
+**GDN side** (`build_gdn_metadata_batch`): rather than replicating the
+real `GDNAttentionMetadataBuilder`'s much more involved `spec_decode`
+branch (accept/reject-aware sorting of spec vs non-spec tokens --
+explicitly out of scope this round per the coordinator), `qo_len>1`
+instead generalizes `build_gdn_metadata`'s OTHER existing branch: the
+`is_decode=False` ("prefill"/chunked) case. This is exactly what the real
+builder's own `split_decodes_and_prefills` would ALSO select for any
+request with query_len>1 when no draft-acceptance info is supplied --
+i.e. an MTP verify step is treated as an ordinary chunked continuation of
+`qo_len` new tokens per request, numerically correct (the chunked FLA
+kernel handles arbitrary query length + GDN state update correctly) even
+though it forgoes the real builder's spec-decode-specific optimizations.
+
+**New `DirectModelRunner` methods**: `_forward_batch` gained a `qo_len`
+parameter (`token_ids` becomes a list of per-slot draft-token lists when
+`qo_len>1`, instead of a flat list); `_slot_mapping_batch` gained the same
+generalization. New public `verify_batch(slot_ids, draft_token_ids,
+kv_lengths)` wraps `_forward_batch` with `qo_len` inferred from the draft
+list length. Accept/reject sampling against the returned per-position
+logits is explicitly left to the caller -- out of scope this round, per
+the coordinator's own instruction (metadata/kernel-call layer first).
+
+**Test methodology pitfall caught before it became a false alarm**: the
+first design considered "rewinding" a slot's `kv_len` bookkeeping after
+running real decode steps, then re-submitting the same tokens through
+`verify_batch` to test it in isolation. This would have been UNSOUND:
+unlike attention's paged KV (content-addressed by position, safe to
+overwrite with identical values), GDN's linear-attention recurrent state
+cannot be cheaply "rewound" -- by the time of the rewind the real
+recurrent state has already advanced past every one of the `steps` real
+decode rounds, not just the first `qo_len` of them, so re-verifying
+against a "rewound" `kv_len` would silently read a state that's too far
+advanced for the position being claimed. Caught by reasoning through the
+mechanism before running anything, and fixed by using an independent twin
+slot group instead (mirrors `batch_decode_regression.py`'s original
+approach): a fresh, pristine-state group prefilled with the same prompts,
+verified against the REF group's own real, established continuation
+tokens as the draft (a genuine causally-coherent sequence, not an
+arbitrary placeholder).
+
+**A second, real (not test-design) subtlety surfaced during
+batch=1 debugging**: the very first token generated after this project's
+"The value of X is {number}. The value of X is" prompt is always a
+leading space (` `, e.g. token id 220), not the first digit -- confirmed
+via a direct diagnostic comparing `verify_batch`'s raw predicted token
+IDs against the trusted single-token path's real continuation at the
+identical positions: **bit-for-bit identical** (`[23, 19, 18, 16]` on both
+sides). This means with `qo_len=4` (the real production MTP shape,
+deliberately used instead of a larger qo_len so the v2 kernel's qo_len
+2-4 dispatch range is actually exercised), only 4 of a 5-digit number's
+digits fit in the newly-predicted positions (the leading space consumes
+one slot from the already-known prefix). Fixed the test's crosstalk check
+to compare a length-matched prefix (`str(number)[:qo_len]`) instead of
+requiring the full number -- still a valid, sufficient crosstalk detector
+since these prefixes don't overlap across `NUMBERS`.
+
+**Results, all at the real production shape `qo_len=4` (K=3 draft + 1
+bonus token)**, 1 sanity run + 3/3 repeat each:
+- **batch=1**: PASS. `v2 decode kernel path HIT (qo_len=4)` confirmed in
+  the logs.
+- **batch=2**: PASS. Both slots recover their own number's prefix, zero
+  crosstalk.
+- **batch=4**: PASS (one repeat run needed a retry after timing out --
+  see below). Self-consistency held (slots 0 and 3, the duplicate-number
+  pair, hash-match at every verify position); all 4 slots recover their
+  own prefix with zero leakage.
+
+**Non-issue encountered, documented for completeness**: the first batch=4
+repeat run hit GPU memory at 96.8/97.9 GiB and a 600s subprocess timeout.
+Root-caused via `ps -ef` (per the standing GPU-discipline requirement) to
+a COMPLETELY UNRELATED, CONCURRENT session on this shared machine running
+its own `llama.cpp` benchmark (`Hy3-IQ1_M-mtp.gguf` via a `codex`-launched
+process tree, unrelated to this project) -- not a leak or bug in this
+round's code. Waited for that job's own `timeout 900` budget to elapse
+naturally (never touched a process this session didn't own), then
+retried cleanly: 3/3 PASS once the GPU was actually free.
+
+**This completes the core "direct model runner supports 4-slot fixed
+batch + MTP" mechanism** the coordinator asked for -- metadata
+construction and kernel-call-level MTP verify batching, reusing the real
+production v2 decode kernel with zero kernel changes. Explicitly NOT done
+this round (per the coordinator's own scoping): accept/reject sampling
+logic downstream of `verify_batch`'s raw logits, and CUDA Graph capture --
+both correctly left for a follow-on round alongside real W1/W2/
+concurrency=4/MTP-K=3 performance measurement.

@@ -232,16 +232,33 @@ def build_attention_metadata_batch(
     block_size: int,
     blocks_per_slot: int,
     device: torch.device,
+    qo_len: int = 1,
 ) -> SM120GQAMetadata:
-    """Hand-built SM120GQAMetadata for a real batch of decode-only requests
-    (exactly one new token per request) spanning multiple fixed physical
-    slots in a SINGLE metadata object -- the batched analogue of
-    ``build_attention_metadata``'s ``is_decode`` case. Field construction
-    (CSR qo_indptr/kv_page_indptr/kv_page_indices/kv_last_page_len,
-    is_pure_decode, decode_qo_len) matches the real
-    ``SM120GQAMetadataBuilder.build()``'s pure-decode branch
-    (vllm/v1/attention/backends/sm120_gqa.py) generalized from vLLM's dense
-    block-table -> CSR conversion to this project's fixed-slot addressing.
+    """Hand-built SM120GQAMetadata for a real batch of requests spanning
+    multiple fixed physical slots in a SINGLE metadata object, each
+    contributing the SAME ``qo_len`` new query tokens this step (uniform
+    across the batch -- the normal production case, since
+    ``num_speculative_tokens`` is a global engine config, not
+    per-request). ``qo_len=1`` (the default) is the batched analogue of
+    ``build_attention_metadata``'s ``is_decode`` case (2026-07-16, verified
+    through the full batch=1/2/3/4/varlen/reuse/continuous-generation
+    ladder). ``qo_len>1`` is MTP/speculative-decode verify (K draft tokens
+    + 1 bonus token per request, e.g. qo_len=4 for K=3) -- the real
+    ``SM120GQAImpl.forward()`` dispatches this to
+    ``flash_attn_sm120_fwd_v2_decode_fp8kv_paged`` (already
+    production-hardened for qo_len in 2..4) whenever
+    ``attn_metadata.decode_qo_len`` is in that range; this function only
+    needs to construct the metadata correctly, not touch the kernel.
+
+    Field construction (CSR qo_indptr/kv_page_indptr/kv_page_indices/
+    kv_last_page_len, is_pure_decode, decode_qo_len) matches the real
+    ``SM120GQAMetadataBuilder.build()`` (vllm/v1/attention/backends/
+    sm120_gqa.py) generalized from vLLM's dense block-table -> CSR
+    conversion to this project's fixed-slot addressing. At ``qo_len=1``
+    every formula below reduces exactly to the previously-verified
+    qo_len=1-only formulas (same numeric values, same tensors) -- this is
+    a generalization, not a parallel implementation, so the existing
+    ladder's results remain valid evidence for the qo_len=1 case.
 
     Kept as a SEPARATE function from ``build_attention_metadata`` (not a
     generalization of it) so this new batch path cannot regress the
@@ -253,7 +270,7 @@ def build_attention_metadata_batch(
     if len(prior_kv_lens) != num_reqs:
         raise ValueError("slots and prior_kv_lens must have equal length")
     page_size = block_size
-    new_kv_lens = [kv_len + 1 for kv_len in prior_kv_lens]
+    new_kv_lens = [kv_len + qo_len for kv_len in prior_kv_lens]
     num_pages_per_req = [(kv_len + page_size - 1) // page_size for kv_len in new_kv_lens]
     for slot, kv_len, num_pages in zip(slots, new_kv_lens, num_pages_per_req):
         if num_pages > blocks_per_slot:
@@ -262,7 +279,7 @@ def build_attention_metadata_batch(
                 f"{blocks_per_slot * page_size}-token capacity"
             )
 
-    qo_indptr = torch.arange(0, num_reqs + 1, dtype=torch.int32, device=device)
+    qo_indptr = torch.arange(0, num_reqs + 1, dtype=torch.int32, device=device) * qo_len
 
     kv_page_indptr_list = [0]
     for num_pages in num_pages_per_req:
@@ -293,48 +310,104 @@ def build_attention_metadata_batch(
     # the same tradeoff build_attention_metadata already makes).
     kv_split_size = max(max(new_kv_lens, default=1), 1)
     return SM120GQAMetadata(
-        num_actual_tokens=num_reqs,
+        num_actual_tokens=num_reqs * qo_len,
         num_reqs=num_reqs,
         qo_indptr=qo_indptr,
         kv_page_indptr=kv_page_indptr,
         kv_page_indices=kv_page_indices,
         kv_last_page_len=kv_last_page_len,
         page_size=page_size,
-        is_pure_decode=True,
+        is_pure_decode=(qo_len == 1),
         kv_split_size=kv_split_size,
         max_num_splits=1,
-        decode_qo_len=1,
+        decode_qo_len=qo_len,
     )
 
 
-def build_gdn_metadata_batch(*, slots: list[int], device: torch.device) -> GDNAttentionMetadata:
-    """Hand-built GDNAttentionMetadata for a real batch of decode-only
-    requests -- the batched analogue of ``build_gdn_metadata``'s
-    ``is_decode`` case. Matches the real ``GDNAttentionMetadataBuilder
-    .build()``'s pure non-spec-decode branch (gdn_attn.py): when every
-    request has query_len 1 and there are no prefills, only
-    num_decodes/num_decode_tokens/non_spec_query_start_loc/
-    non_spec_state_indices_tensor are populated -- has_initial_state,
-    chunk_indices/offsets, and the causal_conv1d triton fields all stay
-    None (that real builder only computes them inside its
-    ``if num_prefills > 0`` branch). See ``build_attention_metadata_batch``
-    for why this is a separate function from ``build_gdn_metadata``.
+def build_gdn_metadata_batch(
+    *,
+    slots: list[int],
+    device: torch.device,
+    qo_len: int = 1,
+    slot_initialized: list[bool] | None = None,
+) -> GDNAttentionMetadata:
+    """Hand-built GDNAttentionMetadata for a real batch of requests, each
+    contributing the SAME ``qo_len`` new query tokens this step (see
+    ``build_attention_metadata_batch``'s docstring for the uniform-qo_len
+    scope rationale shared by both functions).
+
+    ``qo_len=1`` (the default) is the batched analogue of
+    ``build_gdn_metadata``'s ``is_decode`` case (2026-07-16, verified
+    through the full batch ladder) -- matches the real
+    ``GDNAttentionMetadataBuilder.build()``'s pure non-spec-decode branch
+    (gdn_attn.py): only num_decodes/num_decode_tokens/
+    non_spec_query_start_loc/non_spec_state_indices_tensor are populated,
+    everything else stays None. At qo_len=1 the formulas below reduce
+    exactly to the previously-verified values -- a generalization, not a
+    parallel implementation.
+
+    ``qo_len>1`` is MTP/speculative-decode verify. Rather than
+    replicating the real builder's much more involved ``spec_decode``
+    branch (accept/reject bookkeeping, sorting spec vs non-spec tokens --
+    explicitly out of scope this round, see notes/direct-model-runner-
+    design.md), this generalizes ``build_gdn_metadata``'s OTHER existing
+    branch instead: the ``is_decode=False`` ("prefill"/chunked) case,
+    which the real builder's own ``split_decodes_and_prefills`` would also
+    select for any request with query_len>1 when no draft-acceptance info
+    is supplied -- i.e. this treats an MTP verify step as an ordinary
+    chunked continuation of ``qo_len`` new tokens per request, which is
+    numerically correct (the chunked FLA kernel handles arbitrary query
+    length, GDN state update included) even though it foregoes the
+    real builder's spec-decode-specific optimizations.
     """
     num_reqs = len(slots)
     state_indices = torch.tensor(
         [_physical_slot(slot) for slot in slots], dtype=torch.int32, device=device
     )
-    non_spec_qsl = torch.arange(0, num_reqs + 1, dtype=torch.int32, device=device)
+    if qo_len == 1:
+        non_spec_qsl = torch.arange(0, num_reqs + 1, dtype=torch.int32, device=device)
+        return GDNAttentionMetadata(
+            num_prefills=0,
+            num_prefill_tokens=0,
+            num_decodes=num_reqs,
+            num_decode_tokens=num_reqs,
+            num_spec_decodes=0,
+            num_spec_decode_tokens=0,
+            num_actual_tokens=num_reqs,
+            non_spec_query_start_loc=non_spec_qsl,
+            non_spec_state_indices_tensor=state_indices,
+        )
+
+    if slot_initialized is None or len(slot_initialized) != num_reqs:
+        raise ValueError("slot_initialized (one bool per slot) is required when qo_len > 1")
+    query_start_loc = torch.arange(0, num_reqs + 1, dtype=torch.int32, device=device) * qo_len
+    query_start_loc_cpu = query_start_loc.cpu()
+    has_initial_state = torch.tensor(slot_initialized, dtype=torch.bool, device=device)
+    chunk_indices = prepare_chunk_indices(query_start_loc, FLA_CHUNK_SIZE)
+    chunk_offsets = prepare_chunk_offsets(query_start_loc, FLA_CHUNK_SIZE)
+    nums_dict, batch_ptr, token_chunk_offset_ptr = compute_causal_conv1d_metadata(
+        query_start_loc_cpu, device=device
+    )
+    num_actual_tokens = num_reqs * qo_len
     return GDNAttentionMetadata(
-        num_prefills=0,
-        num_prefill_tokens=0,
-        num_decodes=num_reqs,
-        num_decode_tokens=num_reqs,
+        num_prefills=num_reqs,
+        num_prefill_tokens=num_actual_tokens,
+        num_decodes=0,
+        num_decode_tokens=0,
         num_spec_decodes=0,
         num_spec_decode_tokens=0,
-        num_actual_tokens=num_reqs,
-        non_spec_query_start_loc=non_spec_qsl,
+        num_actual_tokens=num_actual_tokens,
+        has_initial_state=has_initial_state,
+        non_spec_query_start_loc=query_start_loc,
         non_spec_state_indices_tensor=state_indices,
+        chunk_indices=chunk_indices,
+        chunk_offsets=chunk_offsets,
+        prefill_query_start_loc=query_start_loc,
+        prefill_state_indices=state_indices,
+        prefill_has_initial_state=has_initial_state,
+        nums_dict=nums_dict,
+        batch_ptr=batch_ptr,
+        token_chunk_offset_ptr=token_chunk_offset_ptr,
     )
 
 
@@ -526,13 +599,21 @@ class DirectModelRunner:
         logits = self._forward(slot, [token_id], start_pos=start_pos, is_decode=True)
         return int(logits[-1].argmax(dim=-1).item())
 
-    def _slot_mapping_batch(self, slots: list[int], positions: list[int]) -> torch.Tensor:
-        """Batched analogue of ``_slot_mapping`` for a decode-only batch:
-        exactly one new token per request, at ``positions[i]``."""
+    def _slot_mapping_batch(
+        self, slots: list[int], kv_lengths: list[int], qo_len: int = 1
+    ) -> torch.Tensor:
+        """Batched analogue of ``_slot_mapping``: each request contributes
+        ``qo_len`` new tokens starting at its own ``kv_lengths[i]``,
+        flattened in the SAME per-request-contiguous order ``_forward_batch``
+        uses for ``input_ids``/``positions`` (request 0's ``qo_len`` tokens,
+        then request 1's, ...). At ``qo_len=1`` this reduces exactly to the
+        previously-verified one-position-per-request mapping."""
+        positions = [kv_len + j for kv_len in kv_lengths for j in range(qo_len)]
+        slots_per_token = [slot for slot in slots for _ in range(qo_len)]
         block_ids = torch.tensor(
             [
                 _physical_slot(slot) * self.blocks_per_slot + pos // self.block_size
-                for slot, pos in zip(slots, positions)
+                for slot, pos in zip(slots_per_token, positions)
             ],
             dtype=torch.long,
             device=self.device,
@@ -543,18 +624,53 @@ class DirectModelRunner:
         return block_ids * self.block_size + offsets
 
     def _forward_batch(
-        self, slot_ids: list[int], token_ids: list[int], kv_lengths: list[int]
+        self,
+        slot_ids: list[int],
+        token_ids,
+        kv_lengths: list[int],
+        *,
+        qo_len: int = 1,
     ) -> torch.Tensor:
-        """Real batched decode: ONE batched attention/GDN metadata object and
-        ONE ``model.forward()`` call covering every listed slot -- not a
-        Python loop calling ``_forward``/``decode`` per slot. ``kv_lengths``
-        is the caller-asserted prior KV length (before this step's new
-        token) for each slot; cross-checked against this runner's own
-        ``self.slot_kv_len`` bookkeeping to catch drift early rather than
-        silently addressing the wrong cache rows."""
+        """Real batched decode/verify: ONE batched attention/GDN metadata
+        object and ONE ``model.forward()`` call covering every listed slot
+        -- not a Python loop calling ``_forward``/``decode`` per slot.
+        ``kv_lengths`` is the caller-asserted prior KV length (before this
+        step's new tokens) for each slot; cross-checked against this
+        runner's own ``self.slot_kv_len`` bookkeeping to catch drift early
+        rather than silently addressing the wrong cache rows.
+
+        ``qo_len=1`` (the default, unchanged from the original decode-only
+        batch path): ``token_ids`` is a flat list, one token id per slot.
+        ``qo_len>1`` (MTP/speculative-decode verify, uniform across the
+        batch): ``token_ids`` is a list of per-slot token-id lists, each of
+        length ``qo_len`` -- the K draft tokens + 1 bonus-position
+        placeholder being verified in one batched call. Accept/reject
+        sampling on the returned per-position logits is intentionally out
+        of scope here (2026-07-16 round) -- this only wires the metadata/
+        kernel-call layer; callers wanting real speculative decoding must
+        still implement accept/reject on top of the returned logits.
+        Returns logits shaped ``[num_reqs * qo_len, vocab]``, flattened in
+        request-then-position order (request 0's qo_len rows, then request
+        1's, ...) -- the same order ``SM120GQAImpl.forward()``'s own
+        ``q_decode.reshape(num_reqs, qo_len, ...)`` expects.
+        """
         num_reqs = len(slot_ids)
-        if not (len(token_ids) == num_reqs and len(kv_lengths) == num_reqs):
-            raise ValueError("slot_ids/token_ids/kv_lengths must have equal length")
+        if qo_len == 1:
+            if not (len(token_ids) == num_reqs and len(kv_lengths) == num_reqs):
+                raise ValueError("slot_ids/token_ids/kv_lengths must have equal length")
+            flat_token_ids = token_ids
+        else:
+            if not (
+                len(token_ids) == num_reqs
+                and len(kv_lengths) == num_reqs
+                and all(len(t) == qo_len for t in token_ids)
+            ):
+                raise ValueError(
+                    "slot_ids/token_ids/kv_lengths must have equal length, and "
+                    f"every token_ids[i] must have exactly qo_len={qo_len} tokens"
+                )
+            flat_token_ids = [tok for slot_tokens in token_ids for tok in slot_tokens]
+
         for slot, kv_len in zip(slot_ids, kv_lengths):
             if kv_len != self.slot_kv_len[slot]:
                 raise RuntimeError(
@@ -570,15 +686,25 @@ class DirectModelRunner:
             block_size=self.block_size,
             blocks_per_slot=self.blocks_per_slot,
             device=self.device,
+            qo_len=qo_len,
         )
-        gdn_meta = build_gdn_metadata_batch(slots=slot_ids, device=self.device)
+        gdn_meta = build_gdn_metadata_batch(
+            slots=slot_ids,
+            device=self.device,
+            qo_len=qo_len,
+            slot_initialized=[self.slot_gdn_initialized[s] for s in slot_ids] if qo_len > 1 else None,
+        )
         attn_metadata_dict = {name: attn_meta for name in self.attn_layer_names}
         attn_metadata_dict.update({name: gdn_meta for name in self.gdn_layer_names})
-        slot_mapping = self._slot_mapping_batch(slot_ids, kv_lengths)
+        slot_mapping = self._slot_mapping_batch(slot_ids, kv_lengths, qo_len=qo_len)
         slot_mapping_dict = {name: slot_mapping for name in self.attn_layer_names}
 
-        input_ids = torch.tensor(token_ids, dtype=torch.long, device=self.device)
-        positions = torch.tensor(kv_lengths, dtype=torch.long, device=self.device)
+        input_ids = torch.tensor(flat_token_ids, dtype=torch.long, device=self.device)
+        positions = torch.tensor(
+            [kv_len + j for kv_len in kv_lengths for j in range(qo_len)],
+            dtype=torch.long,
+            device=self.device,
+        )
 
         with set_forward_context(
             attn_metadata_dict, self.vllm_config, slot_mapping=slot_mapping_dict
@@ -589,7 +715,8 @@ class DirectModelRunner:
         torch.cuda.synchronize()
 
         for slot in slot_ids:
-            self.slot_kv_len[slot] += 1
+            self.slot_kv_len[slot] += qo_len
+            self.slot_gdn_initialized[slot] = True
         return logits
 
     def decode_batch(
@@ -600,6 +727,25 @@ class DirectModelRunner:
         slot, in the same order as ``slot_ids``."""
         logits = self._forward_batch(slot_ids, token_ids, kv_lengths)
         return [int(logits[i].argmax(dim=-1).item()) for i in range(len(slot_ids))]
+
+    def verify_batch(
+        self,
+        slot_ids: list[int],
+        draft_token_ids: list[list[int]],
+        kv_lengths: list[int],
+    ) -> torch.Tensor:
+        """MTP/speculative-decode verify: submit ``qo_len`` draft tokens
+        (K speculative + 1 bonus position) per active slot and run them all
+        through ONE real batched forward call. ``draft_token_ids[i]`` is
+        slot ``slot_ids[i]``'s own list of draft tokens (same length for
+        every slot this step, since ``num_speculative_tokens`` is a global
+        engine config). Returns raw logits shaped
+        ``[num_reqs * qo_len, vocab]`` (request-then-position order) --
+        accept/reject sampling against these logits is intentionally left
+        to the caller (out of scope this round; see ``_forward_batch``'s
+        docstring)."""
+        qo_len = len(draft_token_ids[0]) if draft_token_ids else 0
+        return self._forward_batch(slot_ids, draft_token_ids, kv_lengths, qo_len=qo_len)
 
     def reset_slot(self, slot: int) -> None:
         """Release a slot for reuse by a new logical request. Does not zero
