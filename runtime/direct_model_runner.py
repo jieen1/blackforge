@@ -38,6 +38,22 @@ from vllm.v1.worker.utils import bind_kv_cache
 NUM_SLOTS = 4
 _SM120_BACKEND_PATH = "vllm.v1.attention.backends.sm120_gqa.SM120GQABackend"
 
+# Physical index 0 (block index / GDN state index) is never used for real
+# request data -- confirmed empirically from a real vLLM SchedulerOutput
+# dump (block_ids=([1], [2], [3], [4]) for the first-ever scheduled
+# request; see notes/direct-model-runner-design.md's "Stage C field diff"
+# section). Root cause of the 100%-deterministic wrong output this round:
+# our hand-built metadata hardcoded physical index = logical slot (so slot
+# 0 -> physical index 0), which real vLLM's convention never produces --
+# something about index 0 (padding/NULL_BLOCK_ID-adjacent) makes the model
+# read/write the wrong state. Fix: reserve physical index 0 permanently
+# and offset every logical slot by +1 when computing a physical address.
+RESERVED_PHYSICAL_SLOTS = 1
+
+
+def _physical_slot(logical_slot: int) -> int:
+    return logical_slot + RESERVED_PHYSICAL_SLOTS
+
 
 def _ensure_sm120_backend_registered() -> None:
     """register_backend() is a plain dict write (see registry.py's
@@ -79,7 +95,7 @@ def allocate_fixed_slot_kv_caches(
         num_kv_heads = any_attn.num_kv_heads
         head_size = any_attn.head_size
         cache_dtype_str = vllm_config.cache_config.cache_dtype
-        num_blocks = num_slots * blocks_per_slot
+        num_blocks = (num_slots + RESERVED_PHYSICAL_SLOTS) * blocks_per_slot
         shape = backend_cls.get_kv_cache_shape(
             num_blocks, block_size, num_kv_heads, head_size, cache_dtype_str
         )
@@ -91,8 +107,9 @@ def allocate_fixed_slot_kv_caches(
         layer = static_forward_context[name]
         conv_shape, ssm_shape = layer.get_state_shape()
         conv_dtype, ssm_dtype = layer.get_state_dtype()
-        conv_state = torch.zeros((num_slots, *conv_shape), dtype=conv_dtype, device=device)
-        ssm_state = torch.zeros((num_slots, *ssm_shape), dtype=ssm_dtype, device=device)
+        total_physical_slots = num_slots + RESERVED_PHYSICAL_SLOTS
+        conv_state = torch.zeros((total_physical_slots, *conv_shape), dtype=conv_dtype, device=device)
+        ssm_state = torch.zeros((total_physical_slots, *ssm_shape), dtype=ssm_dtype, device=device)
         kv_caches[name] = (conv_state, ssm_state)
 
     runner_kv_caches: list[torch.Tensor] = []
@@ -121,7 +138,7 @@ def build_attention_metadata(
     """
     new_kv_len = prior_kv_len + num_new_tokens
     page_size = block_size
-    first_block = slot * blocks_per_slot
+    first_block = _physical_slot(slot) * blocks_per_slot
     num_pages = (new_kv_len + page_size - 1) // page_size
     if num_pages > blocks_per_slot:
         raise RuntimeError(
@@ -162,7 +179,7 @@ def build_gdn_metadata(
     see ``build_attention_metadata``'s docstring for why this is a shared
     function, not a second copy, between ``DirectModelRunner`` and Stage C.
     """
-    state_indices = torch.tensor([slot], dtype=torch.int32, device=device)
+    state_indices = torch.tensor([_physical_slot(slot)], dtype=torch.int32, device=device)
     if is_decode:
         assert num_new_tokens == 1
         non_spec_qsl = torch.tensor([0, 1], dtype=torch.int32, device=device)
@@ -343,7 +360,7 @@ class DirectModelRunner:
         ``forward_context.slot_mapping[layer_name]``, NOT from
         ``attn_metadata`` -- easy to miss, and missing it means K/V are never
         written into the cache at all)."""
-        first_block = slot * self.blocks_per_slot
+        first_block = _physical_slot(slot) * self.blocks_per_slot
         positions = torch.arange(
             start_pos, start_pos + num_new_tokens, dtype=torch.long, device=self.device
         )

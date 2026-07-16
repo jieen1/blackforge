@@ -827,3 +827,126 @@ well-scoped follow-on given the harness already exists). Stage D (the
 trimmed-down full `direct_model_runner.py`) was not attempted this round
 either, since C already failing makes D's outcome predictable (D should
 also fail, for the same reason) without needing to re-verify.
+
+## Step 4 result (2026-07-16): root cause found via field diff, fixed, closed loop verified 20/20 on Stage C and Stage D
+
+Followed through on the previous section's "natural next step": wrote a
+throwaway diagnostic (`/tmp/qwen_check/stage_c_diff.py`, not committed --
+scratch, outside the repo) that wraps the real `SM120GQAMetadataBuilder
+.build()`/`GDNAttentionMetadataBuilder.build()` methods (saving originals
+before monkey-patching), calls both the real builder and our hand-built
+`build_attention_metadata()`/`build_gdn_metadata()` on the *same*
+`common_attn_metadata` object (side by side, not sequentially, so no state
+changes between the two calls could produce a spurious diff), and diffs
+every dataclass field.
+
+**Result**: every field matched except two, both in `GDNAttentionMetadata`:
+
+```
+[DIFF] non_spec_state_indices_tensor: real=(torch.Size([1]), [1])  ours=(torch.Size([1]), [0])
+[DIFF] prefill_state_indices: real=(torch.Size([1]), [1])  ours=(torch.Size([1]), [0])
+```
+
+All other fields -- `num_prefills`, `num_prefill_tokens`, `num_decodes`,
+`num_decode_tokens`, `num_spec_decodes`, `num_spec_decode_tokens`,
+`num_actual_tokens`, `has_initial_state`, `spec_query_start_loc`,
+`non_spec_query_start_loc`, `spec_state_indices_tensor`,
+`spec_sequence_masks`, `spec_token_indx`, `non_spec_token_indx`,
+`num_accepted_tokens`, `chunk_indices`, `chunk_offsets`,
+`prefill_query_start_loc`, `prefill_has_initial_state` -- were identical.
+(The diagnostic script crashed right after printing this, on a
+`nums_dict` dict-equality comparison triggering an ambiguous-tensor-
+boolean `RuntimeError` -- a bug in the throwaway script itself, not fixed,
+since the two fields above were already sufficient to act on. The
+SM120GQAMetadata side's own diff was therefore never directly printed --
+see below for how this was independently confirmed anyway.)
+
+The same diagnostic captured a real `SchedulerOutput` dump for this
+request: `block_ids=([1], [2], [3], [4])`. **vLLM's real scheduler never
+assigns physical block/state index 0 to real request data** -- it starts
+at 1. Our hand-built metadata, by contrast, computed physical
+slot/state index directly as `slot` (the logical slot number, 0 for this
+project's single-slot scope this round) with no offset -- landing
+squarely on the index vLLM's real convention treats as reserved/unsafe.
+(The exact underlying mechanism -- whether this is literally a
+`NULL_BLOCK_ID = 0` convention in `KVCacheManager`, something block-pool-
+allocator-internal, or something else -- was not pinned down. Treated as
+an empirically solid fact regardless: real request data is never at index
+0, full stop.)
+
+**Causal confirmation, not just correlation**: rather than fix-and-hope,
+created a throwaway copy `runtime/vllm_stage_c_slot1_test.py` (Stage C's
+baseline with only `SLOT` changed from `0` to `1`, everything else
+byte-identical) and ran it. **Single run: PASS**, correct
+`" Paris.\n\n<think>\nThe user has"`. This directly demonstrates causation:
+changing only the slot-index offset flips the output from wrong to
+correct, with no other variable touched.
+
+**General fix applied** to `runtime/direct_model_runner.py` (not the
+throwaway test file, which was deleted once this landed): added
+
+```python
+RESERVED_PHYSICAL_SLOTS = 1
+
+def _physical_slot(logical_slot: int) -> int:
+    return logical_slot + RESERVED_PHYSICAL_SLOTS
+```
+
+and applied `_physical_slot()` at all four places a physical address is
+computed:
+- `allocate_fixed_slot_kv_caches`: `num_blocks = (num_slots +
+  RESERVED_PHYSICAL_SLOTS) * blocks_per_slot`, and the GDN conv/ssm state
+  tensors are allocated with `num_slots + RESERVED_PHYSICAL_SLOTS` rows
+  (one extra slot's worth of capacity, permanently unaddressed at row 0).
+- `build_attention_metadata`: `first_block = _physical_slot(slot) *
+  blocks_per_slot`.
+- `build_gdn_metadata`: `state_indices = torch.tensor([_physical_slot(slot)], ...)`.
+- `DirectModelRunner._slot_mapping`: `first_block = _physical_slot(slot) *
+  self.blocks_per_slot`.
+
+Because `runtime/vllm_stage_c_baseline.py` already calls these shared
+functions with its own `SLOT = 0` (logical), it required **no code
+changes** to pick up the fix -- its logical slot 0 now automatically
+resolves to physical index 1.
+
+**Independent confirmation that the attention side (not just GDN) had the
+same bug**, closing the gap left by the diagnostic script's crash: a
+lightweight CPU-only check (no GPU/model involved) calling
+`build_attention_metadata()`/`build_gdn_metadata()` directly:
+
+```
+RESERVED_PHYSICAL_SLOTS = 1
+kv_page_indices (slot=0): [128]  -- starts at 1*128, not 0
+prefill_state_indices (slot=0): [1]  -- not [0]
+non_spec_state_indices_tensor (slot=2): [3]  -- not [2]
+```
+
+confirming both `SM120GQAMetadata.kv_page_indices` and
+`GDNAttentionMetadata`'s state-index fields are now consistently offset
+for every logical slot.
+
+**Verification, both 20x, both 20/20 PASS** (note: the first 20x attempt at
+confirming the throwaway `SLOT=1` hypothesis got contaminated mid-run --
+runs 1-4 genuinely passed, but deleting the throwaway test file while its
+background 20x loop was still spawning fresh subprocesses caused runs
+6-20 to fail with `ModuleNotFoundError` rather than a real bug; run 5's
+one `EngineCore init failed` crash is suspected transient port/resource
+contention from rapid successive subprocess launches, not reproduced
+again -- noted honestly rather than swept under the rug, but not the
+signal being tested for):
+
+- `runtime/vllm_stage_c_baseline.py` (real `CommonAttentionMetadata`-driven
+  Stage C, now with the general fix, zero code changes needed): **20/20
+  PASS**, identical `' Paris.\n\n<think>\nThe user has'` every run.
+- `benchmarks/single_prefill_regression.py`, exercising the full
+  `DirectModelRunner` end to end (**Stage D**): **20/20 PASS**, correct
+  first token `' Paris'`, **identical SHA-256 logits hash
+  `7eda2739bbecbc52` across all 20 runs** -- both determinism and
+  correctness confirmed simultaneously.
+
+**This closes the ownership-transfer ladder.** A (real everything), B
+(real metadata + our cache), C (our metadata + real-scheduler-driven
+facts + our cache), and D (the full, real, hand-built
+`DirectModelRunner`) all now produce correct, deterministic output. The
+"direct GPU state ownership, no HTTP bridge" line has a genuine minimal
+correct closed loop as of this round.

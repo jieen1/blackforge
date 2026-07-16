@@ -92,6 +92,55 @@ identical real input, to pinpoint exactly which field is wrong. Stage D
 already makes D's outcome predictable. Full detail in the design doc's
 "Stage C result" section.
 
+**Step 4 (this round, DONE -- root cause found and fixed, closed loop
+established): field diff → causal confirmation → general fix → 20/20 on
+both Stage C and Stage D.** Ran the real `SM120GQAMetadataBuilder.build()`/
+`GDNAttentionMetadataBuilder.build()` and our hand-built
+`build_attention_metadata()`/`build_gdn_metadata()` side by side on the
+identical `CommonAttentionMetadata`, diffing every field. All fields
+matched except **`GDNAttentionMetadata.non_spec_state_indices_tensor`** and
+**`prefill_state_indices`**: real builder produced `[1]`, ours produced
+`[0]`. Cross-checked against a real `SchedulerOutput` dump: vLLM's real
+scheduler assigns block/state index **1** to the first-ever scheduled
+request (`block_ids=([1], [2], [3], [4])`) -- **index 0 is never used for
+real request data**. Our hand-built metadata hardcoded physical
+slot/state index = logical slot number, so logical slot 0 → physical index
+0, landing on whatever convention makes index 0 unsafe (exact mechanism
+not pinned down -- possibly NULL_BLOCK_ID-adjacent -- but the empirical
+fact is solid). **Causal confirmation** (not just correlation): a
+throwaway Stage C variant with `SLOT=1` hardcoded produced the correct
+`" Paris"` output on the first try.
+
+**Fix applied** (`runtime/direct_model_runner.py`): added module constant
+`RESERVED_PHYSICAL_SLOTS = 1` and helper `_physical_slot(logical_slot) =
+logical_slot + RESERVED_PHYSICAL_SLOTS`, applied consistently in all four
+places physical addresses are computed: `allocate_fixed_slot_kv_caches`
+(allocates one extra slot's worth of capacity/state rows and never
+addresses row 0), `build_attention_metadata` (`first_block`),
+`build_gdn_metadata` (`state_indices`), and
+`DirectModelRunner._slot_mapping` (`first_block`). Confirmed via a
+lightweight CPU-only check that both the attention-side
+(`kv_page_indices`) and GDN-side (`prefill_state_indices`,
+`non_spec_state_indices_tensor`) fields now skip physical index 0 for
+every logical slot -- the diagnostic script had crashed before printing
+the attention-side diff directly, so this closes that open question too.
+
+**Verification (both 20x, both 20/20 PASS):**
+- `runtime/vllm_stage_c_baseline.py` (no code changes needed -- its
+  existing `SLOT=0` is now automatically offset internally): **20/20
+  PASS**, identical `' Paris.\n\n<think>\nThe user has'` every run.
+- `benchmarks/single_prefill_regression.py`, i.e. the full
+  `DirectModelRunner` (**Stage D**): **20/20 PASS**, correct first token
+  `' Paris'`, **identical logits hash `7eda2739bbecbc52` across all 20
+  runs**.
+
+This closes the ownership-transfer ladder: A/B/C/D all now produce
+correct, deterministic output. The minimal correct closed loop for
+"direct GPU state ownership" (no HTTP, hand-built metadata, our own
+KV/GDN cache tensors) is established. The throwaway `SLOT=1` test file
+was deleted once the general fix landed in `direct_model_runner.py`
+itself; no separate hack file remains in the repo.
+
 ### Phase 3, main-line redirect (2026-07-16) — direct model runner, replacing the HTTP bridge
 
 The sibling `sm120-flash-attention` project's attention-kernel-tuning main
