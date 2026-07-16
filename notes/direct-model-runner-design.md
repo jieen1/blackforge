@@ -7,6 +7,101 @@ the sibling `sm120-flash-attention` project hit diminishing returns --
 decode v2/prefill v2's "beats native" claims were both overturned -- so
 development effort moved here).
 
+## 2026-07-16, strategy reset after four debugging passes: freeze per-kernel
+## bisection, rebuild top-down from vLLM's real GPUModelRunner instead
+
+After four full debugging passes (see the dated sections below) surfaced two
+real, specific, independently-confirmed low-level anomalies (a Triton
+`causal_conv1d_fn` cold-start bug; a CUTLASS SM120 pingpong-GEMM race per
+`compute-sanitizer racecheck`) -- and then *disproved* both as the actual
+root cause via direct bypass experiments -- the working theory changed.
+**The real, most likely root cause: this runner hand-builds attention/GDN
+metadata and calls `model.forward()` directly, but skips a whole contract
+`vllm/v1/worker/gpu_model_runner.py`'s real `GPUModelRunner` normally
+upholds** -- the distinction between `num_tokens_unpadded`/`num_tokens_padded`
+and padding-region handling (e.g. `slot_mapping=-1` for pad slots), the real
+metadata builders' persistent-buffer/CUDA-graph-safety conventions, the real
+warmup/profiling call sequence, stream/event lifetime management, and how
+GDN state initialization interacts with request/batch bookkeeping. This
+runner's hand-rolled version approximates each of these individually but was
+never checked against the real contract as a whole.
+
+**Per this reset, the per-kernel bisection line (racecheck, kernel
+swapping, Triton warmup theories) is now frozen** -- not abandoned as
+worthless (both anomalies are real and independently documented below,
+each as its own defect), but no longer treated as the search for *the*
+root cause. The two sections below ("Known independent defects") capture
+them as closed, standalone findings. All further work in this doc follows
+a new, top-down plan: (1) formalize the known-wrong repro and characterize
+its failure rate precisely (done, see immediately below), (2) build a
+"no-HTTP correct baseline" that reuses vLLM's *real*, already-verified
+`GPUModelRunner`/`Scheduler`/`KVCacheManager` machinery in-process (HTTP
+removed, nothing else), (3) only once that baseline is solid, do a
+three-stage ownership transfer (vLLM metadata+vLLM cache -> vLLM
+metadata+our cache -> our metadata+our cache -> trimmed direct runner),
+comparing intermediate tensors at each stage to localize exactly where
+divergence starts.
+
+## Step 1 result: the wrong output is 100% deterministic, not a race
+
+Formalized the ad hoc `/tmp` repro as a committed script,
+`benchmarks/single_prefill_regression.py` -- fixed prompt ("The capital of
+France is"), fixed model/config (`unsloth/Qwen3.6-27B-NVFP4`,
+`kv_cache_dtype=fp8_e4m3`, default kernel selection, no env-var bypasses),
+records the first token id/text and a SHA-256 hash of the full logits
+vector, and can run N repeats (each a fresh process, since prior rounds
+showed process-level state -- Triton kernel cache warmth -- can matter).
+
+**Ran 20 consecutive fresh-process repeats. Result: 20/20 identical
+failures** -- same wrong first token every time (`'东'`, id 96265), and
+critically **the exact same SHA-256 logits hash on all 20 runs**
+(`720406302a42f76f`), meaning the full output logits vector was bit-for-bit
+identical across all 20 independent process runs.
+
+**This is an important clarification, not just a confirmation**: the wrong
+output is **fully deterministic** under a fixed configuration -- it is not
+a true hardware race manifesting randomly run to run. The apparent
+"Heisenbug" behavior in the third debugging pass (output flipping between
+runs) is now understood to have been caused by *changing* something about
+the test between those runs (different token counts, different
+instrumentation inserted, different kernel bypass flags) that altered which
+code path ran -- not genuine non-determinism under an unchanged
+configuration. This matters for where to look next: a 100%-reproducible
+deterministic bug is much more consistent with a **semantic/contract
+mismatch** (wrong metadata field, wrong padding convention, wrong state
+initialization -- exactly the class of bug the strategy reset above is
+now targeting) than with a genuine intra-kernel race whose outcome should
+vary with scheduling timing. The CUTLASS racecheck hazard and the
+causal_conv1d_fn cold-start bug are both still real (see below) but neither
+one, on its own, would be expected to produce the *same* wrong answer
+byte-for-byte on 20/20 runs -- a genuine race's effect on final output would
+be expected to vary at least occasionally if it were the dominant cause.
+
+## Known independent defects (real, documented, NOT treated as root cause)
+
+**Defect 1 -- Triton `causal_conv1d_fn` first-call-in-process returns
+all-zero output.** Isolated, reproducible repro (fresh process, `dim=10240`,
+`width=4`, real GDN-layer shapes, 4 repeated calls with fresh random
+tensors): call#0 all-zero, call#1-3 fully correct. Confirmed NOT the (sole)
+cause of this runner's wrong output: instrumenting all 48 real GDN-layer
+calls within one real forward pass showed every call producing correct,
+non-zero output in one full run that *still* generated the wrong final
+token. Real, worth fixing/upstreaming eventually, out of scope for the
+current root-cause search.
+
+**Defect 2 -- CUTLASS SM120 warp-specialized "pingpong" GEMM potential race
+(compute-sanitizer racecheck).** 100 consistent "Potential RAW hazard"
+reports, all in `cutlass_scaled_mm_sm120` (used by
+`CutlassFP8ScaledMMLinearKernel` for one of GDN's FP8 W8A8 linear
+projections), Write Thread 63 / Read Thread 128, varying shared-memory
+offset and CUDA block. Caveat: TMA/mbarrier-synchronized warp-specialized
+kernels are a documented source of racecheck false positives, so "potential"
+(the tool's own word) is not "confirmed." Confirmed NOT the (sole) cause:
+forcing `VLLM_DISABLED_KERNELS=CutlassFP8ScaledMMLinearKernel` (bypassing
+this exact kernel for a plain PyTorch fallback) changed the output but did
+not fix it. Real, worth investigating/reporting upstream eventually if
+confirmed, out of scope for the current root-cause search.
+
 ## What changes vs the HTTP bridge
 
 The HTTP bridge proved the control plane (`EagerEngine`/`HybridCache`/

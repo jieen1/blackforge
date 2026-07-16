@@ -4,6 +4,36 @@ Updated: 2026-07-16
 
 ## Completed
 
+### Phase 3, strategy reset (2026-07-16, fifth pass) — freeze kernel bisection, rebuild top-down
+
+After four debugging passes each surfaced a real, specific, low-level
+anomaly (Triton `causal_conv1d_fn` cold start; a CUTLASS SM120 pingpong-GEMM
+race per `compute-sanitizer racecheck`) and then *disproved* both as the
+actual root cause (bypass experiments changed output without fixing it),
+the strategy reset: **freeze further per-kernel bisection** (both anomalies
+now documented as independent, closed defects -- see the design doc's
+"Known independent defects" section) and instead rebuild top-down from
+vLLM's real, already-verified `GPUModelRunner`/`Scheduler` machinery.
+
+**Step 1 (this round, done): formalized the repro, ran it 20x.** New
+committed script `benchmarks/single_prefill_regression.py` (fixed prompt,
+config, no bypasses; records first-token id + a SHA-256 hash of the full
+logits vector; runs N fresh-process repeats). **Result: 20/20 identical
+failures** -- same wrong token, same byte-for-byte logits hash, every
+single run. This is an important clarification: the bug is **100%
+deterministic** under a fixed configuration, not a genuine hardware race.
+The earlier apparent "Heisenbug" (pass 3) is now understood to have come
+from *changing* the test configuration between runs (different token
+counts, added instrumentation, kernel bypass flags altering the code
+path) -- not true non-determinism. This points toward a **semantic/contract
+mismatch** (wrong metadata field, padding convention, or state
+initialization vs. what real `GPUModelRunner` does) as the more likely
+root cause, which is exactly what step 2 targets.
+
+**Step 2 (this round, in progress): building a no-HTTP correct baseline
+that reuses vLLM's real `GPUModelRunner`/`Scheduler`/`KVCacheManager`
+in-process** (HTTP removed, nothing else) -- see below for progress.
+
 ### Phase 3, main-line redirect (2026-07-16) — direct model runner, replacing the HTTP bridge
 
 The sibling `sm120-flash-attention` project's attention-kernel-tuning main
