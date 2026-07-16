@@ -114,6 +114,30 @@ class DirectModelRunner:
         self.slot_kv_len = [0] * num_slots
         self.slot_gdn_initialized = [False] * num_slots
 
+        self._warmup()
+
+    def _warmup(self) -> None:
+        """Real vLLM always runs a profiling/warmup forward before serving
+        (see gpu_model_runner.py's warmup pass, and this project's own
+        server logs: "Initial profiling/warmup run took N s"). Motivated by
+        a real, isolated repro (see notes/direct-model-runner-design.md's
+        "deep dive on the conv_state lead" section): causal_conv1d_fn's
+        Triton kernel returns an all-zero result on its first-ever call in
+        a process, in complete isolation, unrelated to this runtime's code.
+        Kept here since it mirrors real vLLM's own behavior and cannot
+        hurt, but -- reported honestly -- this alone does NOT fix the real
+        model's wrong output (verified: neither a 1-token nor a
+        shape-matched 5-token warmup changed the observed wrong completion
+        for "The capital of France is"). The cold-start bug is real but
+        evidently not the whole story; see the design doc for the
+        follow-up isolated tests that show a messier, not-yet-characterized
+        pattern (interleaved shapes don't self-correct the way repeating
+        one shape does) and the next debugging steps."""
+        try:
+            self.prefill(0, [0, 0, 0, 0, 0])
+        finally:
+            self.reset_slot(0)
+
     def _allocate_and_bind_kv_caches(self) -> None:
         kv_caches: dict[str, object] = {}
 

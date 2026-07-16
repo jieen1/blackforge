@@ -212,53 +212,138 @@ re-derive these):
   -- plausible but not proven innocent; worth revisiting if the GDN lead
   below dead-ends.
 
-**Concrete, NOT-yet-explained lead**: after prefill, `ssm_state` (the GDN
-recurrent state) is mostly non-zero (593152/786432) as expected for a real
-computation, but `conv_state` (the GDN causal-conv1d state) is **entirely
-zero** (0/30720) for slot 0's layer -- i.e. one of the two GDN state tensors
-persists correctly and the other does not, for the same layer, same call,
-same metadata object. `qwen_gdn_linear_attn.py`'s `_forward_core` passes
-`conv_states=conv_state, cache_indices=non_spec_state_indices_tensor` to
-`causal_conv1d_fn` for the prefill (`num_prefills>0`) branch, using the same
-`non_spec_state_indices_tensor=[slot]` this runner already sets correctly (verified
-by reading the code back). `conv_state` itself is
-`self.kv_cache[0]` transposed via `.transpose(-1,-2)` when
-`is_conv_state_dim_first()` is `False` (confirmed: `get_conv_state_layout()`
-defaults to `"SD"`, so this transpose does happen) -- a non-contiguous view.
-Whether `causal_conv1d_fn` correctly writes through that non-contiguous view
-in general (it must, since real vLLM serving allocates conv_state the exact
-same way and works) or whether something about *this* call's metadata
-specifically defeats it is the open question. **This may or may not be the
-actual cause of the wrong final output** (conv_state not persisting would
-only visibly matter for a *second* forward call needing that history, not
-necessarily for prefill's own single-call output correctness) -- it is
-reported as a concrete, reproducible anomaly, not a confirmed root cause.
+## 2026-07-16 continued: deep dive on the conv_state lead -- real progress, not yet a fix
 
-**Next debugging steps** (for whoever picks this up next, session or not):
-1. Compare intermediate hidden states layer-by-layer against a known-good
-   reference (e.g. hook the real HTTP-bridge-driven server's model at the
-   same prompt, if that's still feasible, or run this same model through
-   plain `transformers`/eager HF forward as an independent oracle) to
-   bisect whether the corruption starts in an attention layer, a GDN layer,
-   or earlier (embedding/RoPE).
-2. Try isolating GDN entirely: temporarily patch/monkeypatch a `has_initial_state`-independent
-   sanity check, or single-step through `_forward_core` with prints, to see
-   whether `mixed_qkv`/`b`/`a` (the conv1d's own inputs) are already wrong
-   *before* reaching `causal_conv1d_fn` -- would point at the projection
-   layers or `has_initial_state`/chunking metadata instead of the conv-state
-   write itself.
-3. Try running with GDN's `has_initial_state` fields flipped or with
-   `chunk_indices`/`chunk_offsets` recomputed a different way, to see if the
-   FLA chunked-prefill path (vs. a hypothetical non-chunked path) is where
-   the divergence is -- `FLA_CHUNK_SIZE=64` vs. a 5-token prompt means
-   exactly one chunk, which should be the simplest possible case to get
-   right, so if even *that* is wrong, the chunk metadata plumbing itself
-   (not chunk-boundary edge cases) is suspect.
-4. Once a signal-probe run finally produces plausible text, re-run the
-   *exact* signal-probe prompts from the HTTP-bridge round
-   (`benchmarks/real_forward_smoke.py`'s marker-code prompts) for a
-   like-for-like comparison, and specifically re-test slot release + reuse
-   (`reset_slot`) under this direct ownership model, since that is the
-   scenario this whole effort exists to get right (vLLM issue #37554's risk
-   class) -- a mechanism that merely "runs" without that guarantee holding
-   is not yet done.
+Per the coordinator's explicit direction, chased the `conv_state` lead to
+ground rather than jumping to other hypotheses. Order followed: (1) check
+whether the conv1d's own *input* is already wrong, (2) compare against how
+the HTTP-bridge round's real path triggers the conv-state write, (3) check
+the state buffer's binding/lifecycle. Found something real, but it does not
+yet add up to a working fix -- reported exactly as far as it goes.
+
+**Step 1 result -- input is fine, but so is `causal_conv1d_fn`'s own output
+computation, at least sometimes**: hooked `causal_conv1d_fn` directly
+(monkeypatch in `qwen_gdn_linear_attn`'s module namespace, since it's
+imported by name). `mixed_qkv` (the conv1d's input) is real, non-degenerate,
+non-zero data (51200/51200 non-zero, sane mean/std) every time -- input is
+not the problem. But `causal_conv1d_fn`'s **return value** (`out`, the
+actual conv1d output that feeds the rest of GDN) was *also* frequently all
+Zero in early instrumented runs -- not just `conv_state`. That reframed the
+question: state not persisting might be a symptom of the whole kernel
+call silently no-op'ing, not an isolated state-write bug.
+
+**Step 2 finding -- reproduced a real `causal_conv1d_fn` bug in complete
+isolation, independent of this runtime, the model, or its metadata**: wrote
+a minimal standalone script (no model, no `DirectModelRunner`, just
+`causal_conv1d_fn` called directly with hand-built random tensors matching
+this GDN layer's real shapes: `dim=10240`, `width=4`, `cache_indices=[0]`,
+`has_initial_state=[False]`). Result, calling it 4 times in a fresh process
+with fresh random inputs each time:
+```
+call#0: out_nonzero=     0/51200   <- first call: silently all-zero
+call#1: out_nonzero= 51200/51200   <- every later call: fully correct
+call#2: out_nonzero= 51200/51200
+call#3: out_nonzero= 51200/51200
+```
+This is a genuine, deterministic, repeatable "cold start" bug: **the very
+first invocation of this Triton kernel in a process returns an all-zero
+result**, independent of any of this runtime's code. This isn't
+metadata-construction-specific -- it reproduces with a bare, textbook call.
+
+**Why this matters directly**: real vLLM always runs a profiling/warmup
+forward pass before serving any real request (confirmed in this project's
+own server logs: `monitor.py:81] Initial profiling/warmup run took 3.64s`).
+This runner's first-ever call to the model was the real prefill itself --
+exactly the "first call" this cold-start bug breaks. Added `_warmup()` to
+`DirectModelRunner.__init__` (runs one throwaway prefill on slot 0, then
+calls `reset_slot(0)` so it looks untouched) to mirror this.
+
+**But: the warmup fix did NOT fix the real end-to-end output.** Tried both
+a 1-token dummy warmup and a 5-token dummy warmup (matching the real "The
+capital of France is" prompt's exact token count) -- both still produced
+the identical wrong output (`'东Ё¨¨¨¨...'`, byte-for-byte the same
+completion in both cases). So the isolated repro's "just call it twice"
+fix does not transfer cleanly to the full 64-layer model.
+
+**Follow-up isolated tests show the bug is messier than "first call bad,
+rest fine" -- this is the honest, unresolved part**:
+- Repeating the *exact same* shape (`num_tokens=5`, `dim=10240`) 4 times in
+  a row, with no other shapes interleaved: call#0 zero, call#1-3 correct
+  (matches the simple story).
+- But interleaving shapes (`num_tokens=1` then `5` then `5` then `5` then
+  `1` then `1` then `1`) gives a different, harder-to-explain pattern: the
+  `num_tokens=1` shape recovers after its own first (zero) call and stays
+  correct for its next 3 calls, but `num_tokens=5` stayed all-zero for 3
+  calls *in a row*, even on its 2nd and 3rd attempts. So "first call at a
+  given shape is bad, everything after is fine" is too simple a model --
+  there's some additional state (possibly Triton's kernel-variant cache,
+  possibly something about calling different shapes back-to-back) this
+  investigation has not characterized.
+- Given that, the real model's warmup not fixing the real output is
+  consistent with "the model's 48 GDN layers each call this kernel with
+  their own distinct compiled variant" or some other confound not yet
+  isolated -- not proof the cold-start finding is irrelevant, but proof
+  a single blanket warmup call is not (yet) the right fix.
+
+**Separately, and still true regardless of the above**: even in the
+"working" isolated calls (call#1-3 above, `out` fully non-zero and
+correct-looking), `conv_state` itself remained **entirely zero** every
+time. So there are likely **two distinct issues** in this area, not one:
+(a) the cold-start all-zero-output bug (real, isolated, reproducible,
+partially understood), and (b) `conv_state` never actually persisting even
+when the surrounding computation is otherwise correct (real, isolated,
+reproducible, *not yet investigated in isolation* -- steps 2-3 of the
+original plan for this specific sub-question were not reached this round).
+
+**Reproduction scripts** (kept for the next session, not committed --
+scratch-only, paths under `/tmp/qwen_check/`, referenced here by content
+since the files themselves won't survive): the core minimal repro is ~30
+lines -- build `mixed_qkv`/`conv_weights`/`bias` with `torch.randn` at
+`dim=10240,width=4,num_tokens=5`, a zeroed `conv_state` of shape
+`(1, width-1, dim)` transposed to `(1, dim, width-1)`, `cache_indices=[0]`,
+`has_initial_state=[False]`, `query_start_loc=[0,5]`, and call
+`causal_conv1d_fn(...)` 4 times in a loop with fresh tensors each iteration
+-- call 0 is zero, 1-3 are correct. Worth re-creating as a committed,
+permanent regression-probe script (`kernel/tests` equivalent) once this is
+actually root-caused, so it can be re-run against future Triton/vLLM
+version bumps.
+
+**Next debugging steps** (revised, more specific than last round):
+1. Characterize the cold-start bug's real scope: is it keyed by Triton's
+   internal kernel-variant cache (which would mean each DISTINCT
+   `(dim, width, dtype, num_stages, ...)` compile signature needs its own
+   separate warm-up call), or is it about something else entirely (a
+   process-wide CUDA/cuBLAS/cuDNN handle lazy-init race, unrelated to
+   Triton's own caching)? Try: does calling a *different* Triton kernel
+   first (unrelated to causal_conv1d) still leave causal_conv1d's own first
+   call broken? If yes, this points away from "per-kernel-variant Triton
+   caching" and toward something more global (first CUDA kernel launch of
+   any kind in the process, a known class of driver/context lazy-init
+   quirk) -- test this specifically, it's cheap.
+2. Since the real model's 48 GDN layers likely differ only in weight
+   VALUES (not shapes/dtypes -- all should be `dim=10240,width=4`), a
+   single real forward pass already calls this kernel 48 times per prefill;
+   if "same shape, called repeatedly" were sufficient (as the monotonic
+   isolated test suggested), layers 2-48 within the SAME forward call
+   should already self-correct even without an explicit separate warmup.
+   Instrument all 48 calls within one real forward pass (not just the
+   first 2, as this round's hook did) to check whether output nonzero-ness
+   turns on partway through the 48 layers -- if it does, that's a
+   different, more specific, more fixable finding than "warmup the whole
+   model first."
+3. Investigate `conv_state` non-persistence (finding (b) above) as its own,
+   separate isolated repro -- e.g. check whether calling `causal_conv1d_fn`
+   with `has_initial_state=True` and a pre-filled, non-zero `conv_state`
+   causes the OUTPUT to actually depend on that pre-filled state (would
+   confirm reads work even if writes don't), and try varying
+   `cache_indices`/batch size in the isolated script to see if state-write
+   ever succeeds under ANY isolated configuration -- this round did not
+   find one.
+4. Once output is genuinely correct for "The capital of France is" ->
+   "Paris" (the stated minimum bar), re-run the *exact* signal-probe
+   prompts from the HTTP-bridge round (`benchmarks/real_forward_smoke.py`'s
+   marker-code prompts) for a like-for-like comparison, and specifically
+   re-test slot release + reuse (`reset_slot`) under this direct ownership
+   model -- that is the scenario this whole effort exists to get right
+   (vLLM issue #37554's risk class); a mechanism that merely "runs" without
+   that guarantee holding is not yet done.

@@ -39,14 +39,27 @@ Concrete findings (full detail in the design doc's "Current state" section):
 - Ruled out: KV cache dtype mismatch, FP8 default-scale-quality (the
   HTTP-bridge round used identical FP8-KV settings and got correct output),
   and `positions`/mrope shape.
-- Open, unexplained lead: after prefill, GDN's `ssm_state` persists
-  correctly (mostly non-zero) but `conv_state` does not (all zero) for the
-  same layer/call -- reported as a concrete anomaly, not a confirmed root
-  cause of the wrong final output.
-- Next debugging steps are written up in the design doc for whoever
-  continues this (layer-by-layer comparison against a known-good oracle,
-  isolating whether GDN's own conv1d inputs are already wrong before the
-  state-write step, chunk-metadata sanity checks).
+- **Chased the `conv_state`-all-zero lead to ground per the coordinator's
+  direction (2026-07-16, later same day)**: confirmed the conv1d's own
+  input is real/non-degenerate (not the problem). Then found, in complete
+  isolation (a ~30-line script calling vLLM's `causal_conv1d_fn` directly,
+  no model, no runtime code involved) that **the first-ever call to this
+  Triton kernel in a process silently returns an all-zero result**; every
+  later call at the same shape is correct. This is a genuine, reproducible
+  bug, independent of anything this project wrote. Added a `_warmup()` step
+  (mirrors real vLLM's own pre-serving warmup pass) to work around it.
+  **However: the warmup fix did NOT change the real model's wrong output**
+  (tried both a 1-token and a shape-matched 5-token dummy warmup; identical
+  wrong completion both times). Follow-up isolated tests show the bug is
+  messier than "first call bad, rest fine" -- interleaving different
+  prompt-length shapes did not self-correct the way repeating one shape
+  did, so there is some additional, not-yet-characterized state at play.
+  Separately, and still unresolved regardless: `conv_state` remained zero
+  even in isolated calls whose *output* was otherwise fully correct --
+  likely two distinct issues, not one. Full blow-by-blow, including the
+  next specific debugging steps, is in the design doc's "deep dive" section
+  -- this is genuine, reportable progress (a real bug, isolated and
+  partially characterized), not a dead end, but it is **not yet fixed**.
 
 **Do not read this as "single prefill+decode achieved."** The mechanism
 (model loading, KV/GDN tensor ownership, metadata plumbing) is real,
