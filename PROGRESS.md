@@ -1,8 +1,57 @@
 # Implementation Progress
 
-Updated: 2026-07-15
+Updated: 2026-07-16
 
 ## Completed
+
+### Phase 3, main-line redirect (2026-07-16) — direct model runner, replacing the HTTP bridge
+
+The sibling `sm120-flash-attention` project's attention-kernel-tuning main
+line hit diminishing returns today (decode v2/prefill v2's "beats native"
+claims were both overturned, and the final split-KV hypothesis was falsified
+too), so main development effort moved to this project. Per the new
+direction: remove the HTTP bridge to a separate vLLM server
+(`runtime/vllm_bridge_backend.py`, commit `b28942c`) and have this runtime's
+own process directly own the GPU KV/GDN state for 4 fixed slots, reusing
+existing kernels (FlashInfer NVFP4 GEMM, sm120-flash-attention's decode
+v2/prefill v2, vLLM's own GDN implementation) rather than reinventing them.
+
+**Design**: `notes/direct-model-runner-design.md` -- the concrete mechanism
+(reusing `EngineArgs.create_engine_config()`, `get_model()`,
+`bind_kv_cache()`, `set_forward_context()`, all real vLLM primitives, none
+reimplemented), per-slot KV/GDN tensor layout, and hand-built
+per-request attention/GDN metadata for this round's single-request scope.
+
+**Implementation**: `runtime/direct_model_runner.py` -- loads the real
+`unsloth/Qwen3.6-27B-NVFP4` model in-process (no separate server, no HTTP),
+allocates and binds real per-slot KV cache (attention) and state (GDN
+conv/ssm) tensors, and drives `model.forward()` directly for prefill/decode.
+
+**Status: runs end-to-end without crashing, but output is INCORRECT --
+not yet a working closed loop.** This is reported honestly, not glossed
+over: the point of this round was exactly to verify correctness under direct
+GPU-state ownership, and that verification found a real, unresolved bug.
+Concrete findings (full detail in the design doc's "Current state" section):
+- Found and fixed one real bug already: `ForwardContext.slot_mapping` (a
+  field *separate* from `attn_metadata`) was never populated, so KV-cache
+  writes silently never happened at all. Fixed; KV cache now genuinely gets
+  written.
+- Ruled out: KV cache dtype mismatch, FP8 default-scale-quality (the
+  HTTP-bridge round used identical FP8-KV settings and got correct output),
+  and `positions`/mrope shape.
+- Open, unexplained lead: after prefill, GDN's `ssm_state` persists
+  correctly (mostly non-zero) but `conv_state` does not (all zero) for the
+  same layer/call -- reported as a concrete anomaly, not a confirmed root
+  cause of the wrong final output.
+- Next debugging steps are written up in the design doc for whoever
+  continues this (layer-by-layer comparison against a known-good oracle,
+  isolating whether GDN's own conv1d inputs are already wrong before the
+  state-write step, chunk-metadata sanity checks).
+
+**Do not read this as "single prefill+decode achieved."** The mechanism
+(model loading, KV/GDN tensor ownership, metadata plumbing) is real,
+substantial, verified-working infrastructure; the actual *output* is still
+wrong, and shipping this as a claimed milestone would misrepresent that.
 
 ### Phase 0 — Baseline contract
 
