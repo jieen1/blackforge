@@ -768,3 +768,62 @@ addressing (e.g. forcing the scheduler's own block-count belief down to
 match, via a smaller profiled `gpu_memory_utilization`/explicit
 `kv_cache_memory`) before Stage B could be trusted for anything beyond this
 narrow smoke test.
+
+## Stage C result (2026-07-16): the bug is conclusively localized -- 0/20,
+## deterministically, and it's specifically the hand-built metadata
+
+Per the ladder, built `runtime/vllm_stage_c_baseline.py`: keeps Stage B's
+cache substitution (already verified clean), and adds exactly one more
+substitution -- `SM120GQAMetadataBuilder.build()` and
+`GDNAttentionMetadataBuilder.build()` (the two REAL vLLM metadata builder
+classes) are monkey-patched to call
+`runtime.direct_model_runner.build_attention_metadata()` /
+`build_gdn_metadata()` (extracted as shared functions from
+`DirectModelRunner._attention_metadata`/`_gdn_metadata` -- confirmed
+behavior-preserving via the regression script's unchanged logits hash
+after this second refactor too) instead of doing the real, production
+field derivation. The few facts our hand-built functions need
+(`prior_kv_len`, `num_new_tokens`, `is_decode`) are derived from vLLM's own
+real, scheduler-computed `CommonAttentionMetadata` (`num_actual_tokens`,
+`seq_lens[0]`) rather than re-implementing independent bookkeeping -- this
+isolates the metadata *construction logic* as the one variable under test,
+not "does our own request/slot bookkeeping also happen to be right."
+Everything else (real `Scheduler`, real warmup, Stage B's real-scheduling-
+driven cache) stays untouched.
+
+**Result: ran 20 consecutive fresh-process repeats. 0/20 passed -- and,
+notably, all 20 failures were byte-for-byte identical**
+(`'束\n\n�aser้องagogue衙ires'` every single run,
+no crash, no exception). Same deterministic-failure signature as the
+original `direct_model_runner.py` bug (Step 1's 20/20 identical failure),
+though the exact wrong text differs between the two -- expected, since
+Stage C's harness differs slightly in mechanics (single real `LLM.generate`
+call under real scheduling vs. `direct_model_runner.py`'s own manual loop),
+but both are 100% deterministic wrong answers, not races.
+
+**This is the cleanest localization this entire investigation has
+produced**: A (real metadata + real cache) passes 20/20. B (real metadata +
+our cache) passes 20/20. C (our metadata + our cache) fails 0/20,
+deterministically. Per the ladder's own decision rule, this conclusively
+proves **the bug is specifically in this project's hand-built
+attention/GDN metadata construction logic**
+(`build_attention_metadata`/`build_gdn_metadata` in
+`runtime/direct_model_runner.py`) -- not the cache shape/binding/slot-
+mapping/state-init (B already exonerated that), not the model, not the
+quantization, not the kernels, not the CUTLASS/Triton anomalies found and
+ruled out in earlier passes (both real, both independent, neither the root
+cause -- now doubly confirmed, since this whole ladder never touches
+either of those specific kernels' code paths differently between B and C).
+
+**Not yet done, natural next step (not attempted this round given time
+already spent)**: pinpoint exactly *which* field(s) in
+`build_attention_metadata`/`build_gdn_metadata` are wrong, by comparing
+them value-by-value against what the REAL builders would have produced for
+the *identical* real `CommonAttentionMetadata` input at each step (both
+patches already have access to the real object at the exact substitution
+point -- capturing both the real builder's real output AND our hand-built
+output for the same input, then diffing field-by-field, is now a small,
+well-scoped follow-on given the harness already exists). Stage D (the
+trimmed-down full `direct_model_runner.py`) was not attempted this round
+either, since C already failing makes D's outcome predictable (D should
+also fail, for the same reason) without needing to re-verify.

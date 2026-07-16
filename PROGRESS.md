@@ -68,6 +68,30 @@ capacity (~8192 tokens) -- never manifested in this narrow single-short-
 request test, but would need reconciling before trusting Stage B beyond
 this smoke test. Full detail in the design doc's "Stage B result" section.
 
+**Step 3, Stage C (this round, DONE -- bug conclusively localized): 0/20,
+deterministically.** Built `runtime/vllm_stage_c_baseline.py`: keeps
+Stage B's cache substitution, adds exactly one more -- the two real vLLM
+metadata builder classes (`SM120GQAMetadataBuilder`,
+`GDNAttentionMetadataBuilder`) are monkey-patched to call this project's
+own hand-built metadata construction (`build_attention_metadata`/
+`build_gdn_metadata`, extracted as shared functions -- confirmed
+behavior-preserving) instead of their real field derivation, sourcing the
+few needed facts from vLLM's own real `CommonAttentionMetadata`. **Ran 20
+consecutive fresh-process repeats: 0/20 passed, and all 20 failures were
+byte-for-byte identical** (same deterministic-failure signature as the
+original bug, different exact wrong text). **Per the ladder's decision
+rule, this conclusively localizes the bug**: A (real everything) passes
+20/20, B (real metadata + our cache) passes 20/20, C (our metadata + our
+cache) fails 0/20 -- the bug is specifically in this project's hand-built
+attention/GDN metadata construction logic, not cache, not the model, not
+the two independent kernel-level anomalies found and ruled out in earlier
+passes. Natural next step (not attempted this round): diff our hand-built
+metadata field-by-field against the real builders' output for the
+identical real input, to pinpoint exactly which field is wrong. Stage D
+(the full `direct_model_runner.py`) was not run this round since C failing
+already makes D's outcome predictable. Full detail in the design doc's
+"Stage C result" section.
+
 ### Phase 3, main-line redirect (2026-07-16) — direct model runner, replacing the HTTP bridge
 
 The sibling `sm120-flash-attention` project's attention-kernel-tuning main

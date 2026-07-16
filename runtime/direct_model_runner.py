@@ -100,6 +100,114 @@ def allocate_fixed_slot_kv_caches(
     return kv_caches
 
 
+def build_attention_metadata(
+    *,
+    prior_kv_len: int,
+    num_new_tokens: int,
+    is_decode: bool,
+    slot: int,
+    block_size: int,
+    blocks_per_slot: int,
+    device: torch.device,
+) -> SM120GQAMetadata:
+    """Hand-built SM120GQAMetadata for one request in one fixed slot. Shared
+    between ``DirectModelRunner`` (which tracks ``prior_kv_len`` itself via
+    ``self.slot_kv_len``) and Stage C of the 2026-07-16 ownership-transfer
+    ladder (``runtime/vllm_stage_c_baseline.py``, which derives
+    ``prior_kv_len`` from vLLM's own real, scheduler-computed
+    ``CommonAttentionMetadata`` instead) -- this is deliberately the exact
+    same field-construction logic in both cases, so Stage C tests whether
+    *this logic* is correct, not a second, independently-written copy of it.
+    """
+    new_kv_len = prior_kv_len + num_new_tokens
+    page_size = block_size
+    first_block = slot * blocks_per_slot
+    num_pages = (new_kv_len + page_size - 1) // page_size
+    if num_pages > blocks_per_slot:
+        raise RuntimeError(
+            f"slot {slot} kv_len {new_kv_len} exceeds this slot's "
+            f"{blocks_per_slot * page_size}-token capacity"
+        )
+    qo_indptr = torch.tensor([0, num_new_tokens], dtype=torch.int32, device=device)
+    kv_page_indptr = torch.tensor([0, num_pages], dtype=torch.int32, device=device)
+    kv_page_indices = torch.arange(
+        first_block, first_block + num_pages, dtype=torch.int32, device=device
+    )
+    last_page_len = new_kv_len - (num_pages - 1) * page_size
+    kv_last_page_len = torch.tensor([last_page_len], dtype=torch.int32, device=device)
+    return SM120GQAMetadata(
+        num_actual_tokens=num_new_tokens,
+        num_reqs=1,
+        qo_indptr=qo_indptr,
+        kv_page_indptr=kv_page_indptr,
+        kv_page_indices=kv_page_indices,
+        kv_last_page_len=kv_last_page_len,
+        page_size=page_size,
+        is_pure_decode=is_decode and num_new_tokens == 1,
+        kv_split_size=max(new_kv_len, 1),
+        max_num_splits=1,
+        decode_qo_len=num_new_tokens if is_decode else 0,
+    )
+
+
+def build_gdn_metadata(
+    *,
+    slot_initialized: bool,
+    num_new_tokens: int,
+    is_decode: bool,
+    slot: int,
+    device: torch.device,
+) -> GDNAttentionMetadata:
+    """Hand-built GDNAttentionMetadata for one request in one fixed slot --
+    see ``build_attention_metadata``'s docstring for why this is a shared
+    function, not a second copy, between ``DirectModelRunner`` and Stage C.
+    """
+    state_indices = torch.tensor([slot], dtype=torch.int32, device=device)
+    if is_decode:
+        assert num_new_tokens == 1
+        non_spec_qsl = torch.tensor([0, 1], dtype=torch.int32, device=device)
+        return GDNAttentionMetadata(
+            num_prefills=0,
+            num_prefill_tokens=0,
+            num_decodes=1,
+            num_decode_tokens=1,
+            num_spec_decodes=0,
+            num_spec_decode_tokens=0,
+            num_actual_tokens=1,
+            non_spec_query_start_loc=non_spec_qsl,
+            non_spec_state_indices_tensor=state_indices,
+        )
+
+    query_start_loc = torch.tensor([0, num_new_tokens], dtype=torch.int32, device=device)
+    query_start_loc_cpu = query_start_loc.cpu()
+    has_initial_state = torch.tensor([slot_initialized], dtype=torch.bool, device=device)
+    chunk_indices = prepare_chunk_indices(query_start_loc, FLA_CHUNK_SIZE)
+    chunk_offsets = prepare_chunk_offsets(query_start_loc, FLA_CHUNK_SIZE)
+    nums_dict, batch_ptr, token_chunk_offset_ptr = compute_causal_conv1d_metadata(
+        query_start_loc_cpu, device=device
+    )
+    return GDNAttentionMetadata(
+        num_prefills=1,
+        num_prefill_tokens=num_new_tokens,
+        num_decodes=0,
+        num_decode_tokens=0,
+        num_spec_decodes=0,
+        num_spec_decode_tokens=0,
+        num_actual_tokens=num_new_tokens,
+        has_initial_state=has_initial_state,
+        non_spec_query_start_loc=query_start_loc,
+        non_spec_state_indices_tensor=state_indices,
+        chunk_indices=chunk_indices,
+        chunk_offsets=chunk_offsets,
+        prefill_query_start_loc=query_start_loc,
+        prefill_state_indices=state_indices,
+        prefill_has_initial_state=has_initial_state,
+        nums_dict=nums_dict,
+        batch_ptr=batch_ptr,
+        token_chunk_offset_ptr=token_chunk_offset_ptr,
+    )
+
+
 def build_vllm_config(
     *,
     model: str,
@@ -207,87 +315,25 @@ class DirectModelRunner:
     def _attention_metadata(
         self, slot: int, *, num_new_tokens: int, is_decode: bool
     ) -> SM120GQAMetadata:
-        prior_kv_len = self.slot_kv_len[slot]
-        new_kv_len = prior_kv_len + num_new_tokens
-        page_size = self.block_size
-        first_block = slot * self.blocks_per_slot
-        num_pages = (new_kv_len + page_size - 1) // page_size
-        if num_pages > self.blocks_per_slot:
-            raise RuntimeError(
-                f"slot {slot} kv_len {new_kv_len} exceeds this slot's "
-                f"{self.blocks_per_slot * page_size}-token capacity"
-            )
-        device = self.device
-        qo_indptr = torch.tensor([0, num_new_tokens], dtype=torch.int32, device=device)
-        kv_page_indptr = torch.tensor([0, num_pages], dtype=torch.int32, device=device)
-        kv_page_indices = torch.arange(
-            first_block, first_block + num_pages, dtype=torch.int32, device=device
-        )
-        last_page_len = new_kv_len - (num_pages - 1) * page_size
-        kv_last_page_len = torch.tensor([last_page_len], dtype=torch.int32, device=device)
-        return SM120GQAMetadata(
-            num_actual_tokens=num_new_tokens,
-            num_reqs=1,
-            qo_indptr=qo_indptr,
-            kv_page_indptr=kv_page_indptr,
-            kv_page_indices=kv_page_indices,
-            kv_last_page_len=kv_last_page_len,
-            page_size=page_size,
-            is_pure_decode=is_decode and num_new_tokens == 1,
-            kv_split_size=max(new_kv_len, 1),
-            max_num_splits=1,
-            decode_qo_len=num_new_tokens if is_decode else 0,
+        return build_attention_metadata(
+            prior_kv_len=self.slot_kv_len[slot],
+            num_new_tokens=num_new_tokens,
+            is_decode=is_decode,
+            slot=slot,
+            block_size=self.block_size,
+            blocks_per_slot=self.blocks_per_slot,
+            device=self.device,
         )
 
     def _gdn_metadata(
         self, slot: int, *, num_new_tokens: int, is_decode: bool
     ) -> GDNAttentionMetadata:
-        device = self.device
-        state_indices = torch.tensor([slot], dtype=torch.int32, device=device)
-        if is_decode:
-            assert num_new_tokens == 1
-            non_spec_qsl = torch.tensor([0, 1], dtype=torch.int32, device=device)
-            return GDNAttentionMetadata(
-                num_prefills=0,
-                num_prefill_tokens=0,
-                num_decodes=1,
-                num_decode_tokens=1,
-                num_spec_decodes=0,
-                num_spec_decode_tokens=0,
-                num_actual_tokens=1,
-                non_spec_query_start_loc=non_spec_qsl,
-                non_spec_state_indices_tensor=state_indices,
-            )
-
-        query_start_loc = torch.tensor([0, num_new_tokens], dtype=torch.int32, device=device)
-        query_start_loc_cpu = query_start_loc.cpu()
-        has_initial_state = torch.tensor(
-            [self.slot_gdn_initialized[slot]], dtype=torch.bool, device=device
-        )
-        chunk_indices = prepare_chunk_indices(query_start_loc, FLA_CHUNK_SIZE)
-        chunk_offsets = prepare_chunk_offsets(query_start_loc, FLA_CHUNK_SIZE)
-        nums_dict, batch_ptr, token_chunk_offset_ptr = compute_causal_conv1d_metadata(
-            query_start_loc_cpu, device=device
-        )
-        return GDNAttentionMetadata(
-            num_prefills=1,
-            num_prefill_tokens=num_new_tokens,
-            num_decodes=0,
-            num_decode_tokens=0,
-            num_spec_decodes=0,
-            num_spec_decode_tokens=0,
-            num_actual_tokens=num_new_tokens,
-            has_initial_state=has_initial_state,
-            non_spec_query_start_loc=query_start_loc,
-            non_spec_state_indices_tensor=state_indices,
-            chunk_indices=chunk_indices,
-            chunk_offsets=chunk_offsets,
-            prefill_query_start_loc=query_start_loc,
-            prefill_state_indices=state_indices,
-            prefill_has_initial_state=has_initial_state,
-            nums_dict=nums_dict,
-            batch_ptr=batch_ptr,
-            token_chunk_offset_ptr=token_chunk_offset_ptr,
+        return build_gdn_metadata(
+            slot_initialized=self.slot_gdn_initialized[slot],
+            num_new_tokens=num_new_tokens,
+            is_decode=is_decode,
+            slot=slot,
+            device=self.device,
         )
 
     def _slot_mapping(self, slot: int, start_pos: int, num_new_tokens: int) -> torch.Tensor:
