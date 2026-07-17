@@ -656,6 +656,53 @@ boundary," and recommended a strictly time-boxed trace-driven
 performance probe (no real drafter) before committing to the full
 faithful integration — adopted, see next section.
 
+### Phase 3, step 7: real W1 acceptance-rate comparison vs native vLLM (2026-07-17) — two real methodology confounds found and fixed, real ~3.1pp gap remains, does not yet clear the ≤1pp gate
+
+Full detail in `notes/direct-model-runner-design.md`. Built `benchmarks/
+mtp_our_runtime_acceptance.py` (real concurrency=4 round-robin
+`mtp_prefill`→`mtp_verify_and_commit`, W1 shape, tallying acceptance
+using the exact same formulas vLLM's own `SpecDecodingLogging` uses) and
+used the sibling project's existing isolated-test-server infra
+(`scripts/run_serving_benchmark.sh`, `--backend flashinfer --with-mtp`,
+never touches the production server) for native's side, matched W1
+shape (4096in/256out — reduced output length from 1024 to keep this
+round's GPU time bounded, documented not hidden).
+
+**First attempt showed a ~20pp gap that was NOT taken at face value**:
+native (default sampling) 49.83% vs. our runtime (uniform-random
+prompts) 63.30%. `vllm bench serve` itself warned it no longer defaults
+to greedy sampling — a real confound against this runtime's
+unconditionally-greedy MTP. Re-ran native with `--temperature 0` forced:
+**70.38%**, a 20-point jump, confirming this was real. Second confound
+found by reading vLLM's own `RandomDataset` source directly: its
+"random" tokens are actually a SEQUENTIAL RUN of ascending ids (`(offset
++ index + arange) % vocab_size`), not i.i.d. uniform samples — a more
+locally-predictable distribution than what our own test used. Fixed to
+match exactly; our runtime's rate rose to **67.25%** (mean length 3.02).
+
+**Current state, both confounds fixed, same shape (4096in/256out, c=4,
+K=3, both greedy)**: native **70.38%** (1318 drafts) vs. our runtime
+**67.25%** (341 drafts) — a real **3.1 percentage point gap**, does NOT
+yet clear the project's ≤1pp gate. Reported honestly, not explained
+away. Two candidate remaining explanations, not yet distinguished:
+(1) sampling noise (our smaller sample has ~2.6% SE vs. native's ~1.3%,
+so part of the gap could narrow with more samples), (2) a genuine,
+still-undiscovered mechanism difference between this runtime's MTP
+implementation and real vLLM's actual speculator internals — important
+caveat: this project's steps 1-6 verification all checked internal
+consistency (does the mechanism behave correctly per its OWN design),
+never validated it exactly reproduces native's specific numerics —
+passing those checks was necessary but not sufficient for this, and
+this is the first real evidence of where that gap actually sits.
+
+**Not attempted this round**: W2 (32768in) — W1 alone (plus its two
+confound-driven re-runs) already used substantial GPU time on top of
+this round's earlier capacity work; W2's per-round cost is meaningfully
+higher. Investigating the W1 gap (larger sample and/or a closer
+mechanism-level comparison) is a better next step than moving to a more
+expensive workload before understanding a gap already visible at the
+cheaper one.
+
 ### Phase 3, capacity expansion to real W1/W2 scale (2026-07-17) — empirically measured, expanded, full MTP suite re-verified with zero regressions
 
 Full detail in `notes/direct-model-runner-design.md`. Built `benchmarks/

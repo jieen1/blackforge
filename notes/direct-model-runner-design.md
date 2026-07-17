@@ -2839,3 +2839,119 @@ size.
 Capacity (coordinator's item 3) is now done and re-verified -- the last
 blocker before step 7. Moving to the real W1/W2 acceptance-rate
 comparison against native vLLM next.
+
+## 2026-07-17, step 7: real W1 acceptance-rate comparison vs native vLLM -- two real methodology confounds found and fixed, real ~3.1pp gap remains (does not yet clear the ≤1pp gate)
+
+### Our own runtime's W1 measurement
+
+Built `benchmarks/mtp_our_runtime_acceptance.py`: real, concurrency=4,
+round-robin `mtp_prefill` → repeated `mtp_verify_and_commit` (the
+already-verified-correct machinery, used here as a black box for
+throughput/acceptance measurement, not re-verifying correctness), W1
+shape (4096in), tallying `num_drafts`/`num_draft_tokens`/
+`num_accepted_tokens` using the EXACT SAME formulas
+`vllm/v1/spec_decode/metrics.py`'s `SpecDecodingLogging.log()` uses
+(`draft_acceptance_rate = accepted/draft_tokens*100`,
+`mean_acceptance_length = 1 + accepted/drafts`), so the number is
+directly comparable to what native vLLM itself reports.
+
+### Native vLLM's W1 measurement (real server, existing infra)
+
+Used the sibling project's already-tested
+`scripts/run_serving_benchmark.sh` (launches an ISOLATED test server,
+never touches the production server) with `--backend flashinfer`
+(stock/native, not our SM120 kernel) `--with-mtp`, matched W1 shape
+(4096in/256out -- reduced output length from the full 1024 to keep this
+round's total GPU time bounded while still getting a statistically
+meaningful sample; documented, not silently substituted),
+`--kv-cache-dtype fp8_e4m3`, concurrency=4. `vllm bench serve` itself
+now reports a full "Speculative Decoding" section directly (acceptance
+rate, acceptance length, per-position rates) -- did not need to
+manually grep server logs for `SpecDecodingLogging`'s output.
+
+### First attempt: a ~20-point gap, NOT accepted at face value
+
+First native run: **49.83%** acceptance rate. Our own runtime: **63.30%**
+(uniform-random-token prompts). Took this at face value only long
+enough to notice `vllm bench serve`'s own printed warning: *"vllm bench
+serve no longer sets temperature==0 (greedy) in requests by default."*
+This is a decisive confound -- native's request used WHATEVER default
+sampling temperature the server applies (NOT necessarily 0/greedy),
+while this runtime's own MTP implementation is unconditionally greedy
+(`argmax` at every step, no sampling). Comparing a non-greedy target
+against a greedy one is not a fair test of the SAME mechanism.
+
+**Fix**: re-ran natively with `--temperature 0` explicitly forced
+(confirmed accepted by `vllm bench serve`'s own CLI). Result:
+**70.38%** acceptance rate, 3.11 mean length -- a full 20-point jump
+from the non-greedy run, confirming this was a real, large confound,
+not a minor detail.
+
+### Second confound found and fixed: input token distribution
+
+Comparing greedy-native (70.38%) against our own runtime's
+uniform-random-token run (63.30%) still left a ~7pp gap. Read real
+vLLM's own `RandomDataset.generate_token_sequence()` source directly
+rather than assume "random" means i.i.d. uniform sampling -- it
+does NOT: `allowed_tokens[(offset + index + arange(input_len)) %
+len(allowed_tokens)]` is a SEQUENTIAL RUN of ascending token ids
+(wrapping mod vocab size), a meaningfully more locally-structured
+(hence more locally-predictable) sequence than i.i.d. uniform sampling,
+which this project's own first attempt at the "our runtime" side used
+instead. Fixed `mtp_our_runtime_acceptance.py`'s prompt generation to
+use the IDENTICAL formula. Re-ran: our runtime's acceptance rate rose
+to **67.25%** (mean length 3.02) -- confirming the distribution
+mismatch was real and substantial (closed roughly half the remaining
+gap).
+
+### Current state: a real ~3.1 percentage point gap remains
+
+With BOTH confounds fixed (temperature=0 forced on both sides via this
+runtime's inherent greedy design + native's explicit `--temperature 0`
+flag; identical vLLM-formula random-token input distribution on both
+sides), same W1 shape (4096in/256out, concurrency=4, K=3):
+
+| | Acceptance rate | Mean acceptance length | Sample size (drafts) |
+|---|---|---|---|
+| Native vLLM (greedy, FlashInfer) | **70.38%** | 3.11 | 1318 |
+| This runtime (greedy) | **67.25%** | 3.02 | 341 |
+| **Gap** | **3.13pp** | 0.09 | -- |
+
+This does **NOT** yet clear the project's own ≤1pp gate
+(`项目实施规划.md`'s Phase 1 gate: "MTP acceptance 不得比 vLLM 下降超过 1
+个百分点"). Reported as a real, currently-open finding, not explained
+away. Candidate remaining explanations, NOT yet distinguished from each
+other (honest, not resolved this round):
+
+1. **Sampling noise**: our runtime's 341-draft sample has a coarser
+   estimate (~2.6% standard error) than native's 1318-draft sample
+   (~1.3%) -- a combined ~2.9% SE means 3.1pp is a real but not
+   overwhelming signal (roughly 1 combined SE), so SOME of the
+   remaining gap could narrow with a larger sample.
+2. **A genuine, still-undiscovered mechanism difference** between this
+   runtime's `mtp_prefill`/`_mtp_sync_and_propose`/
+   `mtp_verify_and_commit` and real vLLM's actual
+   `AutoRegressiveSpeculator`/`MTPSpeculator` internals. Important
+   caveat, stated plainly: this project's own steps 1-6 verification
+   (weight sharing, shifted first pass, K=3 proposal, accept/reject,
+   GDN rollback, multi-round, 4-slot isolation) all checked this
+   runtime's INTERNAL CONSISTENCY -- does the mechanism behave
+   correctly according to ITS OWN design -- never validated that this
+   design exactly reproduces real vLLM's specific numerical behavior
+   end to end. Passing every internal check is necessary but was never
+   sufficient to guarantee matching native's real acceptance rate; this
+   round's finding is the first real evidence of where that assumption
+   breaks down, by exactly how much.
+
+### Scope this round (reported honestly, not forced further)
+
+W2 (32768in) was NOT attempted -- W1 alone, including the two
+confound-driven re-runs, already used substantial GPU time this round
+(on top of the capacity work earlier in the same round); W2's per-round
+cost is meaningfully higher (longer context per attention call) and a
+comparable sample size would take considerably longer. The ~3.1pp W1
+gap is itself the more pressing next question -- investigating that
+(larger W1 sample to rule out noise, and/or a closer read of real
+vLLM's actual `AutoRegressiveSpeculator` numerics against this runtime's
+own) is a better next step than moving to a more expensive workload
+before understanding a gap already visible at the cheaper one.
