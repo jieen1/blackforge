@@ -554,6 +554,80 @@ per the coordinator's explicit invitation to do so rather than force a
 rushed finish -- the concrete design above is the starting point for
 that round, not a re-investigation.
 
+### Phase 3, MTP draft-sync evidence chain + worst-case redesign scope + pragmatic fallback proposal (2026-07-17)
+
+Design/research-only round (explicitly no heavy GPU ops), following up
+the MTP semantics round above. Full detail in
+`notes/direct-model-runner-design.md`'s "2026-07-17 follow-up" section;
+summary here.
+
+**Question**: does every real target-model step truly need a synchronous
+draft-model forward pass, or is there a lighter alternative (e.g. only
+sync when actually about to propose)? **Answer: confirmed decisively,
+no lighter alternative exists in vLLM's real implementation.** Exact
+evidence chain: `vllm/v1/worker/gpu/model_runner.py:1114`'s
+`execute_model()` is the single unified per-step entry point for both
+prefill and decode (not two dispatch paths); `:1456-1479` calls
+`self.speculator.propose(...)` right after `postprocess_sampled()`,
+gated ONLY by `self.speculator is not None` (no decode-only/every-N-steps
+condition); the SAME call is duplicated at `:582-623` for the dummy/
+warmup run, confirming it's treated as a mandatory part of every step's
+contract, not an optional side channel. Mechanism-level reason it must
+be per-step: `_prepare_prefill_inputs_kernel`
+(`autoregressive/speculator.py:510-519`) shifts-by-one over the FULL
+current step's query range on every real step, feeding the draft model's
+own attention layer a gap-free causal history — a transformer attention
+layer has no valid "catch up later," every position must be written in
+order or later positions attend over a hole.
+
+**Worst-case redesign scope** (design-level only): (A) model loading —
+add `speculative_config` to `build_vllm_config`, load `Qwen3NextMTP` via
+a second `get_model()` call BEFORE KV-cache allocation so its attention
+layer auto-registers into the existing allocation machinery (small,
+low-risk, reuses existing generic code). (B) KV sizing — draft model's
+own attention layer needs the same per-slot capacity as the target's 16
+full-attention layers; ~1/16 ≈ 6.25% more attention-KV memory per slot,
+GDN memory unaffected (MTP model has no GDN layers). (C) **the expensive
+part**: every real forward call site (`prefill`/`decode`/`_forward`/
+`_forward_batch`, plus `CapturedBatchDecodeGraph.replay()`) needs a
+matching draft-model forward call added immediately after the target's
+own forward+logits — roughly doubles real forward-pass count per step
+(draft model's single decoder layer is cheap per-token, but the sync
+call itself is pervasive, touching every call site including the
+CUDA-Graph-captured path). (D) the K-step autoregressive propose loop
+layers on top of C once a synced draft KV cache exists. (E) wiring
+already-verified `verify_batch`/`determine_accept_reject`/
+`snapshot_gdn_state`/`restore_gdn_state` into a real cycle — comparatively
+contained once C exists. **Bottom line: A-B-D-E are small/contained, C
+is the real cost driver** (consistent with the prior round's "more
+invasive than a simple propose loop" finding).
+
+**Pragmatic fallback evaluated**: self-drafting — feed K real greedy
+single-token decodes (via the already-verified qo_len=1 path) as the
+"draft," submit through the REAL qo_len=K+1 `verify_batch`/CUDA-graph
+path exactly as production MTP would. **Gets right**: exercises the
+actual production kernel shape that determines launch-gap/throughput
+(this round's real open question) using 100% already-built, already-
+verified infrastructure, zero new engineering. **Gets wrong, by
+construction**: acceptance rate will read ~100% (the "draft" IS the
+target model's own output) vs. this project's own earlier ~63-66%
+measurement for real MTP on this model — must be reported as an
+explicitly-labeled optimistic upper bound on accepted-tokens/s, never
+conflated with a real acceptance-rate number, and does not by itself
+satisfy Phase 8's "faithfully replicate vLLM's MTP" mandate.
+**Recommendation**: reasonable as an early, clearly-caveated performance
+signal while real draft-model integration (section C) is scoped as its
+own round, provided that real work isn't quietly dropped once an early
+number is in hand. Not implemented this round (design-only scope); a
+small, low-risk addition on top of existing verified pieces whenever
+picked up.
+
+**Status**: a parallel independent (Codex-sol) analysis of the same
+architectural question was requested by the coordinator and was still
+running as of this write-up — not waited on, per instruction. This
+section is written so that once it returns, decisions can be made
+without re-discussing the evidence from scratch.
+
 ### Phase 3, main-line redirect (2026-07-16) — direct model runner, replacing the HTTP bridge
 
 The sibling `sm120-flash-attention` project's attention-kernel-tuning main

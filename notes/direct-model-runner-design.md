@@ -1803,3 +1803,241 @@ coordinator's explicit invitation to do so, not forced to a rushed
 finish. Recommendation: treat this as its own dedicated round, using the
 concrete design above (already traced from source, not requiring
 re-investigation) as the starting point.
+
+## 2026-07-17 follow-up: confirmed "every step needs draft-model sync" with an exact evidence chain; worst-case redesign scope; a pragmatic simplified-draft alternative evaluated
+
+Per the coordinator's request, went deeper on whether vLLM's real MTP
+implementation truly requires a draft-model forward pass on every single
+real engine step, or whether there's a lighter path (only sync when
+actually about to propose). This is now settled with an exact,
+citable evidence chain, not inference from a partial read.
+
+### Evidence chain: yes, unconditionally every step
+
+1. **`vllm/v1/worker/gpu/model_runner.py:1114` (`execute_model`)** is the
+   SINGLE, unified per-engine-step entry point -- driven by one
+   `scheduler_output` that can mix prefill and decode requests in the
+   same call (V1's continuous-batching design), not a
+   prefill-vs-decode-branching dispatcher. There is exactly one call site
+   per real step, not one-per-request-type.
+2. **`vllm/v1/worker/gpu/model_runner.py:1456-1479`**: immediately after
+   `self.postprocess_sampled(...)` (which commits this step's real
+   sampled/accepted tokens into request state), the code runs:
+   ```python
+   if self.speculator is not None:
+       ...
+       draft_tokens = self.speculator.propose(...)
+       self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+   ```
+   The ONLY gate is `self.speculator is not None` (i.e. "is speculative
+   decoding configured at all for this engine") -- there is no additional
+   condition like "only if this step is a decode step" or "only every N
+   steps" or "only if the scheduler asked for a draft this cycle". Every
+   real step -- prefill, decode, or a mixed batch -- calls `propose()`
+   right after committing that step's real output.
+3. **The SAME call appears a second time, at
+   `vllm/v1/worker/gpu/model_runner.py:582-623`**, inside the
+   warmup/dummy-run/profiling path (`dummy_run=True`) -- explicitly
+   labeled "dummy run the eagle speculator's propose to ensure DP/EP
+   sync", confirming the propose call is treated as a MANDATORY part of
+   every step's execution contract (even a fake warmup step must still
+   exercise it), not an optional side channel.
+4. **`vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py`**
+   (`AutoRegressiveSpeculator.propose`, the base class
+   `MTPSpeculator`/Qwen3's MTP uses): line 174
+   (`hidden_states = last_hidden_states`) feeds the draft model the
+   TARGET model's own just-computed hidden state for THIS step -- a
+   hard, per-step data dependency, not something that could be
+   deferred or batched up and run less often.
+5. **`_prepare_prefill_inputs_kernel`, same file, lines 510-519**:
+   ```python
+   # Shift target_input_ids by one.
+   for i in range(1, query_len, BLOCK_SIZE):
+       ...
+       tl.store(draft_input_ids_ptr + query_start + block - 1, input_ids, mask=mask)
+   ...
+   tl.store(draft_input_ids_ptr + last_token_index, next_token)
+   ```
+   This loops over the FULL current step's query range (`query_len`,
+   this step's real token count for this request -- large for a prefill,
+   1 for a plain decode, K+1 for an MTP verify step), not just the last
+   position. The draft model is fed a "teacher-forced" shifted copy of
+   EVERY real token processed this step, so its own attention KV cache
+   accumulates a complete, gap-free history in lockstep with the target
+   model's. This is the direct mechanism-level confirmation: the draft
+   model's own attention layer literally cannot skip steps and stay
+   correct, because a real transformer attention layer's causal history
+   has no valid notion of "catch up later" -- every position must be
+   written when it happens, in order, or later positions attend over a
+   hole.
+
+**Conclusion, stated plainly**: there is no lighter alternative in
+vLLM's real implementation. "Only run the draft model when actually
+about to propose K tokens" is not a real code path that exists -- MTP's
+design fundamentally assumes the draft model's KV cache is always
+current, because that is what makes the K-step autoregressive propose
+loop cheap (it only needs to extend, never rebuild, history). A
+from-scratch reimplementation COULD in principle choose a different,
+non-vLLM-compatible design (e.g. recompute the draft model's full
+context from scratch on demand, trading a large one-time cost per
+verify cycle for avoiding the small per-step sync cost) -- but that
+would not be "replicating vLLM's MTP K=3" per the project's own Phase 8
+mandate, it would be a genuinely different mechanism with different
+acceptance-rate and performance characteristics, unverified against
+anything.
+
+### Worst-case redesign scope (design-level, no implementation this round)
+
+If this project commits to faithfully replicating vLLM's mechanism, the
+concrete changes are:
+
+**A. Model loading** (`build_vllm_config`/`DirectModelRunner.__init__`):
+add a `with_mtp: bool`/`num_speculative_tokens: int` parameter passing
+`speculative_config={"method": "mtp", "num_speculative_tokens": K,
+"attention_backend": "CUSTOM"}` to `EngineArgs` (matching
+`launch_test_server.py` exactly -- reuses vLLM's own
+`SpeculativeConfig.update_arch_()` construction, not reinvented). Then
+`get_model(vllm_config=vllm_config, model_config=vllm_config
+.speculative_config.draft_model_config)` loads `Qwen3NextMTP`, storing
+it as `self.mtp_model`. Must happen BEFORE
+`_allocate_and_bind_kv_caches()` so the MTP model's own attention layer
+registers into the SAME `static_forward_context` this project's existing
+KV-cache-allocation machinery already iterates over.
+
+**B. KV cache sizing**: the MTP model's own attention layer needs the
+SAME per-slot page-table capacity as the target's 16 full-attention
+layers (it tracks the identical-length sequence history) -- this
+`allocate_fixed_slot_kv_caches` handles "for free" once the MTP layer is
+in `attn_layer_names`, but it means attention-KV memory footprint grows
+by 1/16 ≈ 6.25% (one extra full-attention-shaped cache per slot). GDN
+memory is unaffected -- `Qwen3NextMTP` has no GDN/linear-attention
+layers at all.
+
+**C. Every real target-model forward call needs a matching draft-model
+forward call** (the pervasive part): `DirectModelRunner.prefill()`/
+`.decode()`/`._forward()`/`._forward_batch()`, and
+`CapturedBatchDecodeGraph.replay()`, would each need to, immediately
+after the target model's own `forward()`+`compute_logits()`, ALSO:
+   1. Build a shifted-by-one `input_ids` for the draft model (this
+      step's real input_ids shifted left by one, with the newly-sampled
+      next token in the last slot -- mirrors
+      `_prepare_prefill_inputs_kernel`).
+   2. Build the draft model's OWN attention metadata + slot_mapping
+      (same per-slot physical addressing as the target's attention
+      layers, scoped to just the MTP layer's own name(s) -- a NEW
+      `self.mtp_attn_layer_names` list, separate from
+      `self.attn_layer_names`).
+   3. Call `self.mtp_model.forward(input_ids, positions, hidden_states=
+      <target's own last hidden state from step 1's call>, spec_step_idx=0)`
+      under `set_forward_context` scoped to the MTP layer's metadata.
+   This roughly DOUBLES the number of real forward passes per step
+   (target + draft-sync), though the draft model's own single decoder
+   layer is far cheaper per token than the full 64-layer target model.
+   For the CUDA-Graph-captured path specifically, this sync call would
+   need to be captured as part of the SAME graph (or a second, chained
+   graph) to keep the "no Python-level dispatch per step" property this
+   round's CUDA Graph work established.
+
+**D. The K-step autoregressive propose loop** (only needed once C above
+provides a synced draft KV cache and an initial `draft_tokens[0]`, i.e.
+this is layered ON TOP of C, not a replacement for it): for
+`step in range(1, K)`, call `self.mtp_model.forward(input_ids=
+previous_draft_token, positions=advancing by 1, hidden_states=
+previous step's own output hidden state, spec_step_idx=step)`
+(`spec_step_idx % num_mtp_layers` always resolves to layer 0 here, since
+`num_nextn_predict_layers=1` for this model -- confirmed via
+`qwen3_next_mtp.py`'s own `Qwen3NextMultiTokenPredictor.__init__`), each
+extending the draft model's own KV cache by one more position at the
+SAME physical slot.
+
+**E. Wiring the two already-verified pieces into a real cycle**: submit
+`[anchor] + draft_tokens` through the ALREADY-WORKING
+`verify_batch()` (qo_len=K+1); run the ALREADY-VERIFIED
+`determine_accept_reject()`; on any rejection, call the
+ALREADY-VERIFIED `restore_gdn_state()` (snapshotted before the verify
+call) then re-run the target model's own forward for exactly the
+accepted-token count to bring GDN state to the correct point (the
+target's attention KV needs no explicit cleanup -- rejected positions'
+KV entries are simply never addressed again, matching how attention
+already handles this generally). The draft model's OWN KV cache likely
+needs NO special rollback either, by the same "position-addressed,
+never revisited" logic -- ONLY GDN's recurrent state has the
+non-addressable-by-position problem this round's Option A specifically
+targets.
+
+**F. Verification**: compare acceptance rate against a real vLLM MTP
+server (`launch_test_server.py --with-mtp`) on the same prompt/seed,
+against the project's explicit ≤1-percentage-point gate
+(`项目实施规划.md` Phase 1).
+
+**Bottom line on cost**: A-B are small, mechanical, low-risk (reuses
+existing generic machinery). C is the expensive, pervasive part --
+touches every real forward call site in `DirectModelRunner` plus the
+CUDA-Graph-captured path, and roughly doubles real forward-pass count
+per step. D-E are comparatively contained once C exists. This is
+consistent with the previous round's conclusion that this is
+substantially more than "add a propose loop" -- C is the reason.
+
+### Pragmatic alternative evaluated: a simplified, shape-correct-but-not-vLLM-faithful draft mechanism to unblock the performance question sooner
+
+The coordinator asked whether a simplified draft mechanism -- even one
+with an acceptance rate that does not yet meet the ≤1pp gate -- could
+establish a minimal closed loop sooner, specifically to get the more
+fundamental "how much does removing scheduling overhead actually save"
+signal, with a rigorous real-draft-model implementation as a separate
+follow-up task. Evaluated concretely:
+
+**Proposed mechanism**: instead of loading `Qwen3NextMTP` at all, use
+the TARGET model's own already-verified, already-CUDA-graph-capable
+qo_len=1 decode path to generate K "draft" tokens via K genuine
+sequential single-token greedy decodes (self-drafting), then submit
+`[anchor] + those K tokens` through the REAL `verify_batch()` (qo_len=
+K+1, the actual production MTP shape, already CUDA-Graph-capturable)
+exactly as a real MTP cycle would.
+
+**What this gets right**: it exercises the ACTUAL qo_len=K+1
+CUDA-Graph-captured kernel path (the thing that actually determines
+launch-gap/GPU-busy%/throughput -- this round's core open question) with
+zero new model-loading or KV-sync engineering, reusing 100% already-built
+and already-verified infrastructure (`decode_batch`, `verify_batch`,
+`CapturedBatchDecodeGraph` at both qo_len=1 and qo_len=K+1,
+`determine_accept_reject`, `snapshot_gdn_state`/`restore_gdn_state`).
+This is a genuinely representative WORKLOAD SHAPE for the performance
+question, not a toy.
+
+**What it gets wrong, and why that's an acceptable, clearly-labeled
+limitation for a performance-only round**: since the "draft" tokens ARE
+literally the target model's own greedy continuation, `verify_batch`
+will find them accepted essentially 100% of the time (both computations
+agree by construction, modulo the same small batch/shape-dependent
+floating-point noise this project already characterized and accepted as
+normal) -- an unrealistically perfect acceptance rate compared to a real
+(weaker, cheaper) draft model, which this project's own earlier sibling
+data measured around 63-66% for this exact model/workload. This means:
+- Any "accepted tokens/s" number from this setup is an OPTIMISTIC UPPER
+  BOUND (real MTP would reject some drafts, costing extra recovery-token
+  work and fewer tokens committed per verify call), not a realistic
+  production estimate -- must be reported as such, not conflated with a
+  real accepted-tokens/s figure.
+- It never exercises the REJECTION path in a live pipeline (though
+  that path is ALREADY independently verified correct by this round's
+  `mtp_accept_reject_check.py`/`mtp_gdn_rollback_check.py` -- the
+  performance run does not need to re-prove correctness, only measure
+  shape-representative throughput).
+- It does NOT satisfy the project's Phase 8 mandate ("先完整复现vLLM的
+  MTP K=3") as a final deliverable -- it is explicitly a stopgap for the
+  performance question, not a substitute for the real draft model work
+  in section E above.
+
+**Recommendation**: this is a reasonable, honestly-scoped way to get an
+early, clearly-caveated read on the launch-gap/GPU-busy% question while
+the real draft-model integration (section C above) is scoped as its own
+round -- PROVIDED the resulting numbers are always reported alongside
+an explicit "self-drafted, ~100% acceptance, optimistic upper bound, not
+comparable to real MTP acceptance-rate numbers" label, and the real
+draft-model work in section C-F is not quietly dropped as a result of
+getting an early performance signal this way. Not started this round
+(design-only, per the coordinator's explicit scope for this round);
+implementing it would be a small, low-risk addition on top of already-
+built and already-verified infrastructure whenever the next round picks
+it up.
