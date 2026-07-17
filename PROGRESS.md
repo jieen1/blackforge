@@ -656,6 +656,93 @@ boundary," and recommended a strictly time-boxed trace-driven
 performance probe (no real drafter) before committing to the full
 faithful integration — adopted, see next section.
 
+### Phase 3, THE CORE QUESTION: real end-to-end performance comparison (2026-07-17) — native is ~12.5x faster, despite this runtime's own call path measuring ~96% GPU-busy
+
+Full detail in `notes/direct-model-runner-design.md`. This directly
+answers the project's founding premise (does removing Python/vLLM
+scheduling overhead translate into a real end-to-end win) at the W1-S
+shape (4096in/256out, c=4, K=3, eager mode, no CUDA graph). **Measured
+answer: no** — reported exactly as measured, not adjusted toward the
+expected direction.
+
+**Methodology**: streaming support added to the native client (TTFT/ITL,
+same definitions `vllm bench serve` uses) and GPU-busy-time
+instrumentation added to this runtime's own MTP loop (`torch.cuda.Event`
+around every real GPU call, same technique the earlier trace-driven
+probe used, now on the REAL verified state machine instead of a
+synthetic trace). Both sides: same frozen n=16 fixture, K=3, c=4,
+temperature=0, 3 repetitions each with GPU thermal snapshots (no
+throttling drift found either side). A real bug was found and fixed
+before trusting the numbers: native's first attempt showed 3/16
+"failed" requests — direct debugging showed these were legitimate early
+EOS hits on specific frozen prompts, not errors, and since this
+runtime's own side has no EOS-checking logic at all (always generates
+the full fixed length), leaving this uncorrected would have been a real
+confound. Fixed with `ignore_eos=true` on the native side, matching this
+runtime's implicit behavior — correct for this fixed-length `-S`-line
+comparison specifically.
+
+**Two infrastructure incidents this round, both root-caused**: (1) a
+genuinely-alive server load was misreported as dead because
+`ps aux | grep -iE "..." | grep -v grep` has a reproducible false
+negative for these specific process lines on this machine — confirmed
+via direct `ps -p <pid>`/`pgrep -af` lookups, which do NOT have this
+problem; corrected immediately once caught, and `pgrep -af` is now the
+preferred verification method going forward. (2) A separate, earlier
+launch attempt genuinely died silently mid-weight-load, correlating
+with low available RAM (23GB total, 21.81GB checkpoint) — no OOM-killer
+evidence found in dmesg/journalctl, cause undetermined, reported as
+such rather than guessed at.
+
+**Results (mean over 3 reps each side)**:
+
+| Metric | Native | This runtime | Ratio |
+|---|---|---|---|
+| Accepted tokens/s | 144.54 | 11.60 | native 12.46x faster |
+| ms/accepted token | 6.93 | 86.19 | ours 12.44x slower |
+| ms/draft | 14.44 | 275.12 | ours ~19x slower |
+| TTFT mean | 742.3ms | 693.2ms | comparable (ours slightly faster) |
+| ITL mean | 47.0ms | 118.9ms | ours 2.53x slower |
+| GPU-busy% (this runtime's own calls) | — | **95.86%** | — |
+
+**Interpretation, not softened**: this runtime's own GPU-busy% is HIGH
+(95.86%, matching the earlier synthetic-trace probe's ~98-101%) — launch
+gap in the narrow "idle Python time between kernels" sense is NOT the
+bottleneck for this runtime's own call pattern. Yet end-to-end
+throughput is ~12.5x slower than native. **Conclusion: removing vLLM's
+Python scheduler was never going to be sufficient by itself — the
+scheduler's BATCHING decisions (fusing concurrent requests into one
+kernel launch) are the dominant source of vLLM's efficiency, not
+scheduling "overhead" in the idle-time sense the project's founding
+premise focused on.**
+
+**Most likely root cause** (reasoned hypothesis from the measured facts,
+not yet confirmed via ablation): `mtp_prefill`/`mtp_verify_and_commit`
+are single-slot methods — this runtime processes each of the 4
+concurrent requests as 4 SEPARATE sequential kernel-launch sets per
+round, never fusing them the way native's continuous batching does.
+This was already a documented scope gap from the step-6 (4-slot
+isolation) round; this is the first time its real cost was measured,
+and it's severe. Decode/verify compute is memory-bandwidth-bound, not
+FLOPs-bound — reading the ~22GiB target model's weights 4 separate times
+per round (vs. once, batched) plausibly explains most of the gap;
+eager-mode dispatch overhead (no CUDA graph) likely compounds on top,
+not the sole cause. TTFT being comparable (prefill doesn't repeat
+per-round, so this effect doesn't apply there) is itself evidence
+pointing at the decode-phase batching gap specifically.
+
+**What this means going forward**: the founding hypothesis is not
+supported in isolation. The fair next test is a direct runner that
+faithfully replicates vLLM's real continuous batching (fusing all
+active slots' work into one kernel-launch set per round — generalizing
+`mtp_prefill`/`mtp_verify_and_commit` to accept slot lists, mirroring
+how the plain non-MTP `_forward_batch`/`verify_batch` already do), not
+just removing the Python scheduler process. Not attempted this round —
+a real, unstarted implementation task. CUDA graph integration remains a
+plausible secondary lever once cross-slot batching exists, but this
+round's evidence (high GPU-busy% already without it) suggests it isn't
+the primary one.
+
 ### Phase 3, expanded W1-S sample (2026-07-17) — the 6.45pp gap collapses to 1.34pp: it WAS small-sample noise
 
 Full detail in `notes/direct-model-runner-design.md`. Expanded the

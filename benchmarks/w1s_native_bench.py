@@ -38,6 +38,17 @@ from benchmarks.workloads import W1_S_FIXTURE, W1_S_FIXTURE_N128, load_prompt_to
 FIXTURES = {"n16": W1_S_FIXTURE, "n128": W1_S_FIXTURE_N128}
 
 
+def _gpu_thermal() -> dict:
+    import subprocess
+
+    out = subprocess.run(
+        ["nvidia-smi", "--query-gpu=temperature.gpu,clocks.current.sm,memory.used", "--format=csv,noheader,nounits"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip().splitlines()[0]
+    temp, clock, mem = [x.strip() for x in out.split(",")]
+    return {"temperature_c": int(temp), "clock_sm_mhz": int(clock), "memory_used_mib": int(mem)}
+
+
 async def _fetch_spec_decode_counters(base_url: str, session: aiohttp.ClientSession) -> dict:
     """Faithful port of vllm/benchmarks/serve.py's fetch_spec_decode_metrics
     parsing logic (Prometheus text exposition format, `vllm:spec_decode*_total`
@@ -85,9 +96,55 @@ async def _send_one(
     max_tokens: int,
     temperature: float,
     sem: asyncio.Semaphore,
+    stream: bool,
 ) -> dict:
+    """`stream=False` (default): a single non-streaming completion, only
+    total wall time is measured -- this is what the acceptance-rate
+    comparison rounds used, since TTFT/ITL were not needed there.
+    `stream=True` (2026-07-17 addition, for the real end-to-end
+    performance comparison): uses SSE streaming so per-token arrival
+    times are observable -- TTFT (time to the first streamed token) and
+    ITL (inter-arrival time between subsequent tokens) are exactly the
+    metrics `vllm bench serve` itself reports, computed the same way
+    here (first chunk vs. `t0` for TTFT, consecutive chunk gaps for
+    ITL) so the numbers are directly comparable."""
+    # 2026-07-17 fix: `ignore_eos=True` on BOTH the streaming and
+    # non-streaming paths. Without it, native vLLM legitimately stops
+    # early for some frozen prompts (a REAL EOS prediction, not an
+    # error -- confirmed by direct debugging: some prompts hit EOS
+    # within 1-2 generated tokens). This runtime's own direct-runner
+    # side has no EOS-checking logic at all (it always generates
+    # exactly `target_output_len` tokens, unconditionally) -- for THIS
+    # controlled-synthetic, FIXED-LENGTH performance comparison
+    # (this project's `-S` line, not the real-traffic `-R` line where
+    # early EOS is exactly what should be measured), both sides must
+    # behave the same way: generate the full fixed length regardless of
+    # any model-predicted stop signal. Omitting this was inflating
+    # apparent "failures" (a 0-token completion isn't a failure, just an
+    # early-EOS response) AND would have been a genuine, uncontrolled
+    # confound for the performance numbers (fewer real generated tokens
+    # = less real work = faster wall time, unrelated to the two
+    # implementations' actual per-token cost).
     async with sem:
         t0 = time.perf_counter()
+        if not stream:
+            async with session.post(
+                f"{base_url}/v1/completions",
+                json={
+                    "model": model,
+                    "prompt": prompt_token_ids,
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                    "ignore_eos": True,
+                },
+            ) as resp:
+                body = await resp.json()
+            t1 = time.perf_counter()
+            ok = resp.status == 200 and "choices" in body
+            return {"ok": ok, "wall_s": t1 - t0, "status": resp.status, "raw": body if not ok else None}
+
+        token_times: list[float] = []
+        status = None
         async with session.post(
             f"{base_url}/v1/completions",
             json={
@@ -95,16 +152,48 @@ async def _send_one(
                 "prompt": prompt_token_ids,
                 "max_tokens": max_tokens,
                 "temperature": temperature,
+                "ignore_eos": True,
+                "stream": True,
             },
         ) as resp:
-            body = await resp.json()
-        t1 = time.perf_counter()
-        ok = resp.status == 200 and "choices" in body
-        return {"ok": ok, "wall_s": t1 - t0, "status": resp.status, "raw": body if not ok else None}
+            status = resp.status
+            async for raw_line in resp.content:
+                line = raw_line.decode("utf-8").strip()
+                if not line or not line.startswith("data:"):
+                    continue
+                payload = line[len("data:") :].strip()
+                if payload == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+                choices = chunk.get("choices") or []
+                if choices and choices[0].get("text", "") != "":
+                    token_times.append(time.perf_counter())
+        t_end = time.perf_counter()
+
+        ok = status == 200 and len(token_times) > 0
+        ttft = (token_times[0] - t0) if token_times else float("nan")
+        itls = [b - a for a, b in zip(token_times, token_times[1:])]
+        return {
+            "ok": ok,
+            "wall_s": t_end - t0,
+            "status": status,
+            "num_tokens": len(token_times),
+            "ttft_s": ttft,
+            "itls_s": itls,
+        }
 
 
 async def _run_once(
-    port: int, model: str, max_tokens: int, temperature: float, concurrency: int, fixture_key: str
+    port: int,
+    model: str,
+    max_tokens: int,
+    temperature: float,
+    concurrency: int,
+    fixture_key: str,
+    stream: bool = False,
 ) -> dict:
     base_url = f"http://127.0.0.1:{port}"
     fixture = FIXTURES[fixture_key]
@@ -119,7 +208,7 @@ async def _run_once(
         t_start = time.perf_counter()
         results = await asyncio.gather(
             *[
-                _send_one(session, base_url, model, p, max_tokens, temperature, sem)
+                _send_one(session, base_url, model, p, max_tokens, temperature, sem, stream)
                 for p in prompts
             ]
         )
@@ -141,13 +230,14 @@ async def _run_once(
         {pos: v / delta_drafts for pos, v in sorted(per_pos_delta.items())} if delta_drafts > 0 else {}
     )
 
-    return {
+    result = {
         "passed": num_failed == 0,
         "num_requests": len(prompts),
         "num_failed": num_failed,
         "max_tokens": max_tokens,
         "temperature": temperature,
         "concurrency": concurrency,
+        "stream": stream,
         "wall_s": t_end - t_start,
         "num_drafts": delta_drafts,
         "num_draft_tokens": delta_draft_tokens,
@@ -157,9 +247,25 @@ async def _run_once(
         ),
         "mean_acceptance_length": 1 + (delta_accepted / delta_drafts) if delta_drafts > 0 else float("nan"),
         "per_position_acceptance_rate": per_position_rate,
+        "accepted_tokens_per_sec": delta_accepted / (t_end - t_start) if (t_end - t_start) > 0 else float("nan"),
+        "ms_per_accepted_token": (t_end - t_start) * 1000.0 / delta_accepted if delta_accepted > 0 else float("nan"),
+        "ms_per_draft": (t_end - t_start) * 1000.0 / delta_drafts if delta_drafts > 0 else float("nan"),
         "fixture": fixture.path,
         "fixture_seed": fixture.seed,
     }
+
+    if stream:
+        all_ttfts = [r["ttft_s"] for r in results if r.get("ok") and "ttft_s" in r]
+        all_itls = [itl for r in results if r.get("ok") for itl in r.get("itls_s", [])]
+        result["ttft_mean_ms"] = sum(all_ttfts) / len(all_ttfts) * 1000.0 if all_ttfts else float("nan")
+        result["ttft_p99_ms"] = (
+            sorted(all_ttfts)[int(len(all_ttfts) * 0.99)] * 1000.0 if all_ttfts else float("nan")
+        )
+        result["itl_mean_ms"] = sum(all_itls) / len(all_itls) * 1000.0 if all_itls else float("nan")
+        result["itl_p99_ms"] = sorted(all_itls)[int(len(all_itls) * 0.99)] * 1000.0 if all_itls else float("nan")
+        result["num_itl_samples"] = len(all_itls)
+
+    return result
 
 
 def main() -> int:
@@ -170,11 +276,26 @@ def main() -> int:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--fixture", choices=list(FIXTURES.keys()), default="n16")
+    parser.add_argument("--stream", action="store_true", help="use SSE streaming to measure TTFT/ITL")
+    parser.add_argument("--repeats", type=int, default=1, help="repeat against the SAME already-running server")
     args = parser.parse_args()
 
-    result = asyncio.run(
-        _run_once(args.port, args.model, args.max_tokens, args.temperature, args.concurrency, args.fixture)
-    )
+    reps = []
+    for r in range(args.repeats):
+        thermal_before = _gpu_thermal()
+        rep_result = asyncio.run(
+            _run_once(
+                args.port, args.model, args.max_tokens, args.temperature, args.concurrency, args.fixture, args.stream
+            )
+        )
+        thermal_after = _gpu_thermal()
+        rep_result["rep"] = r + 1
+        rep_result["thermal_before"] = thermal_before
+        rep_result["thermal_after"] = thermal_after
+        reps.append(rep_result)
+        print(f"  ... native rep {r + 1}/{args.repeats} done", flush=True)
+
+    result = {"passed": all(r.get("passed") for r in reps), "repeats": args.repeats, "reps": reps}
     print(json.dumps(result, indent=2, default=str))
     return 0 if result.get("passed") else 1
 
