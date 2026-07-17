@@ -301,6 +301,7 @@ def _run_once(
     num_requests: int | None,
     repeats: int,
     batched: bool = False,
+    cudagraph: bool = False,
 ) -> dict:
     import torch
 
@@ -324,7 +325,21 @@ def _run_once(
         gpu_memory_utilization=0.85,
         speculative_config={"method": "mtp", "num_speculative_tokens": K, "attention_backend": "CUSTOM"},
     )
-    runner = DirectModelRunner(vllm_config, num_slots=concurrency, block_size=16, blocks_per_slot=2560)
+    # 2026-07-17, Phase 3: ``enable_cudagraph`` reserves the LAST
+    # ``concurrency`` logical slots of ``num_slots`` permanently for
+    # ``CapturedBatchDecodeGraph``'s own disposable warmup (see
+    # ``DirectModelRunner._get_verify_graph``'s docstring) -- real request
+    # traffic only ever uses logical slots ``0..concurrency-1`` either way
+    # (unaffected below), so doubling ``num_slots`` here is purely reserved
+    # spare capacity, never exposed to real requests.
+    num_slots = 2 * concurrency if cudagraph else concurrency
+    runner = DirectModelRunner(
+        vllm_config,
+        num_slots=num_slots,
+        block_size=16,
+        blocks_per_slot=2560,
+        enable_cudagraph=cudagraph,
+    )
     thermal_after_load = _gpu_thermal()
 
     reps = [
@@ -339,6 +354,7 @@ def _run_once(
         "concurrency": concurrency,
         "k": K,
         "batched": batched,
+        "cudagraph": cudagraph,
         "repeats": repeats,
         "reps": reps,
         "thermal_before_load": thermal_before_load,
@@ -363,10 +379,26 @@ def main() -> int:
         "launch per round across all concurrent slots) instead of the "
         "original single-slot round-robin path.",
     )
+    parser.add_argument(
+        "--cudagraph",
+        action="store_true",
+        help="2026-07-17, Phase 3: CUDA-graph-capture the verify forward "
+        "inside mtp_verify_and_commit_batch (requires --batched). Doubles "
+        "num_slots (the extra half is reserved, disposable capture-warmup "
+        "capacity -- see DirectModelRunner._get_verify_graph).",
+    )
     args = parser.parse_args()
+    if args.cudagraph and not args.batched:
+        parser.error("--cudagraph requires --batched")
 
     result = _run_once(
-        args.max_tokens, args.concurrency, args.fixture, args.num_requests, args.repeats, batched=args.batched
+        args.max_tokens,
+        args.concurrency,
+        args.fixture,
+        args.num_requests,
+        args.repeats,
+        batched=args.batched,
+        cudagraph=args.cudagraph,
     )
 
     import json

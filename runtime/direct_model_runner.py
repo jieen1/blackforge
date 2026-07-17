@@ -628,6 +628,75 @@ def determine_accept_reject(draft_tokens: list[int], verify_logits) -> dict:
     return {"num_accepted": k, "committed": committed, "rejected_at": None}
 
 
+def determine_accept_reject_batch(
+    slots: list[int], drafts: dict[int, list[int]], verify_logits: torch.Tensor, k: int
+) -> dict[int, dict]:
+    """Batched analogue of ``determine_accept_reject`` -- computes the SAME
+    greedy accept/reject decision for every slot in ONE vectorized GPU op
+    plus exactly ONE host round-trip, instead of a Python loop calling
+    ``determine_accept_reject`` once per slot (each of which does up to
+    ``k+1`` sequential ``.item()`` calls -- 2026-07-17, Phase 3 of
+    ``notes/2026-07-17-post-ragged-round-next-steps.md``, directly
+    targeting that doc's section 7.4 finding that the compute-phase
+    no-kernel gap is dominated by per-launch host dispatch, not GPU work).
+
+    ``verify_logits`` is shaped ``[len(slots)*(k+1), vocab]`` in
+    request-then-position order (``verify_batch``'s / the verify graph's
+    own output convention). Returns a dict keyed by slot id, each value
+    byte-for-byte the same shape as ``determine_accept_reject``'s own
+    return dict (``num_accepted``/``committed``/``rejected_at``) -- this is
+    a strict re-derivation of the same greedy rule, not a different one:
+    for slot ``s`` with drafts ``d = drafts[s]`` (``k+1`` entries, anchor +
+    k draft continuations) and per-position argmax predictions ``pred``,
+    ``committed = [d[p+1] for p in range(num_accepted)] + [pred[num_accepted]]``
+    is exactly what the original sequential version produces in EITHER
+    branch (a genuine reject at position ``num_accepted < k``, where
+    ``pred[num_accepted]`` is the recovery token; or a full accept where
+    ``num_accepted == k`` and ``pred[k]`` is the bonus token) -- verified by
+    direct comparison against ``determine_accept_reject`` in
+    ``benchmarks/mtp_verify_cudagraph_check.py``.
+
+    Vectorization: ``verify_logits.argmax(dim=-1)`` computes every
+    position's greedy prediction in ONE kernel launch (instead of
+    ``len(slots)*(k+1)`` separate ``.argmax().item()`` calls); comparing
+    against each slot's own draft-continuation tokens and taking a
+    cumulative-AND ("still matching every earlier position") over the
+    position axis is a second vectorized op that yields ``num_accepted``
+    for every slot at once. Only the FINAL small result tensor (shape
+    ``[len(slots), k+2]``) is pulled to host via a single ``.tolist()`` --
+    everything upstream of that stays on-GPU.
+    """
+    num_reqs = len(slots)
+    predicted = verify_logits.argmax(dim=-1).view(num_reqs, k + 1)  # [num_reqs, k+1], int64
+    draft_next = torch.tensor(
+        [drafts[s][1:] for s in slots], dtype=predicted.dtype, device=predicted.device
+    )  # [num_reqs, k] -- each slot's k candidate continuation tokens (drafts[s][1:])
+    matches = predicted[:, :k] == draft_next  # [num_reqs, k] bool
+    # True at position p iff every position <= p matched (the greedy
+    # "still on the accepted prefix" condition) -- a cumulative product
+    # over bools is exactly a running AND.
+    still_matching = matches.cumprod(dim=1).bool() if k > 0 else matches.new_zeros((num_reqs, 0), dtype=torch.bool)
+    num_accepted = still_matching.sum(dim=1)  # [num_reqs], int64, values 0..k
+
+    # ONE combined host round-trip for the whole batch: num_accepted plus
+    # every position's raw prediction (needed to build "committed" below).
+    combined = torch.cat([num_accepted.unsqueeze(1), predicted], dim=1)  # [num_reqs, 1 + (k+1)]
+    combined_list = combined.tolist()
+
+    decisions: dict[int, dict] = {}
+    for i, s in enumerate(slots):
+        row = combined_list[i]
+        na = row[0]
+        pred_row = row[1:]
+        committed = [drafts[s][p + 1] for p in range(na)] + [pred_row[na]]
+        decisions[s] = {
+            "num_accepted": na,
+            "committed": committed,
+            "rejected_at": na if na < k else None,
+        }
+    return decisions
+
+
 class DirectModelRunner:
     """Owns the model, the 4-slot KV/GDN state tensors, and drives forward
     passes directly. This round: single request, slot 0 only."""
@@ -639,6 +708,7 @@ class DirectModelRunner:
         num_slots: int = NUM_SLOTS,
         block_size: int = 16,
         blocks_per_slot: int = 128,
+        enable_cudagraph: bool = False,
     ) -> None:
         self.vllm_config = vllm_config
         self.num_slots = num_slots
@@ -646,6 +716,27 @@ class DirectModelRunner:
         self.blocks_per_slot = blocks_per_slot
         self.device = torch.device("cuda:0")
         torch.cuda.set_device(self.device)
+
+        # 2026-07-17, Phase 3 (notes/2026-07-17-post-ragged-round-next-steps.md):
+        # OPT-IN, default False -- preserves every existing caller's
+        # behavior byte-for-byte (every correctness suite in this project
+        # constructs a runner with ``num_slots`` sized to its OWN real slot
+        # count, no spare capacity reserved for a captured graph's
+        # disposable warmup slots; turning this on unconditionally would
+        # break them, since ``CapturedBatchDecodeGraph`` permanently
+        # reserves the LAST ``batch_size`` logical slots of ``num_slots``
+        # for its own warmup -- see that class's docstring -- and several
+        # existing tests use those exact slot indices as real,
+        # independent reference slots, e.g. ``mtp_batch_verify_check.py``'s
+        # ``ref_slots = [4, 5, 6, 7]`` at ``num_slots=8``). A caller that
+        # wants ``mtp_verify_and_commit_batch`` to graph-capture its verify
+        # forward must pass ``enable_cudagraph=True`` AND size ``num_slots``
+        # to at least twice the real concurrency it plans to use (the extra
+        # half is reserved warmup capacity, never touched by real request
+        # traffic) -- see ``_get_verify_graph``.
+        self.enable_cudagraph = enable_cudagraph
+        self._verify_graphs: dict[tuple[int, int], "CapturedBatchDecodeGraph"] = {}
+        self._draft_step_graphs: dict[tuple[int, int], "CapturedMTPDraftStepGraph"] = {}
 
         with set_current_vllm_config(vllm_config):
             init_method = get_distributed_init_method("127.0.0.1", get_open_port())
@@ -763,6 +854,106 @@ class DirectModelRunner:
         self.decode_fixed_max_num_splits = _DECODE_TARGET_SPLITS_PER_REQ
 
         self._warmup()
+
+        # Pre-capture every real batch_size this runner's configured spare
+        # capacity supports, so the one-time capture cost (a few extra
+        # warmup forward passes per size -- see ``CapturedBatchDecodeGraph
+        # .capture()``) happens HERE, during construction, not inside the
+        # first few timed rounds of a real measurement (matches this
+        # method's own "pay setup cost once at construction" philosophy).
+        # Requires MTP to be configured (``num_speculative_tokens`` is
+        # unknown otherwise, and this graph is only ever used from
+        # ``mtp_verify_and_commit_batch``).
+        if self.enable_cudagraph and self.num_speculative_tokens is not None:
+            self._precapture_verify_graphs()
+            self._precapture_draft_step_graphs()
+
+    def _precapture_verify_graphs(self) -> None:
+        # 2026-07-17, Phase 3 round 2: precapture every qo_len in
+        # 1..num_speculative_tokens+1 (not just the verify-only k+1) so the
+        # recompute-forward graph-reuse path (mtp_verify_and_commit_batch's
+        # uniform-committed_len special case, which needs a graph at
+        # whatever committed_len -- 1..k -- the recompute group actually
+        # lands on) never has to lazily capture DURING a real timed round;
+        # that one-time capture cost now happens here, at construction,
+        # matching every other graph's "pay setup cost once" discipline.
+        max_batch = self.num_slots // 2
+        for batch_size in range(1, max_batch + 1):
+            for qo_len in range(1, self.num_speculative_tokens + 2):
+                self._get_verify_graph(batch_size, qo_len)
+
+    def _precapture_draft_step_graphs(self) -> None:
+        # 2026-07-17, Phase 3 round 2: precapture qo_len=1 (the K-1
+        # continuation steps) AND every qo_len in 1..k+1 (step 0's own
+        # shape for the full-accept group -- always k+1 -- and the
+        # recompute group's uniform special case -- 1..k) so NEITHER step
+        # 0 nor the continuation loop ever lazily captures during a real
+        # timed round.
+        max_batch = self.num_slots // 2
+        for batch_size in range(1, max_batch + 1):
+            for qo_len in range(1, self.num_speculative_tokens + 2):
+                self._get_draft_step_graph(batch_size, qo_len)
+
+    def _get_draft_step_graph(self, batch_size: int, qo_len: int = 1) -> "CapturedMTPDraftStepGraph | None":
+        """Lazily construct + capture (and cache, keyed by
+        ``(batch_size, qo_len)``) a ``CapturedMTPDraftStepGraph`` for the
+        MTP draft model's qo_len=1 continuation step OR (2026-07-17,
+        generalized) step 0's resync when its own ``num_new_tokens`` is
+        uniform -- see that class's docstring. Same deliberate
+        ``None``-on-insufficient-capacity fallback contract as
+        ``_get_verify_graph``."""
+        key = (batch_size, qo_len)
+        cached = self._draft_step_graphs.get(key)
+        if cached is not None:
+            return cached
+        if self.num_slots < 2 * batch_size or self.mtp_model is None:
+            return None
+        graph = CapturedMTPDraftStepGraph(self, batch_size=batch_size, qo_len=qo_len)
+        graph.capture()
+        self._draft_step_graphs[key] = graph
+        return graph
+
+    def _get_verify_graph(self, batch_size: int, qo_len: int) -> "CapturedBatchDecodeGraph | None":
+        """Lazily construct + capture (and cache, keyed by
+        ``(batch_size, qo_len)``) a ``CapturedBatchDecodeGraph`` for the
+        target model's verify forward. Returns ``None`` -- a deliberate,
+        documented eager-fallback signal, NOT an error -- when this runner
+        wasn't configured with enough spare capacity
+        (``num_slots >= 2*batch_size``) to reserve that graph's own
+        disposable warmup slots. This is the expected, correct outcome for
+        every existing (non-cudagraph) correctness suite in this project
+        (``enable_cudagraph`` defaults to ``False`` there, so this method is
+        never even called), and also the correct outcome for a genuinely
+        unusual batch_size a graph-enabled caller never pre-captured (e.g.
+        one bigger than ``num_slots // 2`` -- cannot happen from
+        ``_precapture_verify_graphs``'s own range, but this method stays
+        safe if called with an out-of-range size directly).
+
+        Capturing a NEW graph resets its own reserved warmup slots
+        (``runner.reset_slot``) immediately afterward -- ``capture()``
+        requires its warmup slots to be fresh (``slot_kv_len == 0``), and
+        different ``batch_size`` graphs' reserved-slot RANGES overlap
+        (``CapturedBatchDecodeGraph`` reserves the LAST ``batch_size``
+        logical slots of ``num_slots``, so e.g. batch_size=2 and
+        batch_size=4 graphs share slots ``num_slots-2 .. num_slots-1``) --
+        without this reset, capturing a second graph whose reserved range
+        overlaps a previously-captured graph's would hit that freshness
+        check and fail. This is safe because a graph's reserved slots are
+        NEVER touched again after its own ``capture()`` call returns (never
+        passed to ``replay()`` or any other runner method) -- resetting
+        them costs nothing but bookkeeping."""
+        key = (batch_size, qo_len)
+        cached = self._verify_graphs.get(key)
+        if cached is not None:
+            return cached
+        if self.num_slots < 2 * batch_size:
+            return None
+        graph = CapturedBatchDecodeGraph(self, batch_size=batch_size, qo_len=qo_len)
+        graph.capture()
+        for s in graph._warmup_slots:
+            self.reset_slot(s)
+        self._verify_graphs[key] = graph
+        return graph
 
     def _warmup(self) -> None:
         """Real vLLM always runs a profiling/warmup forward before serving
@@ -936,9 +1127,25 @@ class DirectModelRunner:
             attn_metadata_dict, self.vllm_config, slot_mapping=slot_mapping_dict
         ):
             hidden_states = self.model.forward(input_ids, positions)
-        torch.cuda.synchronize()
+        # 2026-07-17, Phase 3 (notes/2026-07-17-post-ragged-round-next-steps.md):
+        # the two ``torch.cuda.synchronize()`` calls that used to bracket
+        # ``compute_logits`` here were removed -- they block the HOST
+        # (Python) thread until every queued GPU op finishes, but neither
+        # call was ever needed for CORRECTNESS: ``model.forward()`` and
+        # ``compute_logits()`` are both issued on the SAME (default) CUDA
+        # stream, so CUDA's own per-stream FIFO ordering already guarantees
+        # ``compute_logits`` reads ``hidden_states`` only after `forward()`'s
+        # kernels have written it -- exactly the same reasoning
+        # ``CapturedBatchDecodeGraph.replay()``'s docstring already
+        # established for removing ITS blanket sync (see that class,
+        # 2026-07-17 correctness-review round). Any caller that actually
+        # needs the values host-side (``.item()``/``.cpu()``/``torch.equal``)
+        # already forces an implicit, narrowly-scoped sync at that read --
+        # a blanket device-wide sync here was pure per-call dispatch
+        # overhead (Phase 0's ``nsys`` ledger measured 3634 kernels/round in
+        # the verify phase alone; every method in this file's hot path used
+        # to insert two of these), not a safety requirement.
         logits = self.model.compute_logits(hidden_states)
-        torch.cuda.synchronize()
 
         self.slot_kv_len[slot] += num_new_tokens
         self.slot_gdn_initialized[slot] = True
@@ -1155,9 +1362,14 @@ class DirectModelRunner:
             attn_metadata_dict, self.vllm_config, slot_mapping=slot_mapping_dict
         ):
             hidden_states = self.model.forward(input_ids, positions)
-        torch.cuda.synchronize()
+        # 2026-07-17, Phase 3: see ``_forward``'s docstring/comment for why
+        # the two blanket ``torch.cuda.synchronize()`` calls that used to
+        # bracket ``compute_logits`` here were removed -- same-stream
+        # ordering already guarantees correctness, and this method (the
+        # real per-round verify/recompute/decode hot path) is exactly
+        # where Phase 0's ``nsys`` ledger measured the dominant no-kernel
+        # gap this removal targets.
         logits = self.model.compute_logits(hidden_states)
-        torch.cuda.synchronize()
 
         for slot, qo in zip(slot_ids, qo_lens):
             if commit:
@@ -1298,12 +1510,27 @@ class DirectModelRunner:
             "__generation__": self.slot_gdn_snapshot_gen[slot],
             "__consumed__": False,
         }
+        # 2026-07-17, Phase 3 (round 2, coordinator-directed fast-iteration
+        # pass): replaced the per-layer Python loop's 2*len(gdn_layer_names)
+        # individual ``.copy_()`` kernel launches (96 for 48 layers, x4
+        # slots/round = 384 -- Phase 0's ledger figure) with TWO
+        # ``torch._foreach_copy_`` calls (one for all conv tensors, one for
+        # all ssm tensors) -- PyTorch's multi-tensor-apply fuses the whole
+        # list into a small constant number of kernel launches regardless
+        # of layer count, cutting per-round host dispatch for this phase by
+        # roughly 48x. Same D2D copy semantics as before (still fixed-address
+        # buffers, no reallocation, no host round-trip) -- purely a launch-
+        # count reduction, not a new mechanism.
+        conv_dsts, ssm_dsts, conv_srcs, ssm_srcs = [], [], [], []
         for name in self.gdn_layer_names:
             conv_state, ssm_state = self.kv_caches[name]
-            snap_conv = self.gdn_snapshot_conv[name][slot]
-            snap_ssm = self.gdn_snapshot_ssm[name][slot]
-            snap_conv.copy_(conv_state[physical])
-            snap_ssm.copy_(ssm_state[physical])
+            conv_dsts.append(self.gdn_snapshot_conv[name][slot])
+            ssm_dsts.append(self.gdn_snapshot_ssm[name][slot])
+            conv_srcs.append(conv_state[physical])
+            ssm_srcs.append(ssm_state[physical])
+        torch._foreach_copy_(conv_dsts, conv_srcs)
+        torch._foreach_copy_(ssm_dsts, ssm_srcs)
+        for name, snap_conv, snap_ssm in zip(self.gdn_layer_names, conv_dsts, ssm_dsts):
             snapshot[name] = (snap_conv, snap_ssm)
         return snapshot
 
@@ -1342,11 +1569,19 @@ class DirectModelRunner:
                 f"current {self.slot_gdn_snapshot_gen[slot]}"
             )
         physical = _physical_slot(slot)
+        # 2026-07-17, Phase 3 (round 2): same torch._foreach_copy_
+        # launch-count reduction as snapshot_gdn_state's mirror-image
+        # change above.
+        conv_dsts, ssm_dsts, conv_srcs, ssm_srcs = [], [], [], []
         for name in self.gdn_layer_names:
             conv_state, ssm_state = self.kv_caches[name]
             snap_conv, snap_ssm = snapshot[name]
-            conv_state[physical].copy_(snap_conv)
-            ssm_state[physical].copy_(snap_ssm)
+            conv_dsts.append(conv_state[physical])
+            ssm_dsts.append(ssm_state[physical])
+            conv_srcs.append(snap_conv)
+            ssm_srcs.append(snap_ssm)
+        torch._foreach_copy_(conv_dsts, conv_srcs)
+        torch._foreach_copy_(ssm_dsts, ssm_srcs)
         snapshot["__consumed__"] = True
 
     def _mtp_forward(
@@ -1446,9 +1681,10 @@ class DirectModelRunner:
             attn_metadata_dict, self.vllm_config, slot_mapping=slot_mapping_dict
         ):
             hidden_states_out = self.mtp_model.forward(input_ids, positions, hidden_states_in)
-        torch.cuda.synchronize()
+        # 2026-07-17, Phase 3: see ``_forward``'s docstring/comment -- same
+        # same-stream-ordering reasoning applies to the draft model's own
+        # forward+compute_logits pair.
         logits = self.mtp_model.compute_logits(hidden_states_out)
-        torch.cuda.synchronize()
         return logits, hidden_states_out
 
     def _mtp_sync_and_propose(
@@ -1741,9 +1977,11 @@ class DirectModelRunner:
             attn_metadata_dict, self.vllm_config, slot_mapping=slot_mapping_dict
         ):
             hidden_states_out = self.mtp_model.forward(input_ids, positions, hidden_states_in)
-        torch.cuda.synchronize()
+        # 2026-07-17, Phase 3: see ``_forward``'s docstring/comment -- this
+        # is the batched draft-model analogue, called up to K times per
+        # round (previously 2 syncs each); same same-stream-ordering
+        # reasoning applies.
         logits = self.mtp_model.compute_logits(hidden_states_out)
-        torch.cuda.synchronize()
         return logits, hidden_states_out
 
     def _mtp_sync_and_propose_batch(
@@ -1792,15 +2030,53 @@ class DirectModelRunner:
             raise ValueError("every slot's shifted_input_ids must have exactly num_new_tokens[i] entries")
 
         prior_kv_lens_step0 = [self.slot_draft_sync_len[s] for s in slots]
-        step0_logits, step0_hidden = self._mtp_forward_batch(
-            slots,
-            shifted_input_ids_per_slot,
-            target_hidden_states,
-            prior_kv_lens_step0,
-            start_pos_list,
-            qo_len=num_new_tokens,
-            is_decode=all(n == 1 for n in num_new_tokens_list),
-        )
+        # 2026-07-17, Phase 3 round 2: step 0 (resync) is graph-capturable
+        # whenever num_new_tokens is UNIFORM across this call's slots --
+        # always true for the full-accept group (always k+1) and
+        # sometimes true for the recompute group (see
+        # ``CapturedMTPDraftStepGraph``'s docstring for the full
+        # rationale, including why using the fast decode-kernel dispatch
+        # here instead of eager's general-kernel choice is still
+        # numerically correct). ``prior_kv_lens_step0 == start_pos_list``
+        # always holds here (both derive from the same
+        # ``slot_draft_sync_len`` snapshot), matching the class's own
+        # single-length-list contract.
+        # SAFETY (caught before ever running this in anger): mtp_prefill_batch
+        # calls this SAME function with num_new_tokens=prompt_len -- a
+        # LARGE uniform value (e.g. 4096 for a real W1-S prompt), which
+        # would also pass the "uniform" check below. Forcing
+        # decode_qo_len=qo_len unconditionally (this class's whole design,
+        # matching CapturedBatchDecodeGraph's own convention) is only valid
+        # within the real decode/verify kernel's tested range
+        # (_MAX_DECODE_QO_LEN=16, the SAME bound
+        # build_attention_metadata_batch's eager path already enforces
+        # before routing to that kernel) -- MUST NOT be used for a genuine
+        # long prefill, which needs the general/chunked kernel instead.
+        step0_graph = None
+        if (
+            self.enable_cudagraph
+            and len(set(num_new_tokens_list)) == 1
+            and num_new_tokens_list[0] <= _MAX_DECODE_QO_LEN
+        ):
+            step0_graph = self._get_draft_step_graph(num_reqs, num_new_tokens_list[0])
+        if step0_graph is not None:
+            step0_qo_len = num_new_tokens_list[0]
+            tokens_for_graph = (
+                [t[0] for t in shifted_input_ids_per_slot] if step0_qo_len == 1 else shifted_input_ids_per_slot
+            )
+            step0_logits, step0_hidden = step0_graph.replay(
+                slots, tokens_for_graph, target_hidden_states, prior_kv_lens_step0
+            )
+        else:
+            step0_logits, step0_hidden = self._mtp_forward_batch(
+                slots,
+                shifted_input_ids_per_slot,
+                target_hidden_states,
+                prior_kv_lens_step0,
+                start_pos_list,
+                qo_len=num_new_tokens,
+                is_decode=all(n == 1 for n in num_new_tokens_list),
+            )
         for s, n in zip(slots, num_new_tokens_list):
             self.slot_draft_sync_len[s] += n
 
@@ -1813,38 +2089,57 @@ class DirectModelRunner:
         for n in num_new_tokens_list:
             row_offsets.append(row_offsets[-1] + n)
 
+        # 2026-07-17, Phase 3: batched on-GPU argmax instead of a per-slot
+        # Python loop each calling ``.argmax(dim=-1).item()`` separately
+        # (``num_reqs`` sequential host round-trips per step, ``k`` steps
+        # per round -- up to ``num_reqs * k`` total). ``index_select`` +
+        # ONE ``.argmax(dim=-1)`` over every last-position row computes
+        # every slot's step-0 draft token in one kernel launch; ONE
+        # ``.tolist()`` is the single host round-trip for this step.
         draft_tokens: dict[int, list[int]] = {s: [] for s in slots}
-        last_hidden_rows = []
-        prev_tokens = []
+        last_idx_tensor = torch.tensor(
+            [row_offsets[i + 1] - 1 for i in range(num_reqs)], dtype=torch.long, device=step0_logits.device
+        )
+        last_logits = step0_logits.index_select(0, last_idx_tensor)
+        prev_hidden = step0_hidden.index_select(0, last_idx_tensor)
+        prev_tokens = last_logits.argmax(dim=-1).tolist()
         for i in range(num_reqs):
-            last_idx = row_offsets[i + 1] - 1
-            tok = int(step0_logits[last_idx].argmax(dim=-1).item())
-            draft_tokens[slots[i]].append(tok)
-            prev_tokens.append(tok)
-            last_hidden_rows.append(step0_hidden[last_idx : last_idx + 1])
-        prev_hidden = torch.cat(last_hidden_rows, dim=0)
+            draft_tokens[slots[i]].append(prev_tokens[i])
 
         next_pos_list = [sp + n for sp, n in zip(start_pos_list, num_new_tokens_list)]
         running_prior_kv_len = [prior_kv_lens_step0[i] + num_new_tokens_list[i] for i in range(num_reqs)]
+        # 2026-07-17, Phase 3 round 2: this loop's ``prior_kv_lens`` and
+        # ``start_pos_list`` are always numerically identical here (both
+        # start equal right after step 0 and both advance by exactly 1
+        # every iteration below) -- confirmed by inspection, see
+        # ``CapturedMTPDraftStepGraph``'s docstring -- which is what makes
+        # a single-length-list captured graph replay valid for this
+        # specific loop.
+        draft_step_graph = self._get_draft_step_graph(num_reqs) if self.enable_cudagraph else None
         for _ in range(1, k):
-            step_logits, step_hidden = self._mtp_forward_batch(
-                slots,
-                prev_tokens,
-                prev_hidden,
-                running_prior_kv_len,
-                next_pos_list,
-                qo_len=1,
-                is_decode=True,
-            )
-            new_prev_tokens = []
-            new_hidden_rows = []
+            if draft_step_graph is not None:
+                step_logits, step_hidden = draft_step_graph.replay(slots, prev_tokens, prev_hidden, running_prior_kv_len)
+            else:
+                step_logits, step_hidden = self._mtp_forward_batch(
+                    slots,
+                    prev_tokens,
+                    prev_hidden,
+                    running_prior_kv_len,
+                    next_pos_list,
+                    qo_len=1,
+                    is_decode=True,
+                )
+            # qo_len=1 uniform -> step_logits/step_hidden already have
+            # exactly one row per slot in ``slots`` order (request-then-
+            # position order degenerates to plain per-request order here),
+            # so no index_select/cat needed -- a single batched argmax
+            # over the whole tensor plus ONE ``.tolist()`` covers every
+            # slot in this step.
+            new_prev_tokens = step_logits.argmax(dim=-1).tolist()
             for i in range(num_reqs):
-                tok = int(step_logits[i].argmax(dim=-1).item())
-                draft_tokens[slots[i]].append(tok)
-                new_prev_tokens.append(tok)
-                new_hidden_rows.append(step_hidden[i : i + 1])
+                draft_tokens[slots[i]].append(new_prev_tokens[i])
             prev_tokens = new_prev_tokens
-            prev_hidden = torch.cat(new_hidden_rows, dim=0)
+            prev_hidden = step_hidden
             for i in range(num_reqs):
                 next_pos_list[i] += 1
                 running_prior_kv_len[i] += 1
@@ -1961,21 +2256,51 @@ class DirectModelRunner:
 
         Returns a dict keyed by slot id, each value shaped exactly like
         ``mtp_verify_and_commit``'s own return dict (plus ``next_anchor``/
-        ``next_draft_tokens``)."""
+        ``next_draft_tokens``).
+
+        **2026-07-17, Phase 3** (``notes/2026-07-17-post-ragged-round-next-steps.md``):
+        two changes to the verify step specifically, both targeting Phase
+        0's finding that the verify/recompute/draft COMPUTE phases (not
+        just the since-fixed GDN snapshot/restore phases) carry a large
+        eager-dispatch no-kernel gap (~37-42% of every round's wall time):
+
+        1. The verify forward itself now goes through a CUDA-graph replay
+           (``CapturedBatchDecodeGraph``, via ``self._get_verify_graph``)
+           whenever ``self.enable_cudagraph`` is on AND this runner was
+           configured with enough spare slot capacity for that batch_size
+           (``num_slots >= 2*len(slots)``) -- one pre-recorded sequence of
+           kernel launches replayed with fresh data ``.copy_()``'d into
+           fixed-address buffers, instead of eager dispatch through
+           ``verify_batch``/``_forward_batch`` (which alone launches ~3634
+           kernels per call per Phase 0's ledger). Falls back to the
+           already-verified eager ``verify_batch`` path -- correctly, not
+           silently -- whenever the graph isn't available for this call's
+           batch_size (e.g. ``enable_cudagraph`` is off, matching every
+           existing correctness suite in this project; or a caller's
+           real active-slot count shrinks below what was pre-captured).
+        2. Accept/reject is now computed via ``determine_accept_reject_batch``
+           -- ONE batched GPU argmax + ONE host round-trip for the WHOLE
+           batch, instead of a per-slot Python loop each calling
+           ``determine_accept_reject`` (up to ``k+1`` sequential
+           ``.item()`` calls per slot)."""
         num_reqs = len(slots)
         k = len(draft_tokens[slots[0]])
-        drafts = [[anchors[s]] + draft_tokens[s] for s in slots]
+        drafts_by_slot = {s: [anchors[s]] + draft_tokens[s] for s in slots}
+        drafts = [drafts_by_slot[s] for s in slots]
         kv_lens_before = {s: self.slot_kv_len[s] for s in slots}
         snapshots = {s: self.snapshot_gdn_state(s) for s in slots}
 
-        verify_logits, verify_hidden = self.verify_batch(
-            slots, drafts, [kv_lens_before[s] for s in slots], return_hidden=True
-        )
+        graph = self._get_verify_graph(len(slots), k + 1) if self.enable_cudagraph else None
+        if graph is not None:
+            verify_logits, verify_hidden = graph.replay(
+                slots, drafts, [kv_lens_before[s] for s in slots], commit=False, return_hidden=True
+            )
+        else:
+            verify_logits, verify_hidden = self.verify_batch(
+                slots, drafts, [kv_lens_before[s] for s in slots], return_hidden=True
+            )
 
-        decisions = {}
-        for i, s in enumerate(slots):
-            row_logits = verify_logits[i * (k + 1) : (i + 1) * (k + 1)]
-            decisions[s] = determine_accept_reject(drafts[i], row_logits)
+        decisions = determine_accept_reject_batch(slots, drafts_by_slot, verify_logits, k)
 
         real_new_tokens = {s: [anchors[s]] + decisions[s]["committed"][:-1] for s in slots}
         full_accept_slots = [s for s in slots if decisions[s]["num_accepted"] == k]
@@ -2002,17 +2327,53 @@ class DirectModelRunner:
             qo_lens_recompute = [recompute_committed_lens[s] for s in recompute_slots]
             tokens_recompute = [real_new_tokens[s] for s in recompute_slots]
             kv_lens_recompute = [kv_lens_before[s] for s in recompute_slots]
-            _, hidden_recompute = self._forward_batch(
-                recompute_slots,
-                tokens_recompute,
-                kv_lens_recompute,
-                qo_len=qo_lens_recompute,
-                commit=True,
-                return_hidden=True,
-                is_decode=True,
-                fixed_kv_split_size=self.decode_fixed_kv_split_size,
-                fixed_max_num_splits=self.decode_fixed_max_num_splits,
-            )
+            # 2026-07-17, Phase 3 round 2: the recompute forward is a
+            # SECOND full target-model forward, numerically identical in
+            # shape/kernel-cost to the verify forward (Phase 0's ledger:
+            # 97.2% kernel-time ratio) -- but its batch is RAGGED
+            # (committed_len differs per recompute slot in general), which
+            # blocks a general captured-graph replacement the same way
+            # padding would corrupt GDN state (see this round's notes).
+            # Opportunistic exception: when every recompute slot in THIS
+            # round happens to share the SAME committed_len (a real,
+            # non-rare case -- greedy rejection position is drawn from one
+            # shared underlying per-position acceptance distribution), the
+            # batch is NOT actually ragged, and the existing verify-graph
+            # cache (already keyed by (batch_size, qo_len), see
+            # ``_get_verify_graph``) is directly reusable: a recompute
+            # forward at (num_reqs=len(recompute_slots), qo_len=committed_len,
+            # is_decode=True) is the SAME shape ``CapturedBatchDecodeGraph``
+            # already supports (it always treats itself as decode/verify-
+            # shaped, matching this call's own ``is_decode=True``). Falls
+            # back to the eager path -- correctly, not silently -- whenever
+            # the group is genuinely ragged or the graph isn't available.
+            recompute_graph = None
+            if self.enable_cudagraph and len(set(qo_lens_recompute)) == 1:
+                recompute_graph = self._get_verify_graph(len(recompute_slots), qo_lens_recompute[0])
+            if recompute_graph is not None:
+                # CapturedBatchDecodeGraph's qo_len==1 case expects FLAT
+                # token_ids (one int per slot), not the list-of-per-slot-
+                # lists ``tokens_recompute`` always is here (mirrors
+                # _forward_batch's own qo_len==1-vs->1 convention) -- flatten
+                # only for that case; qo_len>1 already matches as-is.
+                tokens_for_graph = (
+                    [t[0] for t in tokens_recompute] if qo_lens_recompute[0] == 1 else tokens_recompute
+                )
+                _, hidden_recompute = recompute_graph.replay(
+                    recompute_slots, tokens_for_graph, kv_lens_recompute, commit=True, return_hidden=True
+                )
+            else:
+                _, hidden_recompute = self._forward_batch(
+                    recompute_slots,
+                    tokens_recompute,
+                    kv_lens_recompute,
+                    qo_len=qo_lens_recompute,
+                    commit=True,
+                    return_hidden=True,
+                    is_decode=True,
+                    fixed_kv_split_size=self.decode_fixed_kv_split_size,
+                    fixed_max_num_splits=self.decode_fixed_max_num_splits,
+                )
 
         next_anchors = {s: decisions[s]["committed"][-1] for s in slots}
         result: dict[int, dict] = {}
@@ -2229,6 +2590,20 @@ class CapturedBatchDecodeGraph:
 
         self._graph: torch.cuda.CUDAGraph | None = None
         self._static_logits: torch.Tensor | None = None
+        # 2026-07-17, Phase 3: captured alongside logits (see
+        # ``_forward_no_sync``/``capture()``) so ``replay(..., return_hidden=True)``
+        # can hand back the target model's own hidden states -- needed by
+        # ``mtp_verify_and_commit_batch`` to feed the MTP draft model's next
+        # resync step without an extra eager forward. ``None`` until
+        # ``capture()`` has run.
+        self._static_hidden_states: torch.Tensor | None = None
+        # Test-observability only (2026-07-17, consolidation pass): counts
+        # real replay() calls so a correctness test can directly confirm a
+        # graph was actually EXERCISED, not merely constructed/precaptured
+        # (precapture populates the cache regardless of whether a given
+        # round ever replays that specific shape) -- see
+        # benchmarks/mtp_verify_cudagraph_check.py.
+        self.replay_count = 0
 
     def _fill_buffers(self, slot_ids: list[int], token_ids, kv_lengths: list[int]) -> None:
         """Write real, per-replay-varying values into the persistent static
@@ -2354,18 +2729,26 @@ class CapturedBatchDecodeGraph:
         slot_mapping_dict = {name: self.static_slot_mapping for name in runner.attn_layer_names}
         return attn_metadata_dict, slot_mapping_dict
 
-    def _forward_no_sync(self) -> torch.Tensor:
+    def _forward_no_sync(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Same op sequence as ``DirectModelRunner._forward_batch``, minus
         the ``torch.cuda.synchronize()`` calls -- calling those DURING
         capture is a documented CUDA-graph-capture violation (raises
         ``cudaErrorStreamCaptureUnsupported``), the same error class the
         sibling project already hit and documented for a different op (a
-        boolean-mask-select) during its own CUDA Graph work."""
+        boolean-mask-select) during its own CUDA Graph work.
+
+        Returns ``(logits, hidden_states)`` (2026-07-17, Phase 3 addition --
+        previously only logits were returned/captured; ``hidden_states`` is
+        now ALSO captured so ``replay(..., return_hidden=True)`` can hand it
+        back, matching ``_forward_batch``'s own ``return_hidden`` contract).
+        This is a backward-compatible extension: the only caller inside
+        ``capture()``'s warmup loop discards both return values either way."""
         runner = self.runner
         attn_metadata_dict, slot_mapping_dict = self._static_metadata_dicts()
         with set_forward_context(attn_metadata_dict, runner.vllm_config, slot_mapping=slot_mapping_dict):
             hidden_states = runner.model.forward(self.static_input_ids, self.static_positions)
-        return runner.model.compute_logits(hidden_states)
+        logits = runner.model.compute_logits(hidden_states)
+        return logits, hidden_states
 
     def capture(self) -> None:
         """Warm up (uncaptured, on a side stream -- required by
@@ -2413,18 +2796,33 @@ class CapturedBatchDecodeGraph:
 
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
-            self._static_logits = self._forward_no_sync()
+            self._static_logits, self._static_hidden_states = self._forward_no_sync()
         self._graph = g
 
     def replay(
-        self, slot_ids: list[int], token_ids, kv_lengths: list[int], *, commit: bool = True
-    ) -> torch.Tensor:
+        self,
+        slot_ids: list[int],
+        token_ids,
+        kv_lengths: list[int],
+        *,
+        commit: bool = True,
+        return_hidden: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Replay the captured graph at REAL (slot_ids, token_ids,
         kv_lengths) data -- may (and, per this round's explicit test
         scope, deliberately does) differ drastically from capture()'s
         warmup data, including kv_len values much larger or smaller than
         whatever was used at capture time. Returns logits shaped
         ``[batch_size * qo_len, vocab]`` (request-then-position order).
+
+        ``return_hidden`` (2026-07-17, Phase 3 addition, default ``False``
+        preserving every existing caller's behavior byte-for-byte): when
+        ``True``, returns ``(logits, hidden_states)`` instead of just
+        ``logits`` -- mirrors ``_forward_batch``'s own ``return_hidden``
+        parameter. Needed by ``mtp_verify_and_commit_batch`` so a
+        graph-captured verify replay can still feed the MTP draft model's
+        next resync step (which needs the target model's hidden states,
+        not just its logits) without an extra eager forward call.
 
         ``commit`` (2026-07-17 fix, Codex-sol review, confirmed real):
         mirrors ``_forward_batch``'s own ``commit`` parameter -- this
@@ -2478,8 +2876,285 @@ class CapturedBatchDecodeGraph:
                 raise RuntimeError(f"slot {slot} has no GDN state yet (needs a prior prefill)")
         self._fill_buffers(slot_ids, token_ids, kv_lengths)
         self._graph.replay()
+        self.replay_count += 1
         for slot in slot_ids:
             if commit:
                 self.runner.slot_kv_len[slot] += self.qo_len
             self.runner.slot_gdn_initialized[slot] = True
+        if return_hidden:
+            return self._static_logits, self._static_hidden_states
         return self._static_logits
+
+
+class CapturedMTPDraftStepGraph:
+    """CUDA-graph-captured decode/resync step for the MTP DRAFT model
+    (``runner.mtp_model``), for a FIXED ``batch_size`` and FIXED ``qo_len``
+    (1 = the autoregressive continuation steps 1..k-1; >1 = step 0's
+    resync, when its ``num_new_tokens`` happens to be UNIFORM across the
+    batch -- always true for the full-accept group, which is always
+    exactly k+1, and sometimes true for the recompute group, when every
+    recompute slot's committed_len happens to coincide).
+    2026-07-17, Phase 3 round 2 (coordinator-directed fast-iteration pass,
+    picking off ``notes/2026-07-17-post-ragged-round-next-steps.md``'s
+    Phase 3 candidate 1: "then the K draft steps") -- generalized from an
+    initial qo_len=1-only version (same day, same round) once it became
+    clear step 0 is ALSO uniform-shaped often enough to be worth capturing,
+    exactly mirroring how ``mtp_verify_and_commit_batch``'s recompute
+    forward reuses ``CapturedBatchDecodeGraph`` for its own uniform special
+    case (see that method's comment) -- this class is the draft-model
+    analogue of that same idea, generalized in place rather than as a
+    parallel copy.
+
+    Narrower than ``CapturedBatchDecodeGraph`` in two ways, both because
+    the draft model's own call shape is simpler than the target model's:
+    1. No GDN metadata at all -- ``runner.mtp_attn_layer_names`` never
+       includes a GDN layer (the draft model registers only its own small
+       full-attention layer(s); see ``DirectModelRunner.__init__``).
+    2. Takes an EXTRA static input, ``static_hidden_states_in`` (shape
+       ``[batch_size*qo_len, hidden_size]``), since ``Qwen3_5MultiTokenPredictor
+       .forward()`` needs the running hidden-state carry between steps
+       that the target model's own ``forward()`` does not.
+
+    Always dispatches via ``decode_qo_len=qo_len``/``is_pure_decode=(qo_len==1)``
+    (the fast decode/verify kernel path) regardless of what the EAGER path
+    would have used for the same call -- for step 0 specifically, the eager
+    ``_mtp_forward_batch`` passes ``is_decode=all(n==1 for n in
+    num_new_tokens_list)``, which is ``False`` whenever ``qo_len>1``,
+    routing eager step-0 calls through the general/chunked attention
+    kernel instead. This is a DELIBERATE dispatch difference, not a bug:
+    the underlying math (causal attention over a query range against a KV
+    cache) is identical either way -- this project's own
+    ``build_attention_metadata_batch`` docstring already establishes that
+    the decode-kernel and general-kernel paths are numerically
+    equivalent, just different kernel choices -- and using the fast
+    decode/verify kernel here is a legitimate additional (small) win on
+    top of the graph-capture win itself. Verified via
+    ``benchmarks/mtp_verify_cudagraph_check.py``'s real content comparison
+    against an independent eager reference, not assumed.
+
+    Stateless w.r.t. runner bookkeeping: unlike ``CapturedBatchDecodeGraph
+    .replay()``, this class's ``replay()`` does NOT touch
+    ``runner.slot_kv_len``/``slot_gdn_initialized`` at all -- mirroring
+    ``_mtp_forward_batch`` itself, which also never does (the caller
+    tracks its own running length counters as plain local Python
+    variables, not persistent per-slot runner state). ``prior_kv_len ==
+    start_pos`` always holds for every real call site in this codebase
+    (confirmed by inspection: ``_mtp_sync_and_propose_batch`` always
+    derives ``start_pos_list`` from the exact same ``slot_draft_sync_len``
+    snapshot its own internal ``prior_kv_lens_step0`` uses, and the
+    qo_len=1 continuation loop advances both counters by the same amount
+    every iteration), so this class only needs ONE per-slot length list,
+    not two.
+
+    Same warmup-slot-reservation and state-neutral-capture discipline as
+    ``CapturedBatchDecodeGraph`` (see that class's docstring for the full
+    rationale): the last ``batch_size`` logical slots of ``runner.num_slots``
+    are reserved, used only by this graph's own ``capture()``, and reset
+    immediately afterward. Warmup content is fully disposable (a dummy
+    all-zeros hidden-state tensor and dummy token ids) -- the draft
+    model's own attention KV is content/position-addressed like the
+    target model's, so redundant warmup writes are harmless, and there is
+    no GDN-style non-idempotent recurrent state in this class's scope at
+    all (point 1 above), so the correctness concern that motivated
+    ``CapturedBatchDecodeGraph``'s state-neutral-capture fix does not even
+    apply here -- reserved slots are used anyway, for consistency with the
+    established pattern and so a caller can safely reuse the SAME
+    physical reserved-slot range across both graph classes (each resets
+    its own warmup slots right after its own ``capture()``)."""
+
+    def __init__(self, runner: "DirectModelRunner", batch_size: int, qo_len: int = 1) -> None:
+        if runner.mtp_model is None:
+            raise RuntimeError("no MTP draft model loaded")
+        if runner.num_slots < 2 * batch_size:
+            raise ValueError(
+                f"runner.num_slots={runner.num_slots} must be >= 2*batch_size ({2 * batch_size})"
+            )
+        self.runner = runner
+        self.batch_size = batch_size
+        self.qo_len = qo_len
+        device = runner.device
+        blocks_per_slot = runner.blocks_per_slot
+        # Reuse the runner's own fixed split-KV derivation (already
+        # CUDA-graph-safe -- every real _mtp_forward_batch call already
+        # passes these same fixed values, see that method's docstring).
+        self.fixed_kv_split_size = runner.decode_fixed_kv_split_size
+        self.fixed_max_num_splits = runner.decode_fixed_max_num_splits
+
+        self._warmup_slots = list(range(runner.num_slots - batch_size, runner.num_slots))
+
+        n_tokens = batch_size * qo_len
+        self.static_qo_indptr = torch.arange(0, batch_size + 1, dtype=torch.int32, device=device) * qo_len
+        self.static_kv_page_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+        self.static_kv_page_indices = torch.zeros(batch_size * blocks_per_slot, dtype=torch.int32, device=device)
+        self.static_kv_last_page_len = torch.zeros(batch_size, dtype=torch.int32, device=device)
+        self.static_input_ids = torch.zeros(n_tokens, dtype=torch.long, device=device)
+        self.static_positions = torch.zeros(n_tokens, dtype=torch.long, device=device)
+        self.static_slot_mapping = torch.zeros(n_tokens, dtype=torch.long, device=device)
+        self.hidden_size = runner.vllm_config.model_config.get_hidden_size()
+        # Dtype/device matched lazily on first real hidden_states_in at
+        # capture time (mirrors how the class discovers its own model's
+        # activation dtype rather than assuming one).
+        self.static_hidden_states_in: torch.Tensor | None = None
+
+        self._graph: torch.cuda.CUDAGraph | None = None
+        self._static_logits: torch.Tensor | None = None
+        self._static_hidden_states_out: torch.Tensor | None = None
+        # Test-observability only -- see CapturedBatchDecodeGraph's
+        # identical field for the rationale.
+        self.replay_count = 0
+
+    def _fill_buffers(self, slot_ids: list[int], token_ids, hidden_states_in: torch.Tensor, kv_lengths: list[int]) -> None:
+        runner = self.runner
+        device = runner.device
+        block_size = runner.block_size
+        blocks_per_slot = runner.blocks_per_slot
+        qo_len = self.qo_len
+
+        if qo_len == 1:
+            flat_token_ids = token_ids
+        else:
+            flat_token_ids = [tok for slot_tokens in token_ids for tok in slot_tokens]
+
+        new_kv_lens = [kv_len + qo_len for kv_len in kv_lengths]
+        num_pages_per_req = [(kv_len + block_size - 1) // block_size for kv_len in new_kv_lens]
+        for slot, kv_len, num_pages in zip(slot_ids, new_kv_lens, num_pages_per_req):
+            if num_pages > blocks_per_slot:
+                raise RuntimeError(f"slot {slot} kv_len {kv_len} exceeds this slot's {blocks_per_slot * block_size}-token capacity")
+
+        kv_page_indptr_list = [0]
+        for num_pages in num_pages_per_req:
+            kv_page_indptr_list.append(kv_page_indptr_list[-1] + num_pages)
+        page_indices_list: list[int] = []
+        for slot, num_pages in zip(slot_ids, num_pages_per_req):
+            first_block = _physical_slot(slot) * blocks_per_slot
+            page_indices_list.extend(range(first_block, first_block + num_pages))
+        last_page_len_list = [
+            kv_len - (num_pages - 1) * block_size for kv_len, num_pages in zip(new_kv_lens, num_pages_per_req)
+        ]
+        positions_list = [kv_len + j for kv_len in kv_lengths for j in range(qo_len)]
+        slot_mapping_list = []
+        for slot, kv_len in zip(slot_ids, kv_lengths):
+            first_block = _physical_slot(slot) * blocks_per_slot
+            for j in range(qo_len):
+                pos = kv_len + j
+                block_id = first_block + pos // block_size
+                offset = pos % block_size
+                slot_mapping_list.append(block_id * block_size + offset)
+
+        self.static_kv_page_indptr.copy_(torch.tensor(kv_page_indptr_list, dtype=torch.int32, device=device))
+        self.static_kv_page_indices.zero_()
+        if page_indices_list:
+            self.static_kv_page_indices[: len(page_indices_list)].copy_(
+                torch.tensor(page_indices_list, dtype=torch.int32, device=device)
+            )
+        self.static_kv_last_page_len.copy_(torch.tensor(last_page_len_list, dtype=torch.int32, device=device))
+        self.static_input_ids.copy_(torch.tensor(flat_token_ids, dtype=torch.long, device=device))
+        self.static_positions.copy_(torch.tensor(positions_list, dtype=torch.long, device=device))
+        self.static_slot_mapping.copy_(torch.tensor(slot_mapping_list, dtype=torch.long, device=device))
+        if self.static_hidden_states_in is None:
+            self.static_hidden_states_in = torch.zeros_like(hidden_states_in)
+        self.static_hidden_states_in.copy_(hidden_states_in)
+
+    def _static_metadata_dict(self) -> dict:
+        runner = self.runner
+        attn_meta = SM120GQAMetadata(
+            num_actual_tokens=self.batch_size * self.qo_len,
+            num_reqs=self.batch_size,
+            qo_indptr=self.static_qo_indptr,
+            kv_page_indptr=self.static_kv_page_indptr,
+            kv_page_indices=self.static_kv_page_indices,
+            kv_last_page_len=self.static_kv_last_page_len,
+            page_size=runner.block_size,
+            is_pure_decode=(self.qo_len == 1),
+            kv_split_size=self.fixed_kv_split_size,
+            max_num_splits=self.fixed_max_num_splits,
+            decode_qo_len=self.qo_len,
+        )
+        return {name: attn_meta for name in runner.mtp_attn_layer_names}
+
+    def _forward_no_sync(self) -> tuple[torch.Tensor, torch.Tensor]:
+        runner = self.runner
+        attn_metadata_dict = self._static_metadata_dict()
+        slot_mapping_dict = {name: self.static_slot_mapping for name in runner.mtp_attn_layer_names}
+        with set_forward_context(attn_metadata_dict, runner.vllm_config, slot_mapping=slot_mapping_dict):
+            hidden_states_out = runner.mtp_model.forward(
+                self.static_input_ids, self.static_positions, self.static_hidden_states_in
+            )
+        logits = runner.mtp_model.compute_logits(hidden_states_out)
+        return logits, hidden_states_out
+
+    def capture(self) -> None:
+        if self._graph is not None:
+            raise RuntimeError("already captured")
+        runner = self.runner
+        warmup_slots = self._warmup_slots
+        dummy_prompt = [0, 0, 0, 0, 0]
+        dummy_hidden = torch.zeros(
+            len(warmup_slots) * len(dummy_prompt),
+            self.hidden_size,
+            dtype=runner.vllm_config.model_config.dtype,
+            device=runner.device,
+        )
+        # Establishes the DRAFT model's own attention KV history on these
+        # slots directly (bypassing the target model entirely -- warmup
+        # content is disposable, see class docstring) so a subsequent
+        # qo_len-token "step" at position len(dummy_prompt) is a genuine,
+        # valid continuation rather than an out-of-range access.
+        runner._mtp_forward_batch(
+            warmup_slots,
+            [dummy_prompt] * len(warmup_slots),
+            dummy_hidden,
+            [0] * len(warmup_slots),
+            [0] * len(warmup_slots),
+            qo_len=len(dummy_prompt),
+            is_decode=False,
+        )
+        warmup_kv_lengths = [len(dummy_prompt)] * len(warmup_slots)
+        if self.qo_len == 1:
+            warmup_token_ids = [0] * self.batch_size
+        else:
+            warmup_token_ids = [[0] * self.qo_len for _ in range(self.batch_size)]
+        warmup_hidden = torch.zeros(
+            self.batch_size * self.qo_len, self.hidden_size, dtype=dummy_hidden.dtype, device=runner.device
+        )
+        self._fill_buffers(warmup_slots, warmup_token_ids, warmup_hidden, warmup_kv_lengths)
+
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                self._forward_no_sync()
+        torch.cuda.current_stream().wait_stream(s)
+        torch.cuda.synchronize()
+
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            self._static_logits, self._static_hidden_states_out = self._forward_no_sync()
+        self._graph = g
+
+    def replay(
+        self, slot_ids: list[int], token_ids, hidden_states_in: torch.Tensor, kv_lengths: list[int]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Replay at REAL data. Returns ``(logits, hidden_states_out)`` --
+        unlike ``CapturedBatchDecodeGraph.replay()``, ``return_hidden`` is
+        not optional here since every real caller needs the hidden state
+        to feed the NEXT step (or, for a step-0-only recompute-group
+        replay, to hand back to the caller). No runner bookkeeping is
+        touched (see class docstring) -- purely a stateless tensor-in/
+        tensor-out call, same as the eager ``_mtp_forward_batch`` it
+        replaces. ``token_ids`` follows ``_mtp_forward_batch``'s own
+        convention: flat (one id per slot) when ``qo_len==1``, else a
+        list of per-slot ``qo_len``-length lists."""
+        if set(slot_ids) & set(self._warmup_slots):
+            raise RuntimeError(
+                f"slot(s) {set(slot_ids) & set(self._warmup_slots)} are this "
+                "graph's own reserved warmup slots -- never replay() against them"
+            )
+        if self._graph is None:
+            raise RuntimeError("capture() must be called first")
+        if not (len(slot_ids) == self.batch_size == len(token_ids) == len(kv_lengths)):
+            raise ValueError("slot_ids/token_ids/kv_lengths must match batch_size")
+        self._fill_buffers(slot_ids, token_ids, hidden_states_in, kv_lengths)
+        self._graph.replay()
+        self.replay_count += 1
+        return self._static_logits, self._static_hidden_states_out

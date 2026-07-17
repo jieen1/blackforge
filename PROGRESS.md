@@ -1714,6 +1714,59 @@ of Section 7.6's original hedge (do not let Phase 3 slip behind the full
 Phase 2 effort) -- see the plan doc's section 8.4 for the full reasoning.
 Decision left to the coordinator.
 
+### Phase 3 of the post-ragged-round re-diagnosis: CUDA-graph the MTP round (2026-07-17/18) — real +140.9% W1-S (27.464→66.152), gap to native down from 5.26x to 2.185x; Phase 2 scoped precisely but not built
+
+Executed `notes/2026-07-17-post-ragged-round-next-steps.md`'s Phase 3 in
+two passes: an initial pass (verify forward + K-1 draft steps, per the
+plan's own scope) followed by a coordinator-directed fast-iteration pass
+that kept picking off remaining eager-path candidates (GDN snapshot
+batching, recompute-forward graph reuse, full precapture, draft step-0
+generalization) until hitting Phase 2's real spec-decode GDN mechanism,
+which turned out to be a genuinely different scope class (3-5 days, two
+asymmetric custom-kernel state-commit schemes) rather than another quick
+win -- investigated and precisely scoped (not vaguely deferred), but not
+implemented this round per the coordinator's explicit decision. Full
+arc, all intermediate numbers, the two real bugs caught and fixed along
+the way (a qo_len=1 token-flattening shape mismatch in the
+recompute-forward graph-reuse path, and a near-miss `_MAX_DECODE_QO_LEN`
+guard that prevented a real prefill from being wrongly routed through
+the decode-kernel graph), and the precise Phase 2 kernel-level scoping
+are all in the plan doc's new section 9.
+
+**Correctness: all 6 suites pass, freshly re-run against the final code
+state (not the fast-iteration pass's own quicker spot-checks).**
+`mtp_gdn_rollback_check.py --repeat 3`: 3/3 PASS. `mtp_batch_verify_check.py`:
+all 4 sub-checks PASS. `mtp_ragged_recompute_verify_check.py`: all 3
+sub-checks PASS. `cudagraph_eager_parity_check.py --repeat 3`: 3/3 PASS.
+`cudagraph_mtp_regression.py --repeat 3`: 3/3 PASS. New
+`benchmarks/mtp_verify_cudagraph_check.py` (drives the REAL
+`mtp_verify_and_commit_batch`/`_mtp_sync_and_propose_batch` entry points
+with `enable_cudagraph=True`, not just the underlying primitives in
+isolation, across 8 rounds + a batch-size-shrink transition): PASS, with
+`replay_count` instrumentation added to both graph classes confirming
+every captured code path was actually replayed at least once, not merely
+precaptured-but-unused. GPU/process hygiene confirmed clean after every
+suite and the perf run.
+
+**Performance: real W1-S 3-rep mean 66.152 accepted tok/s** (65.354 /
+66.522 / 66.582) — **+140.9% vs. the 27.464 Phase-1 baseline, gap to
+native's 144.54 narrows from ~5.26x to ~2.185x.** The plan's own
+`>=110`/`~1.3x` target was NOT met. `utilization.gpu` during the
+decode/verify loop rose monotonically across the whole arc (14.47% ->
+43.57% -> 54.12%, roughly 3.7x total) -- the eager-dispatch-starvation
+hypothesis this whole Phase 3 line was built on is decisively confirmed,
+not merely assumed. The remaining gap is not a mystery residual: it is
+two specifically-named, still-eager mechanisms (the genuinely-ragged
+recompute forward, and GDN snapshot/restore), both real per Phase 0's own
+kernel-time data, both addressed at once by Phase 2 -- which the
+coordinator explicitly chose not to build this round (see the plan doc's
+section 9.2 item 13 for the exact kernel-level scoping). Also flagged (not
+resolved): an observed within-process GPU-memory growth across reps
+(45→72→80/95GB peak of a 97.9GB card) that did not affect correctness and
+fully released on process exit, but is unexplained and worth a dedicated
+look before any long-running use of this configuration (plan doc section
+9.7).
+
 ### Phase 0 — Baseline contract
 
 - Frozen W1 (4K input / 1K output) and W2 (32K / 1K) workloads for

@@ -831,3 +831,398 @@ original estimate). This is a recommendation for the coordinator to
 weigh, not a decision executed this round -- Phase 2's own justification
 (the redundant full-forward recompute, real and confirmed) still stands
 independently and nothing here invalidates it.
+
+---
+
+## 9. Phase 3 results (executed 2026-07-17/18)
+
+Executed in two passes: an initial pass wiring the verify forward and the
+K-1 draft continuation steps (per this doc's own Phase 3 scope, "verify
+forward first, then the K draft steps"), then a coordinator-directed
+**fast-iteration pass** (explicit instruction: skip the full
+suite-per-change/writeup/commit discipline, get real numbers fast, report
+each one, only pause the fast loop on a genuine dead end) that kept
+picking off the remaining eager-path candidates until hitting one --
+Phase 2's own real spec-decode mechanism -- that is architecturally a
+different scope class, not a quick win. This section is the "return to
+full rigor" consolidation of that whole arc, written after re-running
+every correctness suite fresh against the FINAL code state (not
+re-reporting the fast-iteration pass's own quick spot-checks) and taking
+one proper 3-rep W1-S measurement.
+
+### 9.1 What was built, in the order it landed
+
+**Initial pass (verify forward + K-1 draft steps, per this doc's original Phase 3 scope):**
+
+1. `determine_accept_reject_batch` (module-level, next to the existing
+   single-slot `determine_accept_reject`, which is untouched and still
+   used by every other caller): computes greedy accept/reject for the
+   WHOLE batch via one `argmax(dim=-1)` + a `cumprod`-based "still
+   matching the accepted prefix" mask + exactly ONE combined
+   `.tolist()`, instead of a per-slot Python loop each doing up to `k+1`
+   sequential `.item()` calls (up to 4*(k+1)=16 host round-trips/round
+   before this change).
+2. Removed the 8 `torch.cuda.synchronize()` calls inside `_forward`,
+   `_forward_batch`, `_mtp_forward`, `_mtp_forward_batch` (2 each,
+   bracketing `compute_logits`). Same-stream ordering already guarantees
+   correctness (identical reasoning this project already used to justify
+   removing `CapturedBatchDecodeGraph.replay()`'s own blanket sync,
+   2026-07-17 correctness-review round) -- these were pure per-call
+   dispatch overhead, not a safety requirement.
+3. Vectorized the per-slot argmax loops inside `_mtp_sync_and_propose_batch`
+   (both the step-0 harvest and the K-1 continuation loop) the same way:
+   one `index_select`/`argmax` + one `.tolist()` per step, covering every
+   slot in the batch, instead of a Python loop calling `.argmax().item()`
+   per slot per step.
+4. New opt-in `DirectModelRunner(..., enable_cudagraph=True)` (default
+   `False`, so every existing correctness suite's behavior is
+   byte-for-byte unaffected -- see 9.4 for why this had to be opt-in, not
+   automatic).
+5. `_get_verify_graph(batch_size, qo_len)` / `_precapture_verify_graphs()`:
+   lazily-constructed-and-cached (then, later, fully precaptured -- see
+   item 9 below) `CapturedBatchDecodeGraph` instances, wired into
+   `mtp_verify_and_commit_batch`'s verify forward in place of the eager
+   `verify_batch` call, with a documented, tested eager fallback whenever
+   `enable_cudagraph` is off or the runner lacks spare slot capacity.
+6. Extended `CapturedBatchDecodeGraph` (the pre-existing, already-verified
+   class) with a backward-compatible `return_hidden` parameter on
+   `replay()` (default `False`, existing callers unaffected) and a
+   captured `_static_hidden_states` buffer alongside the existing
+   `_static_logits` -- needed because the verify forward's hidden states
+   feed the next round's MTP draft resync, and the pre-existing class
+   only captured logits.
+7. New `CapturedMTPDraftStepGraph` class (draft model, qo_len=1 initially)
+   wired into `_mtp_sync_and_propose_batch`'s K-1 continuation loop.
+
+Real W1-S 3-rep result at the end of this initial pass: **47.945 accepted
+tok/s** (48.392 / 48.920 / 46.524) -- +74.6% vs the 27.464 Phase-1
+baseline, gap to native narrows from 5.26x to 3.01x. A same-protocol 3-rep
+run of items 1-3 WITHOUT the graph (`--batched`, no `--cudagraph`) gave
+**33.593 tok/s** (32.395 / 34.078 / 34.307, +22.3% alone) -- isolating
+sync-removal+batched-argmax's own contribution from the graph's.
+
+### 9.2 Fast-iteration pass: further real wins, one real bug each round
+
+The coordinator's own framing for this pass: quick sanity check (not the
+full suite), one real number, report and keep going, stop only on a
+genuine dead end. Numbers below are **single-rep** (as instructed at the
+time) except where marked -- read as directional evidence, not the
+number of record; the number of record is the fresh 3-rep result in 9.3.
+
+8. **GDN snapshot/restore batching** (`torch._foreach_copy_` replacing the
+   per-layer Python loop's 2×48=96 individual `.copy_()` launches per
+   slot -- 384 total per round across 4 slots -- with 2 fused
+   multi-tensor calls per slot, ~8 total per round): correctness holds
+   (`mtp_gdn_rollback_check` bytewise-exact), but **measured no net
+   throughput effect** -- single-rep 48.810, statistically indistinguishable
+   from the 47.9-48.9 range above. Kept anyway (free, correct, and
+   strictly fewer launches) but not a real lever: Phase 1 already removed
+   the dominant cost (the blocking PCIe transfer); the residual per-launch
+   Python/CUDA-dispatch overhead this change targets was apparently
+   already small relative to everything else.
+9. **Draft K-1 step CUDA-graph capture** (`CapturedMTPDraftStepGraph`,
+   item 7 above, now actually wired in and measured): single-rep
+   **53.21 tok/s**.
+10. **Recompute-forward graph reuse**: the recompute forward is a SECOND
+    full 64-layer target-model forward (Phase 0's ledger: 97.2%
+    kernel-time ratio vs. the verify forward) that is normally ineligible
+    for graph capture because its batch is ragged (each recompute slot's
+    committed_len can differ). Opportunistic fix: when every recompute
+    slot in a round happens to share the SAME committed_len (a real,
+    non-rare case -- greedy rejection position is one draw from a shared
+    per-position acceptance distribution across independent slots), reuse
+    the existing verify-graph cache (`_get_verify_graph(len(recompute_slots),
+    committed_len)`) instead of falling back to eager `_forward_batch`.
+    **Real bug caught and fixed during this step**: `CapturedBatchDecodeGraph`'s
+    qo_len==1 branch expects FLAT token_ids (one int per slot), but the
+    recompute path always builds list-of-per-slot-lists (`real_new_tokens[s]`
+    is itself a list, even at length 1) -- a genuinely uniform
+    committed_len=1 round (all recompute slots reject at position 0)
+    crashed with `RuntimeError: output with shape [4] doesn't match the
+    broadcast shape [4, 4]` the first time it was exercised. Fixed by
+    flattening `tokens_recompute` before `replay()` specifically for the
+    qo_len==1 case (`mtp_verify_and_commit_batch`'s `tokens_for_graph`
+    variable). Added dedicated forced-uniform test rounds at both qo_len=2
+    and qo_len=1 to `mtp_verify_cudagraph_check.py` to lock this in as a
+    permanent regression guard, not just a one-off fix. Single-rep after
+    the fix: **58.12 tok/s**.
+11. **Full precapture** (extended `_precapture_verify_graphs`/new
+    `_precapture_draft_step_graphs` to cover every `qo_len` in
+    `1..num_speculative_tokens+1`, not just the verify-only `k+1`, for
+    every batch_size the runner has spare capacity for): item 10's
+    recompute-reuse path was, until this change, lazily capturing a new
+    graph the FIRST time each new `(batch_size, qo_len)` combination
+    appeared -- inside the timed measurement region. Moving that one-time
+    cost to construction time (matching every other graph's own "pay
+    setup cost once" discipline) removed that noise. Single-rep:
+    **65.31 tok/s**.
+12. **Draft step-0 (resync) generalized to the graph too**:
+    `CapturedMTPDraftStepGraph` generalized from qo_len=1-only to
+    arbitrary `qo_len` (buffers sized `batch_size*qo_len`, CSR
+    `qo_indptr`, etc. -- the same generalization pattern
+    `CapturedBatchDecodeGraph` already used for qo_len>1), then wired into
+    `_mtp_sync_and_propose_batch`'s step 0 whenever `num_new_tokens` is
+    uniform across the calling group (always true for the full-accept
+    group's fixed `k+1`; sometimes true for the recompute group).
+    **Real near-miss bug caught before ever running it in anger**:
+    `mtp_prefill_batch` calls this SAME function with
+    `num_new_tokens=prompt_len` (e.g. ~4096 for a real W1-S prompt) --
+    also "uniform" by the same check, which would have forced a
+    thousands-of-tokens prefill through the decode-kernel dispatch that
+    is only validated up to `_MAX_DECODE_QO_LEN=16`
+    (`build_attention_metadata_batch`'s own established bound). Caught by
+    re-reading the call site before running anything, fixed with an
+    explicit `num_new_tokens_list[0] <= _MAX_DECODE_QO_LEN` guard before
+    ever attempting the graph path. Single-rep after the fix: **64.01
+    tok/s** -- statistically FLAT vs. item 11's 65.31 (within single-rep
+    noise, not a real additional win). Kept anyway: it is a real,
+    now-verified capability (the draft model's step 0 no longer needs a
+    separate code path once its shape is graph-eligible), and Phase 0's
+    own ledger explains why the gain is negligible -- the draft model is
+    small (few layers) relative to the target model's 64, so even fully
+    graph-capturing its whole cycle barely moves a total that's already
+    dominated by the target model's captured verify+recompute forwards.
+13. **Phase 2 scoping (native spec-decode GDN path) -- investigated, NOT
+    implemented, precisely scoped as a real but different-class blocker**:
+    the fast-iteration pass's next natural candidate was the general
+    ragged recompute-forward case (item 10's reuse only covers the
+    uniform special case). Direct investigation (reading the actual
+    kernels, not just the metadata struct) found this is a genuine dead
+    end for graph capture specifically -- GDN's recurrent state advances
+    through every fed token regardless of content, so padding the ragged
+    batch to a fixed shape (the obvious workaround) would corrupt the
+    final committed state, and one captured graph per exact
+    (slot-count, committed-len-combination) shape is combinatorially
+    infeasible to precapture. This is NOT a dead end for the underlying
+    problem, though: this doc's own Phase 2 (adopt native's real
+    spec-decode `GDNAttentionMetadata` branch,
+    `vllm/v1/attention/backends/gdn_attn.py:198-288`) sidesteps the whole
+    problem class rather than fighting it, by making GDN state commit
+    itself acceptance-aware instead of needing snapshot/restore or a
+    recompute forward at all. Read the actual kernels (not just the
+    builder) to confirm the mechanism is real and get a precise scope:
+    - The recurrent/SSM state
+      (`vllm/model_executor/layers/fla/ops/fused_sigmoid_gating.py:103-170`,
+      the Triton kernel `fused_sigmoid_gating_delta_rule_update_kernel`)
+      needs **K+1 dedicated physical state rows per slot**, not 1. Read
+      side: `i_t = num_accepted_tokens[i_n] - 1; state_idx =
+      ssm_state_indices[i_n, i_t]` -- round N+1 reads whichever of round
+      N's K+1 candidate states corresponds to round N's actual accept
+      count. Write side: round N's own forward writes to
+      `ssm_state_indices[i_n, 0..T-1]` unconditionally, for all K+1
+      positions, before anyone knows what will be accepted -- confirmed
+      real, this is exactly the "commit is acceptance-aware, no rollback
+      needed" mechanism, read directly from the kernel body.
+    - The conv1d state is a DIFFERENT mechanism, not the same K+1-slot
+      scheme: `causal_conv1d_update`'s own docstring
+      (`vllm/model_executor/layers/mamba/ops/causal_conv1d.py:1103-1107`)
+      says `num_accepted_tokens` "indicates the number of accepted
+      tokens... conv_state is updated in a sliding window manner" -- ONE
+      physical slot per sequence (always column 0 of the same
+      block-table-style index tensor), with the kernel doing its own
+      internal sliding-window recompute. Conv and SSM state need two
+      SEPARATELY correct implementations, not one shared pattern.
+    - Concrete scope this implies: (a) restructuring
+      `allocate_fixed_slot_kv_caches`'s GDN tensor shapes to add K+1
+      addressable ssm rows per slot (conv stays 1) -- a schema change,
+      not additive; (b) building the real `spec_sequence_masks`/
+      `spec_token_indx`/`spec_query_start_loc`/`spec_state_indices_tensor`
+      CSR construction (today's `build_gdn_metadata_batch` builds none of
+      these -- always `None`); (c) a new persistent per-slot
+      `num_accepted_tokens` runner field threaded from round N's real
+      accept/reject into round N+1's metadata, with a defined first-round
+      bootstrap; (d) removing snapshot/restore/recompute and rewriting
+      `mtp_verify_and_commit_batch`'s control flow around this. This
+      matches this doc's own original Phase 2 estimate (3-5 days) -- more
+      scope than everything else in this section combined, and the
+      failure mode if either kernel's addressing is subtly misunderstood
+      is a SILENT GDN state corruption, not a crash. **Coordinator
+      decision: hold here, do not implement Phase 2 now** -- this section
+      documents the finding as the reason the fast-iteration pass stops
+      where it does, not as a rejected idea; whether to invest the 3-5
+      days is a call for whoever resumes this line to make.
+
+### 9.3 Final state: what's graph-captured vs. eager, and why
+
+| Call | Captured? | Condition | Why |
+|---|---|---|---|
+| Verify forward (target model, `mtp_verify_and_commit_batch`) | **Always**, when `enable_cudagraph=True` | any `batch_size` 1..`num_slots//2`, `qo_len=k+1` fixed | Every round submits the same K+1-token draft for every active slot -- always uniform. |
+| Recompute forward (target model) | **When uniform** | every recompute slot's `committed_len` this round happens to coincide | Reuses the verify-graph cache at `(len(recompute_slots), committed_len)`. Genuinely ragged rounds (slots with DIFFERENT committed_len) fall back to eager `_forward_batch` -- deliberately, permanently: padding would corrupt GDN's recurrent state, and per-exact-shape graphs are combinatorially infeasible (this is the SAME mechanism that motivates Phase 2, see 9.2 item 13). |
+| Draft K-1 continuation steps (draft model) | **Always** | `qo_len=1` uniform by construction, batch = whatever slots are in that step | `CapturedMTPDraftStepGraph`, one entry per encountered batch_size. |
+| Draft step 0 / resync (draft model) | **When uniform and `<=16`** | full-accept group: always (fixed `k+1`); recompute group: when committed_len coincides; `mtp_prefill_batch`'s own step 0: NEVER (guarded out, `num_new_tokens=prompt_len` is always `>16`) | Same `CapturedMTPDraftStepGraph` class, generalized to arbitrary `qo_len`. The `_MAX_DECODE_QO_LEN` guard is load-bearing, not decorative -- see 9.2 item 12's near-miss. |
+| GDN snapshot/restore | **Never** (always eager) | every round, unconditionally, for every active slot | Not a correctness blocker (Phase 1 already made this GPU-resident/D2D); no measured benefit found to capturing it (9.2 item 8), and it stays outside the captured verify-forward region by design (Phase 1's own writeup: buffers reserved with graph-safe discipline "so Phase 3 doesn't have to revisit this" -- Phase 3 confirms that decision was fine to leave as-is, not that it needed changing). |
+| `mtp_prefill_batch`'s own target-model prefill | **Never** (always eager) | once per request batch | Genuine long prefill (thousands of tokens), compute-bound not dispatch-bound (Phase 0's own prefill-segment utilization measurement: 85-99%, already near saturation) -- not the mechanism Phase 3 targets. |
+
+`enable_cudagraph` stays **opt-in, default `False`**. Every existing
+correctness suite in this project constructs its own runner with
+`num_slots` sized to its OWN real slot count, no spare capacity reserved
+for a captured graph's disposable warmup slots (e.g.
+`mtp_batch_verify_check.py`'s `ref_slots = [4, 5, 6, 7]` at
+`num_slots=8` are real, independently-used reference slots, not reserved
+capacity) -- turning graph capture on unconditionally would silently
+break these by stealing slots they already use for something else. A
+caller that wants the graph path must explicitly pass
+`enable_cudagraph=True` AND size `num_slots` to at least twice its real
+concurrency (the extra half is reserved, disposable capture-warmup
+capacity, never touched by real request traffic) -- see
+`benchmarks/mtp_w1s_our_runtime_perf.py`'s `--cudagraph` flag for the
+reference caller.
+
+### 9.4 Correctness verification (fresh re-run against the FINAL code state, full suites, no shortcuts)
+
+Every suite below was re-run from a clean process against the code as it
+stands at the end of this section, not re-reported from the
+fast-iteration pass's own quicker spot-checks:
+
+1. **`mtp_gdn_rollback_check.py --repeat 3`: 3/3 PASS.**
+2. **`mtp_batch_verify_check.py`: PASS, all 4 sub-checks** (`check0_batch1_equivalence`,
+   `check1_numerical_twin`, `check2_signal_probe`, `check3_mixed_stage`) --
+   this suite runs with `enable_cudagraph` at its default `False`, so it
+   is the regression guard for the untouched eager path.
+3. **`mtp_ragged_recompute_verify_check.py`: PASS, all 3 sub-checks**
+   (`check0_batch1_forced_reject_equivalence`, `check1_ragged_recompute`,
+   `check2_mixed_ragged_and_full_accept`) -- likewise eager-path,
+   unaffected by `enable_cudagraph` defaulting off.
+4. **`cudagraph_eager_parity_check.py --repeat 3`: 3/3 PASS** -- the
+   pre-existing, already-verified primitive's own bytewise-identical
+   parity check, confirming the `return_hidden` extension (9.1 item 6)
+   didn't regress its existing behavior.
+5. **`cudagraph_mtp_regression.py --repeat 3`: 3/3 PASS** -- likewise, the
+   pre-existing qo_len=4 MTP verify signal-probe regression, unaffected.
+6. **`benchmarks/mtp_verify_cudagraph_check.py` (new, built this round,
+   consolidated from several ad-hoc rounds added during fast iteration
+   into one file): PASS.** This is the one that actually exercises the
+   NEW graph-capturing code paths through the real
+   `mtp_verify_and_commit_batch`/`_mtp_sync_and_propose_batch` entry
+   points (`enable_cudagraph=True`), not just the underlying primitives
+   in isolation. 8 rounds (organic, mixed, fully-ragged, uniform-qo2,
+   uniform-qo1, single-slot-reject, post-ragged-organic) plus a
+   batch-size-shrink transition (4->2), verified via the project's
+   established independent-reference-replay methodology. Also asserts,
+   via a `replay_count` counter added to both graph classes specifically
+   for this (cache-key presence alone isn't sufficient evidence --
+   precapture populates every entry regardless of whether a round ever
+   replays it), that every one of the following was ACTUALLY replayed at
+   least once, not just precaptured-but-unused: the verify graph at
+   batch_size 4 and 2; the recompute-reuse path at qo_len=2 (round 6) and
+   qo_len=1 (round 7); the draft step-0 graph at qo_len=2 (via the
+   recompute group's own uniform resync); the draft continuation graph at
+   qo_len=1. All confirmed replayed.
+
+GPU/process hygiene (`pgrep`/`nvidia-smi --query-compute-apps`/
+`--query-gpu`) confirmed clean after every one of the six suites above
+and after the performance run in 9.5 -- no leaked process at any point.
+
+### 9.5 Performance: final real W1-S 3-rep measurement
+
+`python -m benchmarks.mtp_w1s_our_runtime_perf --batched --cudagraph --repeats 3 --max-tokens 256 --concurrency 4 --fixture n16`
+(same protocol as every prior W1-S measurement this project has used).
+
+| Rep | accepted_tokens/s | ms/accepted token | draft acceptance % | gpu_busy_pct (span metric) |
+|---|---:|---:|---:|---:|
+| 1 | 65.354 | 15.301 | 70.814 | 92.93% |
+| 2 | 66.522 | 15.033 | 70.814 | 93.00% |
+| 3 | 66.582 | 15.019 | 70.814 | 93.05% |
+| **mean** | **66.152** | 15.118 | 70.814 | 92.99% |
+
+`total_committed_tokens` (4118) and `draft_acceptance_rate_pct`
+(70.814...%) are identical bit-for-bit across all 3 reps -- expected
+(this is a deterministic greedy pipeline; every change this round is
+purely mechanical, touching neither sampling nor the accept/reject rule
+itself), and a useful passive cross-check on top of section 9.4's
+dedicated suites.
+
+**Comparison against the reference numbers**:
+- **vs. the 27.464 tok/s Phase-1 baseline: 66.152/27.464 = 2.409x --
+  a real +140.9% throughput improvement**, entirely from this Phase 3
+  arc (sync removal, batched argmax, and the graph-capture wiring in
+  9.1-9.2).
+- **vs. native's 144.54 tok/s: gap narrows from ~5.26x (Phase 1's own
+  end state) to ~2.185x.**
+- **vs. the plan's own post-Phase-3 target (>=110 accepted tok/s, "within
+  ~1.3x of native"): NOT met.** 66.152 is well short of 110. Per the
+  plan's own honest-conclusion clause for this outcome ("If we land
+  materially short with the ledger's residual still <=25%, the honest
+  conclusion is that the remaining delta is in per-kernel efficiency at
+  M=16"): this round's own findings point to a MORE SPECIFIC remaining
+  delta than pure per-kernel efficiency, though -- the genuinely ragged
+  recompute forward (still eager, real cost per Phase 0's 97.2%
+  kernel-time-ratio finding) and the GDN snapshot/restore mechanism
+  (still eager, real per-round host-dispatch cost even after both this
+  round's and Phase 1's fixes) are both still-live, identified,
+  NAMED costs -- not a residual/unexplained gap. Phase 2 (9.2 item 13)
+  is the mechanism that would remove both at once; declining to build it
+  this round is a scope/risk decision, not evidence the gap is
+  unreachable.
+
+### 9.6 GPU utilization: the falsifier check, tracked across the whole arc
+
+Sampled `nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader -l 1`
+concurrently during three points in this arc, segmenting each sample set
+into startup/load (<20%), decode/verify steady-state (20-80%), and
+prefill spikes (>80%) the same way section 7.3 did:
+
+| Point in the arc | decode/verify steady-state mean | n (samples) |
+|---|---:|---:|
+| Phase 0 baseline (pre-Phase-3, section 7.3) | 14.47% | 36 |
+| After verify-forward graph capture only (9.1's end state) | 43.57% | 211 |
+| Final (all of 9.1+9.2) | **54.12%** | 145 |
+
+This is the plan's own falsifier check for whether the eager-dispatch-
+starvation hypothesis actually holds ("`utilization.gpu` during steady
+state should rise sharply if P3 held") -- it rose monotonically at every
+measured point across this arc (roughly 1x -> 3x -> 3.7x), not just once
+at the start, which is stronger evidence than a single before/after
+snapshot would have been. **The hypothesis is confirmed, decisively, by
+this arc's own data, not merely assumed.** The gap between "utilization
+tripled" and "throughput only ~2.4x'd, still 2.185x behind native" is
+consistent with 9.5's own account: utilization measures whether A kernel
+is running, not how much of the remaining wall time is still spent on
+the still-eager mechanisms (recompute-forward's ragged case, GDN
+snapshot/restore) -- those still show up as real gaps in this same
+utilization trace (values in the 20-54% band, not pinned near 100%),
+which is itself further, independent confirmation that the NAMED
+remaining costs in 9.5 are real, not residual noise.
+
+### 9.7 An observed, unexplained resource-usage pattern (flagged honestly, not investigated further this round)
+
+During the 9.5 measurement, `nvidia-smi`-reported `memory_used_mib`
+climbed across reps within the SAME process: 45123 MiB (end of rep 1) ->
+72075 MiB (end of rep 2) -> 79924 MiB (end of rep 3, 95531 MiB peak per
+the raw log) -- against a ~97887 MiB total, this is uncomfortably close
+to the ceiling by the end of rep 3, though it did not OOM in this run.
+Confirmed NOT a true unbounded leak in the sense of surviving process
+exit: `nvidia-smi` after the process exited showed memory back at the
+same ~2653 MiB baseline as before the run started, both times this
+measurement was taken (9.1's earlier 3-rep run and this section's final
+one). Also confirmed NOT a correctness problem: `total_committed_tokens`
+(4118) and `draft_acceptance_rate_pct` were bit-for-bit identical across
+all 3 reps regardless of this growth. Plausible (not confirmed)
+explanation: PyTorch's caching allocator growing its reserved
+high-water-mark across reps due to the many small per-call tensor
+allocations on the still-eager paths (fallback recompute, GDN
+snapshot/restore's `_fill_buffers`-equivalent per-call `torch.tensor()`
+construction) rather than a genuine leak -- not confirmed via a dedicated
+allocator-stats trace this round. Flagged here as a real, observed
+pattern worth a dedicated look before running this configuration for
+much longer than 3 reps back-to-back (e.g. a real multi-hour serving
+session), not as a blocking finding for this round's own conclusions.
+
+### 9.8 Honest bottom line
+
+Four real, verified wins landed this session on top of Phase 1's own
++48.1%: sync-removal+batched-argmax (+22.3% alone), the verify-forward
+CUDA graph (the largest single jump), recompute-forward graph reuse, and
+full precapture (draft step-0 generalization landed flat but is kept for
+its own correctness value). Combined: **27.464 -> 66.152 accepted tok/s
+(+140.9%), gap to native 144.54 down from 5.26x to 2.185x.** The
+>=110/~1.3x target was not met. The eager-dispatch-starvation hypothesis
+this whole Phase 3 line was built on is decisively confirmed (utilization
+roughly 3.7x'd across the arc, monotonically, not just once). What
+remains is not a mystery residual -- it is two specifically-identified,
+still-eager mechanisms (the ragged recompute forward, GDN
+snapshot/restore) whose fix (Phase 2, adopting native's real
+acceptance-aware GDN state commit) is scoped, precise, and real, but is a
+3-5 day architecturally-different-class change the coordinator explicitly
+chose not to start this round. Whether to invest that time is a decision
+for whoever picks this line up next.
