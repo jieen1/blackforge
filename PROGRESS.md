@@ -1,6 +1,6 @@
 # Implementation Progress
 
-Updated: 2026-07-16
+Updated: 2026-07-17
 
 ## Completed
 
@@ -1644,6 +1644,75 @@ Concrete findings (full detail in the design doc's "Current state" section):
 (model loading, KV/GDN tensor ownership, metadata plumbing) is real,
 substantial, verified-working infrastructure; the actual *output* is still
 wrong, and shipping this as a claimed milestone would misrepresent that.
+
+### Phase 0 of the post-ragged-round re-diagnosis: real `nsys` gap ledger (2026-07-17) — P1/P2(partial)/P3/P4 all held, none of §6's falsifiers triggered
+
+Executed `notes/2026-07-17-post-ragged-round-next-steps.md`'s Phase 0
+(profiling-only, no `runtime/` file touched). New diagnostic script
+`benchmarks/phase0_nsys_gap_ledger_diag.py` replays
+`mtp_verify_and_commit_batch`'s own real, unmodified sub-calls with
+per-phase NVTX ranges under `nsys profile`, over 50 natural W1-S rounds.
+**Kernel-active time across all families combined is only 8.8-10.2% of
+round wall time**; no-kernel gap is 66.6-72.5% (P3 held, decisively) --
+this directly resolves the long-standing ~95% "GPU-busy%" vs ~30%
+`utilization.gpu` contradiction: the busy% metric is a span (≈wall time by
+construction), not a kernel-active fraction; this ledger measured the
+latter for the first time. D2H/H2D memcpy (the GDN snapshot/restore
+mechanism) is 89-117ms/round, ~17-25% of wall alone and ~48-55% including
+its own host-dispatch gap (P1 held). The recompute branch's second target
+forward matches the verify forward's kernel-time almost exactly (97.2%
+ratio, confirming redundant full-forward cost -- P2 held via this clause);
+GDN kernel time itself is small (0.5% of wall, not "≫native's 8%" as also
+predicted -- that half of P2 is falsified). `flash_attn_decode*` is
+0.75-0.82% of round time (P4 held). Full table + byte/throughput
+cross-checks + `nvidia-smi utilization.gpu` sample distribution (14.47%
+mean during the decode/verify loop, separate from a genuine 85-99% spike
+during the batched prefill) in that doc's new section 7. **Recommendation:
+proceed to Phase 1 next as planned; do not let Phase 3 slip behind the
+full Phase 2 effort by default -- the ledger's phase-level gap split shows
+Phase 3's eager-dispatch lever (~37-42% of wall, present in every round)
+is comparable to or larger than Phase 1/2's snapshot/recompute lever
+(~30-31%, only 84.4% of rounds).**
+
+### Phase 1 of the post-ragged-round re-diagnosis: GPU-resident GDN snapshot/restore (2026-07-17) — real +48.1% W1-S, within predicted range but at its low end
+
+Executed `notes/2026-07-17-post-ragged-round-next-steps.md`'s Phase 1.
+Replaced `snapshot_gdn_state`/`restore_gdn_state`'s per-call
+`.detach().to("cpu", copy=True)`/`.to(self.device)` (89-117ms/round of
+pageable D2H/H2D memcpy per Phase 0's ledger) with a preallocated,
+fixed-address, GPU-resident per-slot buffer (one snapshot slot per
+logical slot, ~604MB VRAM, sized and verified against the real call
+pattern -- both `mtp_verify_and_commit`/`_batch` snapshot each slot at
+most once per round) and a plain D2D `copy_`. API/return contract and all
+three safety invariants (slot-id check, generation-counter staleness
+check, consumed-once flag) unchanged. Full design rationale and code
+detail in `direct_model_runner.py`'s updated docstrings and the plan
+doc's new section 8.
+
+**Correctness: all 4 checks pass, first attempt.**
+`mtp_gdn_rollback_check.py --repeat 3`: 3/3 PASS. `mtp_batch_verify_check.py`:
+all 4 sub-checks PASS. `mtp_ragged_recompute_verify_check.py`: all 3
+sub-checks PASS. GPU/process hygiene confirmed clean (`pgrep`/`nvidia-smi`)
+after every run.
+
+**Performance: real W1-S 3-rep mean 27.464 accepted tok/s** (28.321 /
+25.963 / 28.108), **+48.1% vs. the 18.54 baseline, gap to native's 144.54
+narrows from ~7.80x to ~5.26x.** This is inside the plan's own predicted
+1.3-2x range (holds, not a miss) but near its low end -- worked backward,
+the implied removed decode-loop-time share (~36%) sits between Phase 0's
+strict-memcpy-only estimate (17-25%) and its full-phase-including-
+host-dispatch-gap estimate (48-55%), closer to the former. Reasoned (not
+ablation-proven) explanation: this fix removes the blocking-transfer wait
+but not the per-round COUNT of host-issued small ops (still 384: 2
+tensors x 48 layers x 4 slots) -- residual per-launch dispatch overhead,
+a mechanism Phase 3 (not Phase 1) targets, plausibly ate the rest. Full
+detail, including the arithmetic, in the plan doc's section 8.3.
+
+**Sequencing note for Phase 2 vs Phase 3 (recommendation only, not acted
+on)**: Phase 1's shortfall pattern is, if anything, a data point in favor
+of Section 7.6's original hedge (do not let Phase 3 slip behind the full
+Phase 2 effort) -- see the plan doc's section 8.4 for the full reasoning.
+Decision left to the coordinator.
 
 ### Phase 0 — Baseline contract
 

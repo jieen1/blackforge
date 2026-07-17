@@ -705,6 +705,7 @@ class DirectModelRunner:
             self.num_speculative_tokens = vllm_config.speculative_config.num_speculative_tokens
 
         self._allocate_and_bind_kv_caches()
+        self._allocate_gdn_snapshot_buffers()
 
         # Per-slot bookkeeping: attention kv_len (tokens actually written into
         # the paged KV cache) and GDN "has state been initialized" flag.
@@ -794,6 +795,77 @@ class DirectModelRunner:
             block_size=self.block_size,
             blocks_per_slot=self.blocks_per_slot,
         )
+
+    def _allocate_gdn_snapshot_buffers(self) -> None:
+        """Preallocated, GPU-resident, fixed-address storage for
+        ``snapshot_gdn_state``/``restore_gdn_state`` (2026-07-17, Phase 1 of
+        ``notes/2026-07-17-post-ragged-round-next-steps.md``). Replaces the
+        old per-call ``.detach().to("cpu", copy=True)`` -- Phase 0's real
+        ``nsys`` ledger (that doc's section 7) measured this mechanism at
+        89-117ms/round of pageable D2H/H2D memcpy-engine time alone, plus a
+        comparable amount of host-dispatch gap in the same phases (~30-31%
+        of round wall time combined, present in every round -- snapshot
+        happens unconditionally for all active slots).
+
+        Sizing rationale (verified against the real call pattern before
+        relying on it, per this round's own instructions -- both
+        ``mtp_verify_and_commit`` and ``mtp_verify_and_commit_batch`` snap
+        each slot in the list AT MOST ONCE per round, and any restore for
+        that slot happens later in that SAME round, before the next round's
+        snapshot call for that slot can be issued): at most ONE snapshot
+        per logical slot is ever outstanding at a time. One buffer entry per
+        logical slot (indexed 0..num_slots-1) is therefore sufficient --
+        NOT a literal ping-pong double buffer (which would double the VRAM
+        cost to ~1.2GB); this is deliberately the plan doc's "~604MB"
+        estimate, which already assumed exactly this one-copy-per-slot
+        sizing (confirmed against Phase 0's own measured D2H byte count,
+        ~604MB for a 4-slot round). The persistent buffer is safe to reuse
+        round-over-round without an explicit double-buffer/generation-aware
+        allocation scheme because everything here runs on ONE CUDA stream
+        in strict Python-issued order: a later round's snapshot() write for
+        slot S can only be enqueued after every earlier statement that
+        reads slot S's snapshot (i.e. that round's own restore() call, if
+        any) has already been issued -- CUDA's own per-stream FIFO
+        ordering, not an extra synchronization primitive, is what makes
+        this correct. The three safety invariants this class already
+        enforces (slot-id tag, generation counter, consumed-once flag) are
+        UNCHANGED and still checked before any tensor data is read on
+        restore -- they continue to guard against a caller holding a STALE
+        snapshot object across rounds, which would otherwise now silently
+        alias newer data through the same buffer slot (the checks reject
+        it before that data is ever used, exactly as before).
+
+        Indexed directly by LOGICAL slot (0..num_slots-1), unlike
+        ``kv_caches`` (which reserves physical index 0 -- see
+        ``RESERVED_PHYSICAL_SLOTS``/``_physical_slot``): that reservation
+        works around a real vLLM physical-block-addressing convention this
+        private buffer is not subject to, so no such offset/reservation is
+        needed here.
+
+        Fixed-address discipline (never reallocated after ``__init__``,
+        only ever written into via ``copy_``) matches this file's other
+        persistent GPU buffers (see ``CapturedBatchDecodeGraph``'s class
+        docstring) -- this code path does not currently run inside any CUDA
+        graph capture region (``mtp_verify_and_commit``/``_batch`` are
+        eager-only; ``CapturedBatchDecodeGraph`` is a separate, not-yet-
+        wired-in mechanism per Phase 3 of the same plan doc), but following
+        the same discipline now means Phase 3 does not have to revisit this
+        buffer's allocation strategy later if GDN snapshot/restore is ever
+        folded into a captured graph."""
+        self.gdn_snapshot_conv: dict[str, torch.Tensor] = {}
+        self.gdn_snapshot_ssm: dict[str, torch.Tensor] = {}
+        for name in self.gdn_layer_names:
+            conv_state, ssm_state = self.kv_caches[name]
+            self.gdn_snapshot_conv[name] = torch.zeros(
+                (self.num_slots, *conv_state.shape[1:]),
+                dtype=conv_state.dtype,
+                device=self.device,
+            )
+            self.gdn_snapshot_ssm[name] = torch.zeros(
+                (self.num_slots, *ssm_state.shape[1:]),
+                dtype=ssm_state.dtype,
+                device=self.device,
+            )
 
     def _attention_metadata(
         self, slot: int, *, num_new_tokens: int, is_decode: bool
@@ -1180,10 +1252,19 @@ class DirectModelRunner:
         and to verify independently of the rest of MTP (see
         ``benchmarks/mtp_gdn_rollback_check.py``), at the cost of an extra
         state copy per verify call and a recompute forward pass on
-        rejection. Returns CPU-resident clones (not GPU-resident, to avoid
-        holding extra persistent GPU memory for a snapshot that is usually
-        discarded within one verify step) -- restore moves them back to
-        device.
+        rejection.
+
+        **2026-07-17, Phase 1 (GPU-resident double buffer)**: returns
+        GPU-resident VIEWS into a preallocated, fixed-address per-slot
+        buffer (``self.gdn_snapshot_conv``/``self.gdn_snapshot_ssm``, see
+        ``_allocate_gdn_snapshot_buffers``) instead of fresh CPU clones --
+        the data is copied via a single D2D ``copy_`` per layer (~0.4ms at
+        HBM rates, measured; see notes/2026-07-17-post-ragged-round-next-
+        steps.md's section 8) instead of a blocking pageable D2H memcpy
+        (89-117ms/round, per that doc's section 7). API/return shape is
+        UNCHANGED (same dict keys, same per-layer ``(conv, ssm)`` tuple
+        shape) -- callers (``restore_gdn_state``, both
+        ``mtp_verify_and_commit``/``_batch``) do not need to change.
 
         Tags the snapshot with the SOURCE slot id and this slot's current
         generation counter (``self.slot_gdn_snapshot_gen``, bumped on
@@ -1203,7 +1284,13 @@ class DirectModelRunner:
         this specific case since both restores would write the same
         bytes, but a caller path that restores twice by mistake is exactly
         the kind of latent bug this project's "no silent passes" standard
-        exists to catch)."""
+        exists to catch). These three invariants are unchanged by the
+        Phase 1 storage-medium change -- they are checked in
+        ``restore_gdn_state`` BEFORE any tensor data is read, so a stale
+        snapshot is still rejected even though the underlying GPU buffer
+        may since have been overwritten by a newer generation's data (see
+        ``_allocate_gdn_snapshot_buffers``'s docstring for why that's
+        safe)."""
         physical = _physical_slot(slot)
         self.slot_gdn_snapshot_gen[slot] += 1
         snapshot: dict = {
@@ -1213,10 +1300,11 @@ class DirectModelRunner:
         }
         for name in self.gdn_layer_names:
             conv_state, ssm_state = self.kv_caches[name]
-            snapshot[name] = (
-                conv_state[physical].detach().to("cpu", copy=True),
-                ssm_state[physical].detach().to("cpu", copy=True),
-            )
+            snap_conv = self.gdn_snapshot_conv[name][slot]
+            snap_ssm = self.gdn_snapshot_ssm[name][slot]
+            snap_conv.copy_(conv_state[physical])
+            snap_ssm.copy_(ssm_state[physical])
+            snapshot[name] = (snap_conv, snap_ssm)
         return snapshot
 
     def restore_gdn_state(
@@ -1231,7 +1319,15 @@ class DirectModelRunner:
         mismatch), a snapshot taken for a DIFFERENT slot, or a snapshot
         that has already been consumed by a prior restore -- see
         ``snapshot_gdn_state``'s docstring for why each of these was
-        added (2026-07-17, Codex-sol review)."""
+        added (2026-07-17, Codex-sol review), and (2026-07-17, Phase 1)
+        for why they still hold with GPU-resident snapshot storage.
+
+        **2026-07-17, Phase 1**: ``snapshot[name]`` is now already a
+        GPU-resident tensor (a view into the fixed-address per-slot
+        buffer), so the restore is a single D2D ``copy_`` per layer with
+        no host round-trip and no ``.to(self.device)`` staging step -- the
+        old CPU-clone path did both a D2H (in ``snapshot_gdn_state``) and
+        an H2D (here) blocking pageable-memory copy per layer per slot."""
         if snapshot.get("__slot__") != slot:
             raise RuntimeError(
                 f"GDN snapshot was taken for slot {snapshot.get('__slot__')}, "
@@ -1249,8 +1345,8 @@ class DirectModelRunner:
         for name in self.gdn_layer_names:
             conv_state, ssm_state = self.kv_caches[name]
             snap_conv, snap_ssm = snapshot[name]
-            conv_state[physical].copy_(snap_conv.to(self.device))
-            ssm_state[physical].copy_(snap_ssm.to(self.device))
+            conv_state[physical].copy_(snap_conv)
+            ssm_state[physical].copy_(snap_ssm)
         snapshot["__consumed__"] = True
 
     def _mtp_forward(
