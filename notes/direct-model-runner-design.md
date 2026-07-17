@@ -1659,16 +1659,36 @@ numeric gate, not a vague aspiration.
 
 ### What vLLM's real MTP K=3 actually requires (traced from source, not guessed)
 
-Read `vllm/model_executor/models/qwen3_next_mtp.py`
-(`Qwen3NextMTP`/`Qwen3NextMultiTokenPredictor` -- a genuinely SEPARATE
+> **2026-07-17 correction**: this subsection originally cited
+> `vllm/model_executor/models/qwen3_next_mtp.py` (`Qwen3NextMTP`) as the
+> draft model class. That file/class serves the **`qwen3_next`**
+> `model_type`, a DIFFERENT model family. This project's actual target
+> checkpoint (`unsloth/Qwen3.6-27B-NVFP4`) has top-level `model_type:
+> "qwen3_5"` (verified directly from its `config.json`, nested
+> `text_config.model_type: "qwen3_5_text"`, `mtp_num_hidden_layers: 1`),
+> which `SpeculativeConfig.update_arch_()`
+> (`vllm/config/speculative.py:500-509`) rewrites to `"qwen3_5_mtp"` /
+> `architectures=["Qwen3_5MTP"]` -- loading `Qwen3_5MTP`
+> (`vllm/model_executor/models/qwen3_5_mtp.py:192`), which wraps the
+> actual decoder-layer-holding module `Qwen3_5MultiTokenPredictor`
+> (same file, line 63) as `self.model`. Both were independently
+> re-verified by reading the checkpoint's `config.json` and the vLLM
+> source directly (not taken on trust) before writing this correction.
+> The text below is corrected in place; the architectural
+> conclusions (separate small model, own full-attention KV cache,
+> every-step sync) were never wrong, only the specific file/class/field
+> names were.
+
+Read `vllm/model_executor/models/qwen3_5_mtp.py`
+(`Qwen3_5MTP`/`Qwen3_5MultiTokenPredictor` -- a genuinely SEPARATE
 small model, its own `fc`/decoder-layer(s)/`norm`, sharing only
 `embed_tokens`/`lm_head` with the target model) and
 `vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py` (the real
 propose-loop orchestrator) to understand the exact mechanism:
 
 1. **The MTP model has its OWN full-attention decoder layer(s)**
-   (`Qwen3NextDecoderLayer(layer_type="full_attention")`, count =
-   `num_nextn_predict_layers`, 1 for this model) -- a real transformer
+   (`Qwen3_5DecoderLayer(layer_type="full_attention")`, count =
+   `mtp_num_hidden_layers`, 1 for this checkpoint) -- a real transformer
    layer with real K/V, not just a linear head.
 2. **This MTP attention layer needs its OWN KV cache, kept in sync with
    the target model on EVERY real step** -- not just during propose
@@ -1676,11 +1696,23 @@ propose-loop orchestrator) to understand the exact mechanism:
    one" logic runs over the FULL current query range on every real
    target-model prefill/decode step (not just the last position),
    because the draft model's own attention needs COMPLETE causal history
-   to work at all -- exactly like any autoregressive transformer. This
-   means faithfully replicating vLLM's MTP requires restructuring the
-   main forward path itself (every `prefill`/`decode`/`_forward_batch`
-   call) to ALSO run a matching draft-model forward pass, not just adding
-   an isolated `propose_draft()` method called only when speculating.
+   to work at all -- exactly like any autoregressive transformer.
+   **2026-07-17 refinement (sol-verified)**: this does NOT mean the sync
+   call must be scattered into every public forward entry point of the
+   main model. A precise deferred/lazy catch-up (save the un-synced
+   token span + target hidden states + position/slot metadata, do one
+   batched prefill-style catch-up later) is theoretically possible, but
+   the margin is narrow here: every position's draft-model input
+   depends on the TARGET's own hidden state for that position, not just
+   the token id, so "not saved" means "must recompute the target's
+   history," and this project's K=3-every-round workload has no real
+   idle gap to defer into -- steady state, deferred sync degrades to a
+   first-pass every round anyway, i.e. no real saving. The accurate
+   framing is: draft sync must be part of every round's state machine,
+   but the CALL SITE can be centralized at one place -- the
+   target-forward/verify-propose boundary -- rather than duplicated into
+   every public forward entry point. See "worst-case redesign scope"
+   below, revised accordingly.
 3. **The propose loop itself** (`_prefill`/`_multi_step_decode`/
    `_generate_draft`): step 0 feeds the draft model `hidden_states =
    target model's own last hidden state` (from the step that just ran)
@@ -1688,17 +1720,20 @@ propose-loop orchestrator) to understand the exact mechanism:
    (teacher-forcing); steps 1..K-1 feed the draft model's OWN previous
    step's hidden state and its own previously-sampled draft token
    (genuinely autoregressive on the draft side). Matches
-   `Qwen3NextMultiTokenPredictor.forward()`'s `spec_step_idx` parameter
-   (cycles through `self.layers[spec_step_idx % num_mtp_layers]`).
+   `Qwen3_5MultiTokenPredictor.forward()`'s `spec_step_idx` parameter
+   (cycles through `self.layers[spec_step_idx % num_mtp_layers]`, and
+   `num_mtp_layers=1` here so every step reuses the same single layer).
 4. **Loading it the "complete-replication" way** (not reinventing): pass
    `speculative_config={"method": "mtp", "num_speculative_tokens": 3,
    "attention_backend": "CUSTOM"}` to `EngineArgs` (matching
    `launch_test_server.py`'s established convention exactly) so
    `vllm_config.speculative_config.draft_model_config` is constructed by
    vLLM's own `SpeculativeConfig.update_arch_()` logic (confirmed via
-   source: for `qwen3_next` models this rewrites `hf_config.model_type`
-   to `"qwen3_next_mtp"` and sets `architectures=["Qwen3NextMTP"]`, same
-   checkpoint path, different vLLM model class), then
+   source: for `qwen3_5`/`qwen3_5_moe` models this rewrites
+   `hf_config.model_type` to `"qwen3_5_mtp"` and sets
+   `architectures=["Qwen3_5MTP"]` (or `Qwen3_5MoeMTP` for the MoE
+   variant, not applicable to this checkpoint), same checkpoint path,
+   different vLLM model class), then
    `get_model(vllm_config=vllm_config, model_config=vllm_config
    .speculative_config.draft_model_config)` loads it -- reusing real
    vLLM construction logic end to end, not a hand-rolled substitute.
@@ -1891,6 +1926,15 @@ anything.
 If this project commits to faithfully replicating vLLM's mechanism, the
 concrete changes are:
 
+> **2026-07-17 correction applied throughout A-E below**: the draft
+> model class is `Qwen3_5MTP`/`Qwen3_5MultiTokenPredictor`
+> (`vllm/model_executor/models/qwen3_5_mtp.py`), not `Qwen3NextMTP` --
+> see the correction note earlier in this document. Field name is
+> `mtp_num_hidden_layers`, not `num_nextn_predict_layers`. Point C is
+> also revised from the original write-up per sol's refinement: the
+> sync call does not need to be duplicated into every public forward
+> entry point, only centralized at one boundary (see below).
+
 **A. Model loading** (`build_vllm_config`/`DirectModelRunner.__init__`):
 add a `with_mtp: bool`/`num_speculative_tokens: int` parameter passing
 `speculative_config={"method": "mtp", "num_speculative_tokens": K,
@@ -1898,11 +1942,11 @@ add a `with_mtp: bool`/`num_speculative_tokens: int` parameter passing
 `launch_test_server.py` exactly -- reuses vLLM's own
 `SpeculativeConfig.update_arch_()` construction, not reinvented). Then
 `get_model(vllm_config=vllm_config, model_config=vllm_config
-.speculative_config.draft_model_config)` loads `Qwen3NextMTP`, storing
-it as `self.mtp_model`. Must happen BEFORE
-`_allocate_and_bind_kv_caches()` so the MTP model's own attention layer
-registers into the SAME `static_forward_context` this project's existing
-KV-cache-allocation machinery already iterates over.
+.speculative_config.draft_model_config)` loads `Qwen3_5MTP`, storing it
+as `self.mtp_model`. Must happen BEFORE `_allocate_and_bind_kv_caches()`
+so the MTP model's own attention layer registers into the SAME
+`static_forward_context` this project's existing KV-cache-allocation
+machinery already iterates over.
 
 **B. KV cache sizing**: the MTP model's own attention layer needs the
 SAME per-slot page-table capacity as the target's 16 full-attention
@@ -1910,33 +1954,40 @@ layers (it tracks the identical-length sequence history) -- this
 `allocate_fixed_slot_kv_caches` handles "for free" once the MTP layer is
 in `attn_layer_names`, but it means attention-KV memory footprint grows
 by 1/16 ≈ 6.25% (one extra full-attention-shaped cache per slot). GDN
-memory is unaffected -- `Qwen3NextMTP` has no GDN/linear-attention
-layers at all.
+memory is unaffected -- `Qwen3_5MTP`'s draft layer(s) are plain
+full-attention, no GDN/linear-attention involved.
 
-**C. Every real target-model forward call needs a matching draft-model
-forward call** (the pervasive part): `DirectModelRunner.prefill()`/
-`.decode()`/`._forward()`/`._forward_batch()`, and
-`CapturedBatchDecodeGraph.replay()`, would each need to, immediately
-after the target model's own `forward()`+`compute_logits()`, ALSO:
-   1. Build a shifted-by-one `input_ids` for the draft model (this
+**C. Draft sync, centralized at ONE boundary, not scattered (revised
+per sol)**: rather than adding a draft-model call to every public
+forward entry point (`prefill`/`decode`/`_forward`/`_forward_batch`
+individually), a single internal method -- e.g.
+`_advance_target_and_sync_draft(...)` -- sits at the one place all of
+those already funnel through today (the point right after the target
+model's own `forward()`+`compute_logits()` produces this step's hidden
+state and sampled token), and every one of today's public entry points
+calls through it instead of calling the target forward directly. That
+one method:
+   1. Builds a shifted-by-one `input_ids` for the draft model (this
       step's real input_ids shifted left by one, with the newly-sampled
       next token in the last slot -- mirrors
       `_prepare_prefill_inputs_kernel`).
-   2. Build the draft model's OWN attention metadata + slot_mapping
+   2. Builds the draft model's OWN attention metadata + slot_mapping
       (same per-slot physical addressing as the target's attention
       layers, scoped to just the MTP layer's own name(s) -- a NEW
       `self.mtp_attn_layer_names` list, separate from
       `self.attn_layer_names`).
-   3. Call `self.mtp_model.forward(input_ids, positions, hidden_states=
-      <target's own last hidden state from step 1's call>, spec_step_idx=0)`
-      under `set_forward_context` scoped to the MTP layer's metadata.
-   This roughly DOUBLES the number of real forward passes per step
-   (target + draft-sync), though the draft model's own single decoder
-   layer is far cheaper per token than the full 64-layer target model.
-   For the CUDA-Graph-captured path specifically, this sync call would
-   need to be captured as part of the SAME graph (or a second, chained
-   graph) to keep the "no Python-level dispatch per step" property this
-   round's CUDA Graph work established.
+   3. Calls `self.mtp_model.forward(input_ids, positions, hidden_states=
+      <target's own last hidden state from this step's call>,
+      spec_step_idx=0)` under `set_forward_context` scoped to the MTP
+      layer's metadata.
+   This still roughly DOUBLES the number of real forward passes per
+   step (target + draft-sync), and the CUDA-Graph-captured path still
+   needs this sync call captured as part of the SAME graph (or a
+   second, chained graph) to keep the "no Python-level dispatch per
+   step" property this round's CUDA Graph work established -- the
+   sol-driven change is about WHERE in the code the call lives (one
+   funnel point), not whether the call itself can be skipped or made
+   cheaper.
 
 **D. The K-step autoregressive propose loop** (only needed once C above
 provides a synced draft KV cache and an initial `draft_tokens[0]`, i.e.
@@ -1945,10 +1996,22 @@ this is layered ON TOP of C, not a replacement for it): for
 previous_draft_token, positions=advancing by 1, hidden_states=
 previous step's own output hidden state, spec_step_idx=step)`
 (`spec_step_idx % num_mtp_layers` always resolves to layer 0 here, since
-`num_nextn_predict_layers=1` for this model -- confirmed via
-`qwen3_next_mtp.py`'s own `Qwen3NextMultiTokenPredictor.__init__`), each
+`mtp_num_hidden_layers=1` for this checkpoint -- confirmed via
+`qwen3_5_mtp.py`'s own `Qwen3_5MultiTokenPredictor.__init__`), each
 extending the draft model's own KV cache by one more position at the
 SAME physical slot.
+
+**Per-slot state to track (sol's explicit reminder)**: the centralized
+state machine in C/D/E needs each of the 4 fixed slots to carry, at
+minimum: `committed_len` (target-confirmed sequence length),
+`draft_sync_len` (how far the draft model's own KV cache has been
+advanced -- these two are DIFFERENT quantities and must not be
+conflated, see the `_forward_batch` reminder below), pending draft
+token ids awaiting verification, the KV physical-address range written
+speculatively this round (so a rejection knows what was written but
+never gets "confirmed"), and a GDN snapshot generation/version counter
+(so a stale snapshot can never be restored by mistake once a later
+snapshot has superseded it).
 
 **E. Wiring the two already-verified pieces into a real cycle**: submit
 `[anchor] + draft_tokens` through the ALREADY-WORKING
@@ -1987,7 +2050,7 @@ fundamental "how much does removing scheduling overhead actually save"
 signal, with a rigorous real-draft-model implementation as a separate
 follow-up task. Evaluated concretely:
 
-**Proposed mechanism**: instead of loading `Qwen3NextMTP` at all, use
+**Proposed mechanism**: instead of loading `Qwen3_5MTP` at all, use
 the TARGET model's own already-verified, already-CUDA-graph-capable
 qo_len=1 decode path to generate K "draft" tokens via K genuine
 sequential single-token greedy decodes (self-drafting), then submit
@@ -2041,3 +2104,179 @@ getting an early performance signal this way. Not started this round
 implementing it would be a small, low-risk addition on top of already-
 built and already-verified infrastructure whenever the next round picks
 it up.
+
+## 2026-07-17, second follow-up: independent Codex-sol analysis returned — one real correction accepted, one refinement accepted; trace-driven scheduling-overhead probe (sol's two-phase route, phase 1) built, run, and stable
+
+### Correction accepted and applied throughout this document
+
+The coordinator's parallel Codex-sol analysis of the "does the draft
+model need every-step sync" question caught a real error in the two
+sections above: they cited `vllm/model_executor/models/qwen3_next_mtp.py`
+(`Qwen3NextMTP`) as the draft model class. **Independently re-verified
+before accepting** (not taken on trust): read this project's actual
+target checkpoint's `config.json`
+(`/home/bot/.cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4/
+snapshots/.../config.json`) directly — top-level `model_type: "qwen3_5"`,
+nested `text_config.model_type: "qwen3_5_text"`,
+`mtp_num_hidden_layers: 1`. Then read `vllm/config/speculative.py:500-509`
+directly, confirming `hf_config.model_type in ("qwen3_5", "qwen3_5_moe")`
+is rewritten to `"qwen3_5_mtp"` / `architectures=["Qwen3_5MTP"]` (not
+`Qwen3NextMTP`, which serves the unrelated `qwen3_next` model type), and
+`vllm/model_executor/models/qwen3_5_mtp.py` directly, confirming
+`Qwen3_5MTP` (line 192) wraps `Qwen3_5MultiTokenPredictor` (line 63) as
+`self.model`, with `self.num_mtp_layers = getattr(config,
+"mtp_num_hidden_layers", 1)` (line 79) — matching the checkpoint's real
+field name. All wrong references in the two sections above have been
+corrected in place, with inline correction notes marking what was wrong
+and why (the architectural conclusions were never wrong, only the
+specific file/class/field names).
+
+### Refinement accepted: sync must be per-round, but the call site can be centralized, not scattered
+
+Sol also refined the "must sync every step, no lighter alternative"
+conclusion: a precise deferred/lazy catch-up sync is theoretically
+possible, but the margin is narrow for this project's actual workload
+(K=3, propose every round, no idle gap to defer into — deferred sync
+would degrade to a first-pass every round anyway, no real saving). The
+accurate framing, now applied to the worst-case redesign scope section
+above: draft sync must be part of every round's state machine, but the
+CALL SITE does not need to be duplicated into every public forward
+entry point — it can live at ONE centralized funnel point (the
+target-forward/verify-propose boundary), which every public entry point
+routes through. This is a real softening of the original "restructure
+every real forward call site" framing, though the underlying sync cost
+itself (roughly doubling forward-pass count per round) is unchanged.
+Also incorporated: the specific per-slot state fields a centralized
+state machine needs to track (`committed_len`, `draft_sync_len`,
+pending draft tokens, speculative-write KV range, GDN snapshot
+generation) and two concrete code-level reminders — `snapshot_gdn_state`
+uses CPU clones (fine for the current correctness-verification stage,
+but should become pre-allocated GPU buffers before any graph-capture
+integration), and `_forward_batch` currently conflates "positions
+physically written speculatively" with "positions actually committed"
+(advances `slot_kv_len` by the full `qo_len` unconditionally) — a real
+gap for a future live multi-round loop, though not yet triggered by any
+existing test (each of `mtp_accept_reject_check.py`'s scenarios uses a
+fresh slot exactly once, never continuing after a partial-accept verify
+call, so the conflation never surfaces there).
+
+### Adopted: sol's two-phase route
+
+1. **Phase 1 (this round)**: a strictly time-boxed trace-driven
+   scheduling-overhead probe — no real drafter, a synthetic accept/reject
+   trace drives the real, already-verified production mechanisms
+   (`verify_batch`, GDN snapshot/restore, committed-length recompute),
+   measuring ONLY control-plane/scheduling overhead. Any acceptance-rate
+   or accepted-tokens/s number from this probe MUST be labeled a
+   controlled-trace scheduling-overhead upper-bound estimate, never a
+   real MTP performance/acceptance conclusion, never a substitute for
+   the real W1/W2 ≤1pp acceptance-rate gate.
+2. **Phase 2 (next round, not started this round)**: regardless of
+   phase 1's result, move to "Option A" — the faithful centralized
+   incremental MTP state machine: load the real `Qwen3_5MTP`, have the
+   unified target-forward boundary return both logits and hidden
+   states, sync the draft model and generate a proposal immediately
+   after every prefill/decode, verify then update target/draft KV
+   cursors and GDN state per accept/reject. Per-slot state to track:
+   `committed_len`/`draft_sync_len`/pending draft tokens/KV write
+   range/GDN snapshot generation (see above).
+
+### Phase 1 probe: implementation and results
+
+Built `benchmarks/mtp_trace_driven_probe.py`. Design: a seeded RNG
+generates, per round per slot, an `accept_len ∈ {0,1,2,3}` via K=3
+Bernoulli(p) trials (first failure truncates) — entirely SYNTHETIC, not
+derived from any real model prediction. Three `p` configs run
+back-to-back on the same 4 fixed slots (reset+re-prefilled between
+configs): `p=1.0` (best case / equivalent to the previously-proposed
+"self-drafting" upper bound), `p=0.65` (this project's own earlier real
+MTP measurement, used only as a representative shape, not re-derived
+here), `p=0.0` (worst case, every round rejects immediately). Per round:
+snapshot GDN state for all 4 slots (unconditional — a real system can't
+know the outcome ahead of time), run ONE real batched `verify_batch`
+call (qo_len=K+1=4, concurrency=4) with CUDA-event + wall-clock timing
+around it, then for every slot whose (synthetic) trace outcome is not
+full-accept: `restore_gdn_state`, manually correct `slot_kv_len` back
+down to the pre-verify length (fixing, for this script's own
+bookkeeping, the exact `_forward_batch` conflation noted above), then a
+real recompute forward of exactly the committed length, separately
+timed. 20 rounds per config, first 3 discarded as warmup, 17 measured.
+
+Ran twice (fresh process each time, checkpoint reload ~25s-137s
+depending on OS page cache) to check stability before treating the
+result as real — GPU/process state confirmed clean via `nvidia-smi`/`ps`
+before each run, per standing discipline. **Results were stable across
+both runs** (both included below; not cherry-picked):
+
+| config | run 1 GPU-busy% | run 2 GPU-busy% | run 1 avg wall/round | run 2 avg wall/round |
+|---|---|---|---|---|
+| best_case (p=1.0) | 101.5% | 98.8% | 100.75 ms | 104.40 ms |
+| realistic (p=0.65) | 99.2% | 100.2% | 342.78 ms | 325.49 ms |
+| worst_case (p=0.0) | 99.8% | 98.1% | 405.66 ms | 421.39 ms |
+
+(GPU-busy% values slightly over 100% are CUDA-event/wall-clock
+measurement noise at this small a gap, not a real physical
+impossibility — the honest reading is "indistinguishable from 100%
+within measurement noise," not "somehow more than 100%.")
+
+**Finding: GPU-busy% is ~98-101% across ALL THREE trace configs,
+i.e. indistinguishable from 100% regardless of how much rollback/
+recompute work each round does.** Launch-gap (wall-clock time NOT spent
+executing real GPU kernels) is ~0%, at or below measurement noise, in
+every configuration tested.
+
+**Interpretation (this is real signal, not a null result)**: for THIS
+workload's shape — a 64-layer, 27B-parameter, batch=4, qo_len=4
+verify-or-recompute forward pass — the actual GPU compute (100-420ms
+per round depending on config) completely dwarfs any Python-level
+dispatch/launch overhead (which would be single-digit milliseconds at
+most). This means:
+- **This project's OWN direct-runner call sequence has essentially zero
+  residual per-call scheduling overhead already**, even in plain eager
+  mode with `torch.cuda.synchronize()` forced after every model call.
+  There is no further "squeeze the launch gap" optimization available
+  at THIS granularity — CUDA graph capture would not measurably improve
+  per-round GPU utilization here, because there is no gap left to
+  remove.
+- This does **NOT** mean the whole "remove scheduling overhead" premise
+  behind this runtime is wrong. It means the overhead this project is
+  actually trying to eliminate lives ELSEWHERE — in native vLLM's own
+  Python scheduler/block-manager/sampling/HTTP-layer cost PER STEP, none
+  of which exists in this minimal direct runner's call path at all (it
+  was never built to have that overhead, by construction) and NONE of
+  which this probe measures (this probe only exercises OUR OWN kernel
+  dispatch, not a comparison against native vLLM's overhead). The real
+  answer to "how much do we save vs. native" still requires the actual
+  W1/W2 concurrency=4 MTP K=3 comparison against real vLLM (task #85 in
+  this project's tracker), still blocked on real draft-model
+  integration.
+- **A genuinely useful, if narrower, reading of this result**: since our
+  own runtime's residual overhead is already ~0%, any overhead gap the
+  eventual real W1/W2 comparison finds against native vLLM is a
+  GENUINE, FULLY CAPTURABLE win — it won't be partially eaten by
+  residual dispatch cost in our own call path, because there isn't any
+  at this granularity. This is a positive signal for continuing the
+  Phase 2 investment, not a negative one.
+- **A caveat on method, stated honestly**: `_forward_batch`/`verify_batch`
+  force `torch.cuda.synchronize()` twice per call (after `forward()` and
+  after `compute_logits()`), which by construction prevents any
+  cross-call async pipelining from being observed. A more aggressive
+  design (e.g. CUDA-graph-batched multi-round replay, issuing round N+1
+  before round N's results are consumed) could in principle expose
+  overlap this measurement methodology cannot see — but that is
+  precisely the kind of optimization only relevant when individual
+  kernel calls are SMALL relative to Python dispatch cost (e.g. a plain
+  single-token decode-shaped call), not for this MTP-verify-shaped
+  workload where each call is already a large, compute-dominated chunk.
+  This caveat, not a contradiction of the finding above, is why "capture
+  graph" is explicitly the LAST step of sol's verification gradient, not
+  an earlier one — its value is likely concentrated in smaller,
+  decode-shaped calls, not in this verify/recompute shape.
+
+**Scope discipline**: per the coordinator's explicit instruction ("这一轮
+先做探针(阶段1)...严格限时"), Phase 2 (loading the real `Qwen3_5MTP`,
+building the full centralized state machine) was NOT started this
+round, despite sol's overall recommendation to move to it "immediately,
+regardless of phase 1's result" — that instruction describes the
+recommended route across rounds, not a mandate to compress both phases
+into one. Phase 2 remains the explicit next step.

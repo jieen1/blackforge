@@ -490,6 +490,22 @@ small test value).
 
 ### Phase 3, MTP semantics round (2026-07-17) — accept/reject + GDN rollback implemented and verified; real draft generation investigated in depth, honestly deferred (more scope than estimated)
 
+> **2026-07-17 correction** (caught by an independent Codex-sol analysis,
+> verified against the real checkpoint's `config.json` + vLLM source
+> before accepting): every `Qwen3NextMTP`/`qwen3_next_mtp.py` reference
+> below is the WRONG class for this project's actual target checkpoint.
+> `unsloth/Qwen3.6-27B-NVFP4` has `model_type: "qwen3_5"`, which vLLM's
+> `SpeculativeConfig` routes to `Qwen3_5MTP`/`Qwen3_5MultiTokenPredictor`
+> (`vllm/model_executor/models/qwen3_5_mtp.py`), a different file/class
+> serving a different `model_type` (`qwen3_next_mtp.py` is for the
+> unrelated `qwen3_next` model family). Field name is
+> `mtp_num_hidden_layers`, not `num_nextn_predict_layers`. The
+> architectural conclusion below (separate small model, own
+> full-attention KV cache, every-step sync) was never wrong, only these
+> specific names were — left as originally written below since this is
+> a historical log entry; see `notes/direct-model-runner-design.md`
+> for the corrected version and the fully fixed writeup.
+
 Read `项目实施规划.md`'s actual contract first, per instruction, before
 designing anything: Phase 8 says "先完整复现 vLLM 的 MTP K=3" (replicate
 vLLM's real mechanism, don't invent a simplified one); Phase 1's gate
@@ -580,27 +596,42 @@ own attention layer a gap-free causal history — a transformer attention
 layer has no valid "catch up later," every position must be written in
 order or later positions attend over a hole.
 
+> **2026-07-17 correction** (caught by the independent Codex-sol analysis
+> mentioned below, verified against the checkpoint's real `config.json`
+> before accepting): the draft model class this section originally
+> named is wrong — see the correction note in the "MTP semantics round"
+> entry above. Corrected below to `Qwen3_5MTP`/`Qwen3_5MultiTokenPredictor`
+> / `mtp_num_hidden_layers`. Point C is additionally refined per sol
+> (see below): the sync call needs to be part of every round's state
+> machine, but does NOT need to be duplicated into every public forward
+> entry point — it can be centralized at one funnel point.
+
 **Worst-case redesign scope** (design-level only): (A) model loading —
-add `speculative_config` to `build_vllm_config`, load `Qwen3NextMTP` via
+add `speculative_config` to `build_vllm_config`, load `Qwen3_5MTP` via
 a second `get_model()` call BEFORE KV-cache allocation so its attention
 layer auto-registers into the existing allocation machinery (small,
 low-risk, reuses existing generic code). (B) KV sizing — draft model's
 own attention layer needs the same per-slot capacity as the target's 16
 full-attention layers; ~1/16 ≈ 6.25% more attention-KV memory per slot,
-GDN memory unaffected (MTP model has no GDN layers). (C) **the expensive
-part**: every real forward call site (`prefill`/`decode`/`_forward`/
-`_forward_batch`, plus `CapturedBatchDecodeGraph.replay()`) needs a
-matching draft-model forward call added immediately after the target's
-own forward+logits — roughly doubles real forward-pass count per step
-(draft model's single decoder layer is cheap per-token, but the sync
-call itself is pervasive, touching every call site including the
-CUDA-Graph-captured path). (D) the K-step autoregressive propose loop
-layers on top of C once a synced draft KV cache exists. (E) wiring
-already-verified `verify_batch`/`determine_accept_reject`/
-`snapshot_gdn_state`/`restore_gdn_state` into a real cycle — comparatively
+GDN memory unaffected (draft model has no GDN layers). (C) **the
+expensive part, revised**: rather than duplicating a draft-model call
+into every public forward entry point (`prefill`/`decode`/`_forward`/
+`_forward_batch` individually), centralize it at the ONE point they all
+already funnel through — right after the target model's own
+forward+logits produce this step's hidden state — via a single internal
+method every entry point calls through. This still roughly doubles real
+forward-pass count per step and the CUDA-Graph-captured path still needs
+it captured as part of the same graph; the change from the original
+write-up is WHERE the call lives (one funnel point, not scattered), not
+whether it can be skipped or made cheaper. (D) the K-step autoregressive
+propose loop layers on top of C once a synced draft KV cache exists. (E)
+wiring already-verified `verify_batch`/`determine_accept_reject`/
+`snapshot_gdn_state`/`restore_gdn_state` into a real cycle, tracking
+per-slot `committed_len`/`draft_sync_len`/pending draft tokens/
+speculative-write KV range/GDN snapshot generation — comparatively
 contained once C exists. **Bottom line: A-B-D-E are small/contained, C
-is the real cost driver** (consistent with the prior round's "more
-invasive than a simple propose loop" finding).
+is the real cost driver**, though C is one centralized funnel point, not
+a sprawl across the whole runtime (softer than the original write-up).
 
 **Pragmatic fallback evaluated**: self-drafting — feed K real greedy
 single-token decodes (via the already-verified qo_len=1 path) as the
@@ -615,18 +646,74 @@ measurement for real MTP on this model — must be reported as an
 explicitly-labeled optimistic upper bound on accepted-tokens/s, never
 conflated with a real acceptance-rate number, and does not by itself
 satisfy Phase 8's "faithfully replicate vLLM's MTP" mandate.
-**Recommendation**: reasonable as an early, clearly-caveated performance
-signal while real draft-model integration (section C) is scoped as its
-own round, provided that real work isn't quietly dropped once an early
-number is in hand. Not implemented this round (design-only scope); a
-small, low-risk addition on top of existing verified pieces whenever
-picked up.
 
-**Status**: a parallel independent (Codex-sol) analysis of the same
-architectural question was requested by the coordinator and was still
-running as of this write-up — not waited on, per instruction. This
-section is written so that once it returns, decisions can be made
-without re-discussing the evidence from scratch.
+**Sol's independent analysis returned** (see the next section for the
+adopted two-phase route and this round's actual probe work): confirmed
+the architecture-level conclusion (separate model, own KV cache, every
+real step needs sync) but caught the wrong-class error above, refined
+"restructure the whole forward path" down to "centralize at one
+boundary," and recommended a strictly time-boxed trace-driven
+performance probe (no real drafter) before committing to the full
+faithful integration — adopted, see next section.
+
+### Phase 3, trace-driven scheduling-overhead probe (2026-07-17) — sol's Phase 1, GPU-busy% ~100% found and confirmed stable across 2 runs
+
+Full detail in `notes/direct-model-runner-design.md`'s "second follow-up"
+section. Independent Codex-sol analysis returned this round; two things
+accepted after independent re-verification (checked the real
+checkpoint's `config.json` + vLLM source directly, not taken on trust):
+(1) the wrong-draft-model-class error in the prior round's sections
+(corrected there in place — `Qwen3_5MTP`/`Qwen3_5MultiTokenPredictor`
+from `qwen3_5_mtp.py`, not `Qwen3NextMTP`), (2) the "must sync every
+step" conclusion refined to "must be part of every round's state
+machine, but the call site can be centralized at one funnel point, not
+scattered into every public forward entry point."
+
+Built and ran `benchmarks/mtp_trace_driven_probe.py` (sol's recommended
+"方案C", strictly time-boxed, this round's actual scope): NO real
+drafter — a synthetic, seeded accept/reject trace (K=3 Bernoulli(p)
+per-token trials) drives the real, already-verified `verify_batch`
+(qo_len=4, concurrency=4), `snapshot_gdn_state`/`restore_gdn_state`, and
+a real committed-length recompute forward on any non-full-accept round —
+measuring ONLY control-plane/scheduling overhead via CUDA-event
+GPU-busy-time vs. wall-clock time. GPU/process state confirmed clean via
+`nvidia-smi`/`ps` before each run, per standing discipline.
+
+**Result, stable across 2 independent runs (fresh process each time,
+not cherry-picked)**: GPU-busy% is ~98-101% (indistinguishable from
+100% within measurement noise) across ALL THREE tested configs
+(p=1.0 best-case/never-reject, p=0.65 realistic-shape, p=0.0
+worst-case/always-reject) — i.e. essentially ZERO launch-gap/scheduling
+overhead in this runtime's own eager-mode call sequence, regardless of
+how much rollback/recompute work each round does.
+
+**Interpretation**: for this workload's shape (64-layer/27B/batch=4/
+qo_len=4 forward), real GPU compute (100-420ms/round) already dwarfs any
+Python dispatch cost — this runtime's OWN call path has no further
+launch-gap to squeeze via CUDA graphs at this granularity. This does NOT
+undercut the project's premise: the overhead being targeted lives in
+native vLLM's Python scheduler/block-manager/HTTP layer, which this
+minimal runtime never had in the first place (by construction) and which
+this probe doesn't measure at all — the real answer still needs the
+actual W1/W2 vs. native comparison (task #85, still blocked on real
+draft-model integration). The useful takeaway: since our own residual
+overhead is already ~0%, any gap that comparison finds is a fully
+capturable win, not partially eaten by our own dispatch cost — a
+positive signal for continuing the Phase 2 investment. Caveat stated
+honestly: `_forward_batch`/`verify_batch`'s forced double
+`torch.cuda.synchronize()` per call structurally prevents observing any
+cross-call async pipelining — the kind of gain CUDA graphs mainly help
+with tends to matter for SMALL, decode-shaped calls, not this
+large/compute-dominated verify shape, consistent with "capture graph"
+being the last step of sol's verification gradient, not an early one.
+
+**Scope discipline**: per the coordinator's explicit "这一轮先做探针(阶段1)…
+严格限时" instruction, Phase 2 (loading real `Qwen3_5MTP`, building the
+full centralized incremental MTP state machine) was NOT started this
+round, despite sol's overall recommendation to move to it immediately
+regardless of phase 1's result — that describes the recommended route
+across rounds, not a mandate to compress both into one round. Phase 2
+remains the explicit next step.
 
 ### Phase 3, main-line redirect (2026-07-16) — direct model runner, replacing the HTTP bridge
 
