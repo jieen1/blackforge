@@ -3258,3 +3258,110 @@ Per the coordinator's explicit spec:
    framing; no new implementation needed for this point beyond already
    having `-S`/`-R` cleanly separated, which this round's work
    establishes.
+
+## 2026-07-17, expanded W1-S sample: the gap collapses to 1.34pp -- the earlier 6.45pp WAS small-sample noise
+
+Per the coordinator's own rigorous re-derivation of the required sample
+size (redone independently here too, see below -- both landed close):
+expanded the frozen fixture from 16 to 128 requests and re-measured.
+**Result: the gap that looked real at n=16 (6.45pp) collapsed to 1.34
+percentage points at n=64 (this runtime) vs. n=128 (native) -- well
+within statistical noise (<1 combined standard error either way it's
+computed).** This directly answers the open question from the previous
+round: the 6.45pp (and, further back, 12.15pp/3.1pp) gaps were NOT
+evidence of a stable mechanism difference -- they were small-sample
+volatility, exactly the kind the trajectory-level stdev (~15-16pp) had
+already flagged as a real risk.
+
+### Rigorous sample-size recomputation (redone independently, not just adopting the coordinator's rough estimate)
+
+The coordinator's own quick estimate (`n≈(16.24/2)²≈66`) used a
+single-sample SE formula. Redone with the proper two-sample
+difference-of-means formula (`SE_diff = σ√(1/n₁+1/n₂)`, appropriate
+since BOTH sides carry independent sampling variance, not just one):
+achieving 3 combined SEs at the observed 6.45pp gap and σ≈16.24pp
+requires **n≈114 per side** if both sides have equal n -- notably more
+than the coordinator's rough n≈66. The practical resolution used here:
+since native is CHEAP to scale (a few minutes even at n=128) while this
+runtime is the expensive side (single-slot, non-batched processing),
+giving native a much larger n so its OWN contribution to the combined
+SE becomes small lets this runtime's side target a smaller, more
+practically-achievable n while still getting most of the statistical
+benefit -- native n=128, this runtime n=64 was the chosen split.
+
+### A real infrastructure incident during this round, root-caused and fixed (not glossed over)
+
+A server-launch attempt appeared to hang, was killed via the Bash
+tool's own interactive timeout, and was believed dead -- but its
+`nohup`'d child process had actually SURVIVED that timeout (a real,
+now-understood property of this environment: a backgrounded `& disown`
+child can outlive the specific foreground command that spawned it, even
+when that foreground wrapper gets killed). A second launch attempt was
+then started without realizing the first was still alive, and the two
+collided on the same port (8100), producing a confusing intermediate
+state (`nvidia-smi` briefly showed near-idle GPU while `ps aux`
+separately revealed an actively-CPU-bound `VLLM::EngineCore` process --
+GPU-idle does NOT mean "dead," it can mean "still in the CPU-bound
+model-loading phase before any GPU work starts," an important
+distinction this project's own "verify before trusting" discipline
+needed to internalize more precisely). Root-caused via direct `ps
+aux --sort=-%mem` inspection (found two live `launch_test_server.py`
+processes, not zero), fixed with the project's own established
+`stop_test_server.py` (found and killed all 8 related PIDs across both
+generations cleanly), then relaunched exactly once, cleanly, with an
+explicit death-detection check added to the readiness-wait loop this
+time (`kill -0`/`pgrep` check inside the `until` loop, so a genuinely
+dead launcher is reported immediately instead of looping forever).
+
+### Results
+
+**Native, n=128** (up from n=16's 79.51%): **72.59%** acceptance rate,
+6418 drafts, 129.8s wall time. Notably LOWER than the n=16 measurement
+-- itself further evidence that native's own small-sample number was
+volatile, not just this runtime's.
+
+**This runtime, n=64** (up from n=16's 73.06%): **71.25%** acceptance
+rate, 5246 drafts, 1446.4s (24.1 min) wall time -- reasonably close to
+the pre-run empirical estimate (~20 min, from the 235ms/draft rate
+measured in an earlier long run). Per-trajectory stdev at n=64:
+**15.50pp** (min 46.73%, max 97.95%) -- consistent with the n=16
+estimate (16.24pp), reinforcing that the trajectory-level variance
+estimate itself is stable even as n grows.
+
+| | n | Acceptance rate | Drafts |
+|---|---|---|---|
+| Native vLLM | 128 | **72.59%** | 6418 |
+| This runtime | 64 | **71.25%** | 5246 |
+| **Gap** | -- | **1.34pp** | -- |
+
+Combined SE (assuming similar ~15.5pp variance on both sides,
+`σ√(1/64+1/128)`): **2.37pp** -- gap/SE = **0.56**. Using only this
+runtime's own SE (`15.50/√64=1.94pp`) as a simpler, more conservative
+single-sample comparison: gap/SE = **0.69**. Either convention puts the
+1.34pp gap at well under 1 combined standard error -- not merely
+"improved," genuinely indistinguishable from zero at this sample size.
+
+### Interpretation
+
+The whole arc of this investigation (12.15pp depth-confounded → 6.45pp
+n=16 frozen-pair → 1.34pp n=64/n=128) is itself the finding: acceptance
+rate for this MTP implementation, measured carefully, shows NO evidence
+of a stable, real gap against native vLLM at the controlled-synthetic
+256-token shape. The earlier, larger numbers were successively-resolved
+confounds (temperature, input distribution, generation depth) plus,
+finally, small-sample noise -- each ruled out by direct measurement,
+not by assumption. This is a genuinely reassuring result for the
+project's core question ("does the direct-runtime MTP implementation
+actually work as well as native's"), though it applies specifically to
+the controlled-synthetic (`-S`) line's mechanism-alignment purpose --
+the representative (`-R`) line (real agent traffic, real production
+sampling profile, accepted-tokens/s as the actual gate) remains the
+step needed before a final accept/reject decision, per this round's
+adopted plan.
+
+### Not attempted this round
+
+W2-S (depth-bucketed degeneration test) and W1-R/W2-R (representative
+workload) remain as designed in the earlier section -- not built this
+round; this round's time went to resolving the n=16→n=64/128 sample-size
+question decisively, which was the coordinator's explicit priority.

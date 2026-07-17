@@ -33,7 +33,9 @@ import time
 
 import aiohttp
 
-from benchmarks.workloads import W1_S_FIXTURE, load_prompt_token_ids
+from benchmarks.workloads import W1_S_FIXTURE, W1_S_FIXTURE_N128, load_prompt_token_ids
+
+FIXTURES = {"n16": W1_S_FIXTURE, "n128": W1_S_FIXTURE_N128}
 
 
 async def _fetch_spec_decode_counters(base_url: str, session: aiohttp.ClientSession) -> dict:
@@ -102,10 +104,11 @@ async def _send_one(
 
 
 async def _run_once(
-    port: int, model: str, max_tokens: int, temperature: float, concurrency: int
+    port: int, model: str, max_tokens: int, temperature: float, concurrency: int, fixture_key: str
 ) -> dict:
     base_url = f"http://127.0.0.1:{port}"
-    prompts = load_prompt_token_ids(W1_S_FIXTURE)
+    fixture = FIXTURES[fixture_key]
+    prompts = load_prompt_token_ids(fixture)
 
     async with aiohttp.ClientSession() as session:
         before = await _fetch_spec_decode_counters(base_url, session)
@@ -154,8 +157,8 @@ async def _run_once(
         ),
         "mean_acceptance_length": 1 + (delta_accepted / delta_drafts) if delta_drafts > 0 else float("nan"),
         "per_position_acceptance_rate": per_position_rate,
-        "fixture": W1_S_FIXTURE.path,
-        "fixture_seed": W1_S_FIXTURE.seed,
+        "fixture": fixture.path,
+        "fixture_seed": fixture.seed,
     }
 
 
@@ -166,10 +169,11 @@ def main() -> int:
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--concurrency", type=int, default=4)
+    parser.add_argument("--fixture", choices=list(FIXTURES.keys()), default="n16")
     args = parser.parse_args()
 
     result = asyncio.run(
-        _run_once(args.port, args.model, args.max_tokens, args.temperature, args.concurrency)
+        _run_once(args.port, args.model, args.max_tokens, args.temperature, args.concurrency, args.fixture)
     )
     print(json.dumps(result, indent=2, default=str))
     return 0 if result.get("passed") else 1

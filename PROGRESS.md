@@ -656,6 +656,58 @@ boundary," and recommended a strictly time-boxed trace-driven
 performance probe (no real drafter) before committing to the full
 faithful integration — adopted, see next section.
 
+### Phase 3, expanded W1-S sample (2026-07-17) — the 6.45pp gap collapses to 1.34pp: it WAS small-sample noise
+
+Full detail in `notes/direct-model-runner-design.md`. Expanded the
+frozen fixture from 16 to 128 requests. Redid the required-sample-size
+calculation independently (proper two-sample `SE_diff=σ√(1/n₁+1/n₂)`
+formula, not the coordinator's quicker single-sample estimate): 3
+combined SEs at the observed gap/variance needs n≈114 per side if
+equal — since native is cheap to scale (a few minutes even at n=128)
+and this runtime is the expensive side (single-slot, non-batched),
+gave native n=128 and this runtime n=64, trading a bit of statistical
+purity for a practical ~24-minute runtime instead of ~114-per-side's
+much longer cost.
+
+**A real infrastructure incident this round, root-caused and fixed**: a
+server launch appeared to hang and was killed via the Bash tool's own
+timeout — but its `nohup`'d child had actually survived that kill,
+and a second launch attempt then collided with the still-alive first
+one on the same port, producing a confusing state where `nvidia-smi`
+briefly looked idle while `ps aux` separately showed an actively
+CPU-bound process still loading (GPU-idle does NOT mean "dead" — it
+can mean "still in the CPU-bound loading phase before any GPU work
+starts"). Root-caused via `ps aux --sort=-%mem` (found two live
+launcher processes, not zero), cleaned up with the project's own
+`stop_test_server.py`, relaunched exactly once with an added
+death-detection check in the readiness-wait loop.
+
+**Results**: native n=128 → **72.59%** (6418 drafts, down from n=16's
+79.51%, itself confirming native's own earlier number was volatile
+too). This runtime n=64 → **71.25%** (5246 drafts, 24.1 min, stdev
+15.50pp — consistent with the n=16 estimate of 16.24pp). **Gap: 1.34
+percentage points.** Combined SE (assuming similar variance both
+sides): 2.37pp → gap/SE = **0.56**. Using only this runtime's own SE
+(1.94pp): gap/SE = **0.69**. Either way, well under 1 combined SE —
+not just "smaller," genuinely indistinguishable from zero at this
+sample size.
+
+**Conclusion**: the whole arc (12.15pp depth-confounded → 6.45pp n=16
+frozen-pair → 1.34pp n=64/128) is itself the finding — each larger
+number was a real, successively-identified-and-ruled-out confound
+(temperature, input distribution, generation depth, and finally
+small-sample noise), not evidence of a stable mechanism gap. This
+runtime's MTP acceptance rate shows no measurable difference from
+native's at the controlled-synthetic 256-token shape. Still specific to
+the `-S` (mechanism-alignment) line — the `-R` (representative
+workload, real traffic, accepted-tokens/s as the actual gate) line
+remains the step before a final accept/reject decision.
+
+**Not attempted this round**: W2-S (depth-bucketed degeneration test)
+and W1-R/W2-R (representative workload) — deferred as before, this
+round's time went to resolving the sample-size question the
+coordinator explicitly prioritized.
+
 ### Phase 3, Codex-sol's adopted plan (c): rigorous W1-S methodology built (2026-07-17) — two independent benchmark lines, frozen-token-paired 256-token result is 6.45pp (down from the depth-confounded 12.15pp)
 
 Full detail in `notes/direct-model-runner-design.md`. Codex-sol's

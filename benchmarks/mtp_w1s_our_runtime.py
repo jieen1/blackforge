@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 
 os.environ.setdefault("USE_LIBUV", "0")
 os.environ.setdefault("SM120_GQA_USE_V2_DECODE_KERNEL", "1")
@@ -71,30 +72,46 @@ def _run_batch(runner, prompts_batch: list[list[int]], target_output_len: int) -
     return [per_slot_stats[s] for s in slots]
 
 
-def _run_once(max_tokens: int, concurrency: int) -> dict:
+def _run_once(max_tokens: int, concurrency: int, fixture_key: str, num_requests: int | None = None) -> dict:
     sys.path.insert(0, SM120_VLLM_INTEGRATION)
     import register_sm120_backend  # noqa: F401
 
-    from benchmarks.workloads import W1_S_FIXTURE, load_prompt_token_ids
+    from benchmarks.workloads import W1_S_FIXTURE, W1_S_FIXTURE_N128, load_prompt_token_ids
     from runtime.direct_model_runner import DirectModelRunner, build_vllm_config
 
-    prompts = load_prompt_token_ids(W1_S_FIXTURE)
+    fixture = {"n16": W1_S_FIXTURE, "n128": W1_S_FIXTURE_N128}[fixture_key]
+    prompts = load_prompt_token_ids(fixture)
+    if num_requests is not None:
+        # A prefix of an already-frozen fixture is still exactly
+        # reproducible (no new fixture file needed) -- the frozen file's
+        # own generation formula produces request i's prompt independent
+        # of how many total requests follow it.
+        prompts = prompts[:num_requests]
 
     vllm_config = build_vllm_config(
         model=MODEL,
         kv_cache_dtype="fp8_e4m3",
-        max_model_len=max(40960, W1_S_FIXTURE.prompt_len + max_tokens + 1024),
+        max_model_len=max(40960, fixture.prompt_len + max_tokens + 1024),
         gpu_memory_utilization=0.85,
         speculative_config={"method": "mtp", "num_speculative_tokens": K, "attention_backend": "CUSTOM"},
     )
     runner = DirectModelRunner(vllm_config, num_slots=concurrency, block_size=16, blocks_per_slot=2560)
 
     per_trajectory: list[dict] = []
-    for batch_start in range(0, len(prompts), concurrency):
+    t_start = time.perf_counter()
+    num_batches = (len(prompts) + concurrency - 1) // concurrency
+    for batch_idx, batch_start in enumerate(range(0, len(prompts), concurrency)):
         batch = prompts[batch_start : batch_start + concurrency]
         batch_stats = _run_batch(runner, batch, max_tokens)
         per_trajectory.extend(batch_stats)
+        elapsed = time.perf_counter() - t_start
+        print(
+            f"  ... batch {batch_idx + 1}/{num_batches} done "
+            f"({len(per_trajectory)}/{len(prompts)} trajectories, {elapsed:.0f}s elapsed)",
+            flush=True,
+        )
 
+    wall_s = time.perf_counter() - t_start
     total_drafts = sum(t["num_drafts"] for t in per_trajectory)
     total_draft_tokens = sum(t["num_draft_tokens"] for t in per_trajectory)
     total_accepted = sum(t["num_accepted_tokens"] for t in per_trajectory)
@@ -115,14 +132,15 @@ def _run_once(max_tokens: int, concurrency: int) -> dict:
         "max_tokens": max_tokens,
         "concurrency": concurrency,
         "k": K,
+        "wall_s": wall_s,
         "num_drafts": total_drafts,
         "num_draft_tokens": total_draft_tokens,
         "num_accepted_tokens": total_accepted,
         "draft_acceptance_rate_pct": total_accepted / total_draft_tokens * 100.0 if total_draft_tokens > 0 else float("nan"),
         "mean_acceptance_length": 1 + (total_accepted / total_drafts) if total_drafts > 0 else float("nan"),
         "per_trajectory_acceptance_rate_pct": per_trajectory_rates,
-        "fixture": W1_S_FIXTURE.path,
-        "fixture_seed": W1_S_FIXTURE.seed,
+        "fixture": fixture.path,
+        "fixture_seed": fixture.seed,
     }
 
 
@@ -130,9 +148,11 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--concurrency", type=int, default=4)
+    parser.add_argument("--fixture", choices=["n16", "n128"], default="n16")
+    parser.add_argument("--num-requests", type=int, default=None, help="use only the first N of the fixture's prompts")
     args = parser.parse_args()
 
-    result = _run_once(args.max_tokens, args.concurrency)
+    result = _run_once(args.max_tokens, args.concurrency, args.fixture, args.num_requests)
 
     import json
 

@@ -28,7 +28,7 @@ import random
 
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
-from benchmarks.workloads import FIXTURES_DIR, W1_S_FIXTURE
+from benchmarks.workloads import FIXTURES_DIR, W1_S_FIXTURE, W1_S_FIXTURE_N128
 
 
 def _generate(fixture) -> dict:
@@ -61,11 +61,15 @@ def _generate(fixture) -> dict:
 
 def main() -> int:
     FIXTURES_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = FIXTURES_DIR / W1_S_FIXTURE.path
-    data = _generate(W1_S_FIXTURE)
-    with open(out_path, "w") as f:
-        json.dump(data, f)
-    print(f"wrote {out_path} ({len(data['prompt_token_ids'])} prompts x {W1_S_FIXTURE.prompt_len} tokens)")
+    for fixture in (W1_S_FIXTURE, W1_S_FIXTURE_N128):
+        out_path = FIXTURES_DIR / fixture.path
+        if out_path.exists():
+            print(f"skip (already exists, frozen): {out_path}")
+            continue
+        data = _generate(fixture)
+        with open(out_path, "w") as f:
+            json.dump(data, f)
+        print(f"wrote {out_path} ({len(data['prompt_token_ids'])} prompts x {fixture.prompt_len} tokens)")
     return 0
 
 

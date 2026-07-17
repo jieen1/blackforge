@@ -157,18 +157,38 @@ W2_S = Workload(
 # (32768in) fixture is not built this round -- see the design doc's
 # "not attempted this round" section.
 
+_W1_S_FORMULA = (
+    "allowed_tokens[(offset + request_index + arange(input_tokens)) "
+    "% len(allowed_tokens)], allowed_tokens = sorted(set(range(vocab_size)) "
+    "- set(tokenizer.all_special_ids)), offset = seeded per-request random draw "
+    "(matches vllm.benchmarks.datasets.datasets.RandomDataset.generate_token_sequence's "
+    "own formula, generated ONCE and frozen -- see generate_synthetic_fixtures.py)"
+)
+
 W1_S_FIXTURE = PromptFixture(
     path="w1s_prompts.json",
     tokenizer="unsloth/Qwen3.6-27B-NVFP4",
-    generation_formula=(
-        "allowed_tokens[(offset + request_index + arange(input_tokens)) "
-        "% len(allowed_tokens)], allowed_tokens = sorted(set(range(vocab_size)) "
-        "- set(tokenizer.all_special_ids)), offset = seeded per-request random draw "
-        "(matches vllm.benchmarks.datasets.datasets.RandomDataset.generate_token_sequence's "
-        "own formula, generated ONCE and frozen -- see generate_synthetic_fixtures.py)"
-    ),
+    generation_formula=_W1_S_FORMULA,
     seed=12345,
     num_requests=16,
+    prompt_len=4096,
+)
+
+# 2026-07-17 addition: the n=16 fixture above gave only ~1.6 combined
+# standard errors on the native-vs-this-runtime gap -- not decisive. This
+# larger, SEPARATELY frozen and versioned fixture (same seed, same
+# formula -- its first 16 entries are therefore bit-identical to
+# W1_S_FIXTURE's, a deliberate cross-check property, not a coincidence)
+# extends to num_requests=128 for a properly powered comparison. Kept as
+# a genuinely SEPARATE fixture file (not overwriting w1s_prompts.json) so
+# the original 16-request round's exact numbers remain independently
+# reproducible.
+W1_S_FIXTURE_N128 = PromptFixture(
+    path="w1s_prompts_n128.json",
+    tokenizer="unsloth/Qwen3.6-27B-NVFP4",
+    generation_formula=_W1_S_FORMULA,
+    seed=12345,
+    num_requests=128,
     prompt_len=4096,
 )
 
