@@ -1,13 +1,50 @@
-"""Frozen Phase 0 serving workloads.
+"""Frozen serving workload definitions.
 
-The runner is intentionally not implemented until the target model and vLLM
-launch command are pinned. These values are the contract for all comparisons.
+2026-07-17 extension (Codex-sol review, via the coordinator): the original
+Phase 0 contract (below, kept unchanged for `W1`/`W2` -- `tests/test_workloads
+.py` pins their `input_tokens`/`concurrency`) only carried length and
+concurrency. That is not enough to make an acceptance-rate/throughput
+comparison reproducible: an earlier round's W1 acceptance-rate investigation
+found THREE real confounds hiding in exactly the fields this file was
+missing -- sampling temperature (defaulted differently on each side),
+input token distribution (assumed "same formula" was enough; it wasn't
+precise enough for source-level reproducibility), and generation
+depth/length (this workload's own `output_tokens` interacts with a REAL
+acceptance-inflation effect for long unconstrained-greedy generation, see
+`W1_S`/`W2_S` below). `Workload` now carries every field an acceptance-rate
+or throughput comparison actually needs pinned: the exact tokenizer,
+sampling parameters, stop semantics, and (for the synthetic `-S` line) a
+path to FROZEN, VERSIONED prompt token ids -- not a regenerate-from-formula
+scheme, which is reproducible but not precise (two runs using "the same
+formula" can still diverge if `tokenizer.vocab_size`/`all_special_ids`
+differ across environments/versions).
+
+Two independent workload lines, per the coordinator's adopted "方案(c)":
+- `*_S` (controlled synthetic, e.g. `W1_S`/`W2_S`): mechanism alignment,
+  regression, fast debugging. Exact, frozen, versioned prompt token ids
+  (see `PromptFixture`/`load_prompt_token_ids`) so both sides -- native
+  vLLM and this project's own direct runtime -- are provably running the
+  IDENTICAL input, not just "the same distribution." Explicitly NOT
+  intended to answer "does this pass the acceptance-rate gate" by
+  itself (see `W1_S`/`W2_S`'s own docstring below on the generation-depth
+  caveat this line exists to isolate, not paper over).
+- `*_R` (representative, e.g. `W1_R`/`W2_R`, NOT YET DEFINED -- design
+  only this round, see notes/direct-model-runner-design.md): real
+  programming-agent traffic replay, for the actual go/no-go acceptance
+  decision. Per `项目实施规划.md`'s own original intent (confirmed
+  consistent with the coordinator's framing): the formal gate is
+  accepted-tokens/s + ITL + quality regression, NOT acceptance rate by
+  itself -- acceptance rate is an explanatory intermediate metric for
+  the `-S` line, never the final pass/fail criterion.
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+
+FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 
 @dataclass(frozen=True)
@@ -22,6 +59,118 @@ WORKLOADS = {
     "W1": Workload("W1", input_tokens=4096, output_tokens=1024, concurrency=(1, 4)),
     "W2": Workload("W2", input_tokens=32768, output_tokens=1024, concurrency=(1, 4)),
 }
+
+
+@dataclass(frozen=True)
+class SamplingConfig:
+    """Every field an acceptance-rate comparison must pin identically on
+    both sides -- 2026-07-17's temperature confound (native's benchmark
+    client silently used a non-zero-by-default temperature while this
+    project's own direct runtime is unconditionally greedy) was found
+    precisely because this was NOT a tracked, versioned field before."""
+
+    temperature: float = 0.0
+    top_p: float | None = None
+    top_k: int | None = None
+    repetition_penalty: float | None = None
+    seed: int | None = None
+
+
+@dataclass(frozen=True)
+class StopConfig:
+    """`allow_early_eos=False` means force exactly `output_tokens` tokens
+    regardless of a real EOS (this project's OWN direct runtime and every
+    synthetic-workload measurement so far do this implicitly -- there is
+    no real EOS to hit on sequential-token-synthetic input in the first
+    place). `allow_early_eos=True` is the representative (`-R`) line's
+    mode: a real completion should be allowed to stop early, and forcing
+    it to a fixed length would itself distort accepted-tokens/s and
+    acceptance-rate statistics relative to real usage."""
+
+    stop_sequences: tuple[str, ...] = ()
+    allow_early_eos: bool = True
+
+
+@dataclass(frozen=True)
+class PromptFixture:
+    """Pointer to a FROZEN, VERSIONED set of exact prompt token ids for a
+    synthetic (`-S`) workload -- committed to the repo (`benchmarks/
+    fixtures/<name>.json`), not regenerated from a formula at measurement
+    time. This is what makes "both sides ran the identical input" a
+    checkable fact instead of an assumption. See
+    `benchmarks/generate_synthetic_fixtures.py` for how these were built
+    (once, with a recorded seed/formula/tokenizer version) and
+    `load_prompt_token_ids()` below for how every measurement script must
+    load them (never regenerate)."""
+
+    path: str  # relative to FIXTURES_DIR
+    tokenizer: str
+    generation_formula: str  # human-readable description of how it was built, for audit
+    seed: int
+    num_requests: int
+    prompt_len: int
+
+
+def load_prompt_token_ids(fixture: PromptFixture) -> list[list[int]]:
+    """Load the exact, frozen prompt token id lists a fixture points to.
+    Raises if the file is missing rather than silently regenerating --
+    regenerating would defeat the entire point of freezing these."""
+    full_path = FIXTURES_DIR / fixture.path
+    if not full_path.exists():
+        raise FileNotFoundError(
+            f"frozen prompt fixture not found: {full_path} -- run "
+            "benchmarks/generate_synthetic_fixtures.py first, do not regenerate ad hoc"
+        )
+    with open(full_path) as f:
+        data = json.load(f)
+    prompts = data["prompt_token_ids"]
+    if len(prompts) != fixture.num_requests or any(len(p) != fixture.prompt_len for p in prompts):
+        raise ValueError(
+            f"fixture {full_path} does not match its own declared shape "
+            f"(num_requests={fixture.num_requests}, prompt_len={fixture.prompt_len})"
+        )
+    return prompts
+
+
+# -- Controlled synthetic line (W1-S/W2-S) --
+#
+# "sequential-token-synthetic" (2026-07-17 rename, per the coordinator's
+# explicit instruction): this project's own earlier round called this
+# input "random" (matching vLLM's own dataset name, `--dataset-name
+# random`) -- but the actual generation formula
+# (`allowed_tokens[(offset+index+arange(n)) % len(allowed_tokens)]`, read
+# directly from vLLM's `RandomDataset` source) produces a SEQUENTIAL RUN
+# of ascending token ids, not i.i.d. random sampling. That distinction
+# mattered: it was found to meaningfully raise acceptance rate relative
+# to genuine i.i.d. sampling (more locally predictable), so calling it
+# "random" was actively misleading about what property of the input was
+# actually being measured. Renamed here to describe what it structurally
+# is, not what vLLM happens to call it.
+W1_S = Workload("W1-S", input_tokens=4096, output_tokens=256, concurrency=(4,))
+W2_S = Workload(
+    "W2-S", input_tokens=4096, output_tokens=2000, concurrency=(4,)
+)  # NOTE: input_tokens intentionally matches W1-S, not W2's 32768 -- this
+# is the LONG-GENERATION DEGENERATION test (per the coordinator's point
+# 3), not a long-CONTEXT test; its purpose is isolating how acceptance
+# rate drifts with generation DEPTH for a fixed input, which does not
+# need W2's expensive 32768-token context to study. A true W2-scale
+# (32768in) fixture is not built this round -- see the design doc's
+# "not attempted this round" section.
+
+W1_S_FIXTURE = PromptFixture(
+    path="w1s_prompts.json",
+    tokenizer="unsloth/Qwen3.6-27B-NVFP4",
+    generation_formula=(
+        "allowed_tokens[(offset + request_index + arange(input_tokens)) "
+        "% len(allowed_tokens)], allowed_tokens = sorted(set(range(vocab_size)) "
+        "- set(tokenizer.all_special_ids)), offset = seeded per-request random draw "
+        "(matches vllm.benchmarks.datasets.datasets.RandomDataset.generate_token_sequence's "
+        "own formula, generated ONCE and frozen -- see generate_synthetic_fixtures.py)"
+    ),
+    seed=12345,
+    num_requests=16,
+    prompt_len=4096,
+)
 
 
 def main() -> None:

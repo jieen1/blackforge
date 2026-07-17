@@ -3081,3 +3081,180 @@ options for whoever picks this up next, not chosen between this round:
    this same repetition regime -- worth flagging to the coordinator as
    a possible revision to the W1/W2 definition's own output-length
    choice, not just this test's methodology.
+
+## 2026-07-17, Codex-sol's adopted plan (c): two independent benchmark lines, rigorous W1-S methodology built, the 6.45pp result under STRICT frozen-token pairing
+
+The coordinator relayed Codex-sol's own analysis of the whole W1
+investigation (confirmed by personally reading its output, not
+relayed on trust): the 12.15pp number is exploratory-only, not a
+go/no-go signal, and the fix is to split into two independent lines --
+**`-S`** (controlled synthetic: mechanism alignment/regression/fast
+debug) and **`-R`** (representative: the actual acceptance decision).
+This round built the `-S` line's core infrastructure and re-ran the
+256-token comparison under it.
+
+### `Workload` extended (`benchmarks/workloads.py`)
+
+Added `SamplingConfig` (temperature/top_p/top_k/repetition_penalty/seed),
+`StopConfig` (stop_sequences/allow_early_eos), and `PromptFixture` +
+`load_prompt_token_ids()` (a pointer to a FROZEN, VERSIONED prompt
+token-id file, not a "same formula" regeneration scheme -- loading
+raises rather than silently regenerating if the fixture is missing).
+The original `Workload`/`WORKLOADS` (`W1`/`W2`, pinned by
+`tests/test_workloads.py`) is untouched -- new `W1_S`/`W2_S` entries
+added alongside it, not replacing it. Renamed the input distribution
+from "random" to **"sequential-token-synthetic"** everywhere in this
+new code, per the coordinator's explicit instruction -- it is a
+sequential run of ascending token ids (confirmed by reading vLLM's own
+`RandomDataset.generate_token_sequence()` source in the prior round),
+not i.i.d. random sampling, and calling it "random" was actively
+misleading about what property of the input was being measured.
+
+### Frozen prompt fixture generated (`benchmarks/generate_synthetic_fixtures.py` → `benchmarks/fixtures/w1s_prompts.json`)
+
+16 requests × 4096 tokens, generated ONCE via vLLM's own
+`RandomDataset` formula (read from source, not approximated) with a
+recorded seed (12345), and committed to the repo as a literal JSON
+file of token ids (482KB) -- not regenerated at measurement time. This
+is what makes "both sides ran the identical input" a checked fact:
+`load_prompt_token_ids()` loads the SAME file for both the native
+client and this runtime's own harness, with a shape assertion that
+raises if the fixture doesn't match its own declared `num_requests`/
+`prompt_len` (catches silent corruption/truncation, not just missing
+files). CPU-only to generate (tokenizer vocab access, no GPU/model
+load needed).
+
+### Native client rebuilt to send EXACT token-id prompts, not `--dataset-name random`
+
+`benchmarks/w1s_native_bench.py`: a small async HTTP client that posts
+each frozen prompt directly to `/v1/completions` as `prompt: list[int]`
+(the OpenAI completions API's own token-array prompt form, confirmed by
+reading `vllm/entrypoints/openai/completion/protocol.py`'s
+`CompletionRequest.prompt: list[int] | list[list[int]] | str | ...`
+directly) -- bypassing `vllm bench serve`'s own `--dataset-name random`
+generator entirely, since that generator cannot be pointed at an exact,
+pre-specified token sequence. Spec-decode stats: scrapes `/metrics`
+before and after the batch and computes the delta, a faithful port of
+`vllm/benchmarks/serve.py`'s own `fetch_spec_decode_metrics()` +
+delta-computation logic (confirmed by reading that source directly --
+this IS how `vllm bench serve`'s own "Speculative Decoding" report
+section gets its numbers, not a separate invention) -- reimplemented
+inline rather than imported, to avoid coupling to vLLM's internal
+benchmarks module path.
+
+### This runtime's side rebuilt to match (`benchmarks/mtp_w1s_our_runtime.py`)
+
+Loads the SAME frozen fixture, processes all 16 requests in sequential
+batches of `concurrency` (4) -- "more independent trajectories via more
+batches, not larger concurrency," per the coordinator's explicit
+instruction -- reusing slots across batches via `reset_slot`. Reports
+both the aggregate rate (directly comparable to native's) and a
+PER-TRAJECTORY breakdown (each of the 16 requests' own acceptance
+rate) -- this is the piece the 12.15pp round's methodology was missing
+that let a couple of correlated, degenerate-repetition-driven
+trajectories dominate the aggregate unnoticed.
+
+### Result, strict frozen-token pairing, 256-token output (no long-generation-depth confound)
+
+| | Acceptance rate | Mean acceptance length | Drafts | Requests |
+|---|---|---|---|---|
+| Native vLLM (FlashInfer, frozen prompts) | **79.51%** | 3.39 | 719 | 16 |
+| This runtime (identical frozen prompts) | **73.06%** | 3.19 | 1287 | 16 |
+| **Gap** | **6.45pp** | 0.20 | -- | -- |
+
+This runtime needed nearly DOUBLE the draft rounds (1287 vs 719) to
+reach the same 256-token target per request, consistent with (not an
+independent finding from) its lower per-draft acceptance rate.
+
+**Per-trajectory breakdown for this runtime** (the 16 individual
+requests' own acceptance rates, matching the coordinator's explicit
+ask to check for outlier-driven skew): `92.65, 90.34, 54.64, 65.89,
+63.30, 94.03, 62.22, 92.16, 78.95, 71.95, 56.25, 54.98, 60.44, 97.95,
+73.75, 95.96` (%). Unweighted mean 75.34%, **stdev 16.24 percentage
+points**, range 54.64-97.95%. Stated plainly: with `n=16` and this much
+inter-trajectory spread, the standard error of the mean is
+`16.24/sqrt(16) ≈ 4.06pp` -- the 6.45pp gap is only ~1.6 combined
+standard errors, i.e. suggestive, not strongly conclusive, on its own
+at this trajectory count. (Native's own per-trajectory breakdown is
+NOT available with the current `w1s_native_bench.py` -- it only scrapes
+aggregate `/metrics` deltas across the whole batch; getting
+per-request granularity from native would need scraping between every
+single request, sacrificing concurrency, or finding a response-level
+field that carries per-request spec-decode stats -- not resolved this
+round, a known asymmetry between the two sides' reporting.)
+
+**How this compares to the earlier (non-frozen, "same formula") W1
+measurements**: broadly consistent in DIRECTION (native higher) with
+the previously-reported 3.1pp (67.25% vs 70.38%) and clearly smaller
+than the depth-confounded 12.15pp -- but not numerically identical to
+either, which is itself expected and informative: this is the
+FIRST measurement in the whole investigation where the input is
+PROVABLY identical (literal frozen token ids) rather than merely
+"the same generation formula," and the numbers moved again (both
+sides' absolute rates rose: native 70.38%→79.51%, this runtime
+67.25%→73.06%) -- reinforcing that even "same formula" reproduction
+carries real residual noise/imprecision this round's fixture-freezing
+was specifically built to eliminate going forward. Future re-runs
+against this SAME fixture should reproduce bit-for-bit identically
+(deterministic greedy decoding, frozen input) -- this is now checkable,
+not merely assumed.
+
+### Not attempted this round (reported honestly, not silently dropped)
+
+- **W2-S depth-bucketed degeneration test** (report acceptance rate
+  bucketed by generation depth -- 0-128/128-256/256-512/512-1024/...
+  -- plus per-trajectory results and repetition metrics like repeated
+  n-gram ratio/unique-token ratio, replacing the single aggregate
+  number the 12.15pp round leaned on). Designed in `workloads.py`
+  (`W2_S` = same 4096-token input, 2000-token output, isolating
+  generation-DEPTH effects, not context length) but the
+  depth-bucketed/repetition-metric analysis script itself was not
+  built this round -- this round's GPU time went to getting the
+  frozen-fixture infrastructure and the 256-token re-verification
+  solid first, per the coordinator's own stated priority order.
+- **W1-R/W2-R (representative workload)**: design only, see the next
+  section -- not implemented.
+
+### W1-R/W2-R design (representative workload line, for the actual accept/reject decision) -- proposal only, not implemented
+
+Per the coordinator's explicit spec:
+1. **Real programming-agent traffic replay**: real system prompts, tool
+   definitions, repo maps, actual task content -- NOT repeated-padding
+   text to hit a target length (this project's own earlier long-context
+   tests, including this round's `capacity_w1w2_check.py`, used
+   repeated-sentence padding specifically because it was measuring raw
+   memory capacity, not acceptance rate -- that shortcut is NOT valid
+   for a representativeness-sensitive measurement). Needs a real corpus
+   of agent transcripts -- this machine's own `/home/bot/vllm_server/`
+   or Claude Code's own session transcripts are the most plausible
+   source to investigate first, not yet surveyed this round.
+2. **`max_tokens=1024` allowing real early EOS**, reported SEPARATELY
+   from a fixed-1024-token forced-length stress variant -- `StopConfig
+   .allow_early_eos` (added this round) is exactly the field this
+   needs; the actual replay harness that respects it is not built yet.
+3. **Fixed and recorded sampling profile**: temperature/top_p/top_k/
+   repetition_penalty/seed/stop_sequences/tokenizer version --
+   `SamplingConfig`/`StopConfig` (added this round) are the right
+   fields; population with a REAL production sampling profile (not a
+   guessed temperature) requires finding what this machine's actual
+   `/home/bot/vllm_server/` production launch config uses for these
+   parameters -- not yet looked up this round.
+4. **Sampling/accept-reject semantics must be aligned BEFORE attempting
+   a non-zero-temperature comparison**: this runtime's
+   `determine_accept_reject()` (`runtime/direct_model_runner.py`) is
+   unconditionally greedy (`argmax` at every position, both for the
+   draft's own proposal and the verify decision) -- real vLLM's
+   accept/reject at non-zero temperature uses probabilistic
+   rejection sampling (comparing draft and target PROBABILITIES, not
+   just argmax identity -- the standard speculative-decoding
+   acceptance test). Extending this runtime's `determine_accept_reject`
+   to the probabilistic case is real, unstarted implementation work,
+   a prerequisite for any non-greedy `-R` comparison, not a
+   configuration change -- flagged here so it is not attempted out of
+   order in a future round.
+5. **Final gate = accepted-tokens/s + ITL + quality regression**,
+   acceptance rate demoted to an explanatory intermediate metric for
+   the `-S` line only -- matches `项目实施规划.md`'s own original
+   framing; no new implementation needed for this point beyond already
+   having `-S`/`-R` cleanly separated, which this round's work
+   establishes.

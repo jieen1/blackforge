@@ -656,6 +656,67 @@ boundary," and recommended a strictly time-boxed trace-driven
 performance probe (no real drafter) before committing to the full
 faithful integration — adopted, see next section.
 
+### Phase 3, Codex-sol's adopted plan (c): rigorous W1-S methodology built (2026-07-17) — two independent benchmark lines, frozen-token-paired 256-token result is 6.45pp (down from the depth-confounded 12.15pp)
+
+Full detail in `notes/direct-model-runner-design.md`. Codex-sol's
+analysis (confirmed by the coordinator reading its output directly):
+12.15pp is exploratory-only, not a gate signal — split into two lines,
+`-S` (controlled synthetic, mechanism alignment) and `-R`
+(representative, the actual accept/reject decision).
+
+**`-S` line built this round**: extended `Workload`
+(`benchmarks/workloads.py`) with `SamplingConfig`/`StopConfig`/
+`PromptFixture` (a pointer to FROZEN, VERSIONED prompt token ids, not a
+"same formula" regeneration scheme — loading raises rather than
+silently regenerating if missing). Original `W1`/`W2` untouched (still
+pinned by `tests/test_workloads.py`); added `W1_S`/`W2_S` alongside.
+Renamed the input distribution to **"sequential-token-synthetic"**
+everywhere in the new code (not "random" — confirmed in the prior
+round it's a sequential run of ascending ids, not i.i.d. sampling).
+Generated and committed a frozen 16×4096-token prompt fixture
+(`benchmarks/fixtures/w1s_prompts.json`, 482KB, CPU-only to build, no
+GPU needed). Rebuilt the native client (`w1s_native_bench.py`) to POST
+the exact frozen token ids directly to `/v1/completions` as
+`prompt: list[int]` (confirmed supported by reading vLLM's
+`CompletionRequest` type directly), bypassing `--dataset-name random`
+entirely, and to scrape `/metrics` before/after for spec-decode deltas
+(a faithful port of `vllm bench serve`'s own `fetch_spec_decode_metrics`
+logic, confirmed by reading that source). Rebuilt this runtime's side
+(`mtp_w1s_our_runtime.py`) to load the SAME frozen fixture, processing
+16 requests in sequential batches of 4 (more trajectories via more
+batches, not larger concurrency, per instruction), reporting both the
+aggregate rate and a per-trajectory breakdown.
+
+**Result, strict frozen-token pairing, 256-token output (no
+long-generation-depth confound)**: native **79.51%** (719 drafts, 16
+requests) vs. this runtime **73.06%** (1287 drafts, 16 requests) — a
+**6.45pp gap**, native higher. This runtime needed nearly double the
+draft rounds to reach the same output length, consistent with its
+lower per-draft acceptance rate. Per-trajectory breakdown for this
+runtime (per the explicit ask to check for outlier-driven skew): 16
+individual rates ranging 54.64%-97.95%, stdev 16.24pp — with this much
+spread at n=16, the standard error of the mean is ~4.06pp, so the
+6.45pp gap is only ~1.6 combined SEs: suggestive, not strongly
+conclusive on its own yet. (Native's own per-trajectory breakdown isn't
+available with the current script — a known asymmetry, not resolved
+this round.) Both sides' absolute rates rose again versus the earlier
+"same formula" measurements (native 70.38%→79.51%; this runtime
+67.25%→73.06%), reinforcing that even matched-formula reproduction
+carried real residual imprecision — this fixture-freezing eliminates
+that going forward; re-runs against this same fixture should now
+reproduce bit-for-bit.
+
+**Not attempted this round**: the W2-S depth-bucketed/repetition-metric
+degeneration test (designed in `workloads.py` as `W2_S`, analysis
+script not built) and the full W1-R/W2-R representative-workload line —
+a concrete 5-point design proposal was written instead (real
+agent-traffic replay source, `allow_early_eos` semantics, real
+production sampling profile lookup, and the important flagged
+prerequisite that this runtime's accept/reject logic is unconditionally
+greedy and needs probabilistic rejection-sampling support before any
+non-zero-temperature `-R` comparison is attempted — sequencing note,
+not to be skipped). Both deferred honestly to a future round.
+
 ### Phase 3, step 7 expanded-sample follow-up (2026-07-17) — noise hypothesis rejected, but a THIRD, much bigger confound found (generation-depth/repetition inflation); shape-controlled comparison shows a real ~12pp gap with an important sample-size caveat
 
 Full detail in `notes/direct-model-runner-design.md`. Per the explicit
