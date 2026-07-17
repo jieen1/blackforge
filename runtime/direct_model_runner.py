@@ -454,6 +454,7 @@ def build_vllm_config(
     kv_cache_dtype: str = "fp8_e4m3",
     max_model_len: int = 2048,
     gpu_memory_utilization: float = 0.5,
+    speculative_config: dict | None = None,
 ) -> VllmConfig:
     _ensure_sm120_backend_registered()
     args = EngineArgs(
@@ -466,8 +467,33 @@ def build_vllm_config(
         disable_log_stats=True,
         language_model_only=True,
         async_scheduling=False,
+        speculative_config=speculative_config,
     )
     return args.create_engine_config()
+
+
+def determine_accept_reject(draft_tokens: list[int], verify_logits) -> dict:
+    """Greedy MTP accept/reject (2026-07-17, moved here from
+    ``benchmarks/mtp_accept_reject_check.py`` so the real
+    ``mtp_verify_and_commit`` coordinator and that benchmark's regression
+    test share ONE implementation, not two copies). ``draft_tokens`` has
+    K+1 entries (anchor + K drafts); ``verify_logits`` is shaped
+    ``[K+1, vocab]`` for ONE request. Returns ``num_accepted`` (0..K), the
+    committed real token ids (accepted drafts, if any, plus exactly one
+    recovery/bonus token), and the rejection position (``None`` if all K
+    were accepted)."""
+    k = len(draft_tokens) - 1
+    committed: list[int] = []
+    for p in range(k):
+        predicted = int(verify_logits[p].argmax(dim=-1).item())
+        if predicted == draft_tokens[p + 1]:
+            committed.append(draft_tokens[p + 1])
+        else:
+            committed.append(predicted)
+            return {"num_accepted": p, "committed": committed, "rejected_at": p}
+    bonus = int(verify_logits[k].argmax(dim=-1).item())
+    committed.append(bonus)
+    return {"num_accepted": k, "committed": committed, "rejected_at": None}
 
 
 class DirectModelRunner:
@@ -511,12 +537,60 @@ class DirectModelRunner:
                 f"{len(self.attn_layer_names)} attn / {len(self.gdn_layer_names)} gdn"
             )
 
+        # Real MTP draft model (2026-07-17, Phase 2 / sol's "Option A"),
+        # loaded ONLY if the caller configured speculative decoding via
+        # build_vllm_config(speculative_config=...). Uses vLLM's own real
+        # loading mechanism (load_eagle_model -- also used by vLLM's real
+        # MTPSpeculator, not just EAGLE) so embed_tokens/lm_head sharing
+        # matches production exactly, nothing hand-rolled. Must load
+        # BEFORE _allocate_and_bind_kv_caches() so the draft's own
+        # attention layer registers into the SAME static_forward_context
+        # this project's existing generic KV-cache-allocation machinery
+        # already iterates over -- confirmed by reading vLLM's own
+        # DraftModelSpeculator.load_model() (vllm/v1/worker/gpu/spec_decode
+        # /speculator.py:153-170), which snapshots attention layer names
+        # before/after loading the draft for the exact same reason (there
+        # via get_layers_from_vllm_config(..., AttentionLayerBase); here
+        # via a direct before/after diff of static_forward_context, which
+        # is equivalent since every layer -- attention or GDN -- is
+        # registered into that same dict).
+        self.mtp_model = None
+        self.mtp_attn_layer_names: list[str] = []
+        self.num_speculative_tokens: int | None = None
+        if vllm_config.speculative_config is not None:
+            from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
+
+            names_before = set(sfc.keys())
+            with set_current_vllm_config(vllm_config):
+                self.mtp_model = load_eagle_model(self.model, vllm_config)
+            names_after = set(sfc.keys())
+            self.mtp_attn_layer_names = sorted(names_after - names_before)
+            if not self.mtp_attn_layer_names:
+                raise RuntimeError("loading the MTP draft model registered no new layers")
+            for name in self.mtp_attn_layer_names:
+                if hasattr(sfc[name], "get_state_shape"):
+                    raise RuntimeError(f"unexpected GDN layer in MTP draft model: {name}")
+            self.num_speculative_tokens = vllm_config.speculative_config.num_speculative_tokens
+
         self._allocate_and_bind_kv_caches()
 
         # Per-slot bookkeeping: attention kv_len (tokens actually written into
         # the paged KV cache) and GDN "has state been initialized" flag.
         self.slot_kv_len = [0] * num_slots
         self.slot_gdn_initialized = [False] * num_slots
+
+        # Per-slot MTP state (explicit fields, not implicit -- 2026-07-17
+        # Codex-sol review asked for this precisely so a live multi-round
+        # loop can't silently conflate "physically written" with
+        # "committed"). ``slot_kv_len``/``slot_gdn_initialized`` above
+        # ARE the target's committed_len/init-state -- no separate
+        # "committed_len" field is added since that would just be a second
+        # name for the same quantity; what's genuinely new is the DRAFT
+        # model's own sync length (a different KV cache, tracked
+        # separately) and the in-flight pending proposal.
+        self.slot_draft_sync_len = [0] * num_slots
+        self.slot_pending_draft_tokens: list[list[int] | None] = [None] * num_slots
+        self.slot_gdn_snapshot_gen = [0] * num_slots
 
         self._warmup()
 
@@ -592,7 +666,13 @@ class DirectModelRunner:
         return (block_ids * self.block_size + offsets).to(torch.long)
 
     def _forward(
-        self, slot: int, token_ids: list[int], start_pos: int, *, is_decode: bool
+        self,
+        slot: int,
+        token_ids: list[int],
+        start_pos: int,
+        *,
+        is_decode: bool,
+        return_hidden: bool = False,
     ) -> torch.Tensor:
         num_new_tokens = len(token_ids)
         attn_meta = self._attention_metadata(
@@ -621,6 +701,8 @@ class DirectModelRunner:
 
         self.slot_kv_len[slot] += num_new_tokens
         self.slot_gdn_initialized[slot] = True
+        if return_hidden:
+            return logits, hidden_states
         return logits
 
     def prefill(self, slot: int, prompt_token_ids: list[int]) -> int:
@@ -667,6 +749,8 @@ class DirectModelRunner:
         kv_lengths: list[int],
         *,
         qo_len: int = 1,
+        commit: bool = True,
+        return_hidden: bool = False,
     ) -> torch.Tensor:
         """Real batched decode/verify: ONE batched attention/GDN metadata
         object and ONE ``model.forward()`` call covering every listed slot
@@ -681,15 +765,30 @@ class DirectModelRunner:
         ``qo_len>1`` (MTP/speculative-decode verify, uniform across the
         batch): ``token_ids`` is a list of per-slot token-id lists, each of
         length ``qo_len`` -- the K draft tokens + 1 bonus-position
-        placeholder being verified in one batched call. Accept/reject
-        sampling on the returned per-position logits is intentionally out
-        of scope here (2026-07-16 round) -- this only wires the metadata/
-        kernel-call layer; callers wanting real speculative decoding must
-        still implement accept/reject on top of the returned logits.
+        placeholder being verified in one batched call.
         Returns logits shaped ``[num_reqs * qo_len, vocab]``, flattened in
         request-then-position order (request 0's qo_len rows, then request
         1's, ...) -- the same order ``SM120GQAImpl.forward()``'s own
         ``q_decode.reshape(num_reqs, qo_len, ...)`` expects.
+
+        ``commit`` (default ``True``, preserving the original decode_batch
+        behavior exactly): whether to advance ``self.slot_kv_len`` by
+        ``qo_len`` for every listed slot. The forward pass ALWAYS
+        physically writes K/V for all ``qo_len`` positions regardless of
+        this flag -- ``commit`` only controls this method's own
+        bookkeeping. Real MTP verify calls (``verify_batch``) pass
+        ``commit=False``, since the actual committed length is not known
+        until the caller's accept/reject decision runs on the returned
+        logits (2026-07-17, fixing the exact "physically-written vs.
+        committed" conflation Codex-sol's review flagged) -- the caller
+        (``mtp_verify_and_commit``) is responsible for advancing
+        ``slot_kv_len`` by the REAL committed length afterward. Attention's
+        own KV needs no explicit rollback either way (content/position
+        addressed -- positions beyond the real committed length are simply
+        never read again); only GDN's recurrent state needs the
+        snapshot/restore + recompute-forward repair on a non-full-accept
+        outcome, exactly as already verified by
+        ``benchmarks/mtp_gdn_rollback_check.py``.
         """
         num_reqs = len(slot_ids)
         if qo_len == 1:
@@ -752,8 +851,11 @@ class DirectModelRunner:
         torch.cuda.synchronize()
 
         for slot in slot_ids:
-            self.slot_kv_len[slot] += qo_len
+            if commit:
+                self.slot_kv_len[slot] += qo_len
             self.slot_gdn_initialized[slot] = True
+        if return_hidden:
+            return logits, hidden_states
         return logits
 
     def decode_batch(
@@ -770,6 +872,8 @@ class DirectModelRunner:
         slot_ids: list[int],
         draft_token_ids: list[list[int]],
         kv_lengths: list[int],
+        *,
+        return_hidden: bool = False,
     ) -> torch.Tensor:
         """MTP/speculative-decode verify: submit ``qo_len`` draft tokens
         (K speculative + 1 bonus position) per active slot and run them all
@@ -778,11 +882,17 @@ class DirectModelRunner:
         every slot this step, since ``num_speculative_tokens`` is a global
         engine config). Returns raw logits shaped
         ``[num_reqs * qo_len, vocab]`` (request-then-position order) --
-        accept/reject sampling against these logits is intentionally left
-        to the caller (out of scope this round; see ``_forward_batch``'s
-        docstring)."""
+        accept/reject sampling against these logits is the caller's job
+        (``determine_accept_reject``/``mtp_verify_and_commit``).
+        ``commit=False`` is passed to ``_forward_batch`` unconditionally --
+        a verify call's real committed length is never known until
+        accept/reject runs on these logits, so ``slot_kv_len`` is
+        deliberately NOT advanced here (2026-07-17 fix; see
+        ``_forward_batch``'s docstring)."""
         qo_len = len(draft_token_ids[0]) if draft_token_ids else 0
-        return self._forward_batch(slot_ids, draft_token_ids, kv_lengths, qo_len=qo_len)
+        return self._forward_batch(
+            slot_ids, draft_token_ids, kv_lengths, qo_len=qo_len, commit=False, return_hidden=return_hidden
+        )
 
     def reset_slot(self, slot: int) -> None:
         """Release a slot for reuse by a new logical request. Does not zero
@@ -810,9 +920,17 @@ class DirectModelRunner:
         rejection. Returns CPU-resident clones (not GPU-resident, to avoid
         holding extra persistent GPU memory for a snapshot that is usually
         discarded within one verify step) -- restore moves them back to
-        device."""
+        device.
+
+        Tags the snapshot with this slot's current generation counter
+        (``self.slot_gdn_snapshot_gen``, bumped on every snapshot) --
+        2026-07-17 addition per Codex-sol's explicit ask for explicit
+        per-slot state so a STALE snapshot (e.g. a caller accidentally
+        holding on to one from two rounds ago) can never be restored by
+        mistake; ``restore_gdn_state`` rejects a generation mismatch."""
         physical = _physical_slot(slot)
-        snapshot: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        self.slot_gdn_snapshot_gen[slot] += 1
+        snapshot: dict = {"__generation__": self.slot_gdn_snapshot_gen[slot]}
         for name in self.gdn_layer_names:
             conv_state, ssm_state = self.kv_caches[name]
             snapshot[name] = (
@@ -829,13 +947,216 @@ class DirectModelRunner:
         persistent ``kv_caches`` tensors (never reallocates them), so this
         is safe to call between real forward passes without disturbing any
         other slot or any fixed-address buffer a CUDA-graph-captured call
-        might depend on."""
+        might depend on. Rejects a stale snapshot (generation counter
+        mismatch -- see ``snapshot_gdn_state``'s docstring)."""
+        gen = snapshot.get("__generation__")
+        if gen != self.slot_gdn_snapshot_gen[slot]:
+            raise RuntimeError(
+                f"stale GDN snapshot for slot {slot}: snapshot generation {gen} != "
+                f"current {self.slot_gdn_snapshot_gen[slot]}"
+            )
         physical = _physical_slot(slot)
         for name in self.gdn_layer_names:
             conv_state, ssm_state = self.kv_caches[name]
             snap_conv, snap_ssm = snapshot[name]
             conv_state[physical].copy_(snap_conv.to(self.device))
             ssm_state[physical].copy_(snap_ssm.to(self.device))
+
+    def _mtp_forward(
+        self,
+        slot: int,
+        token_ids: list[int],
+        hidden_states_in: torch.Tensor,
+        start_pos: int,
+        *,
+        is_decode: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Real draft-model (``Qwen3_5MTP``) forward for ONE slot -- the
+        low-level primitive the centralized MTP-cycle coordinator methods
+        (``mtp_prefill``/``mtp_verify_and_commit``) build on. Deliberately
+        does NOT touch ``self.slot_draft_sync_len`` itself (unlike
+        ``_forward``/``_forward_batch``'s unconditional-or-commit-flag
+        bookkeeping) -- the caller decides whether this call's advance
+        represents the real synced history (step 0, teacher-forced with
+        the target's own just-computed hidden state) or a throwaway
+        exploratory propose step (steps 1..K-1, autoregressive on the
+        draft's own previous hidden state/token) that must NOT be counted
+        as committed. This is what makes the draft model's own KV cache
+        need no explicit rollback on accept/reject, unlike GDN: an
+        exploratory step's positions are simply overwritten by the next
+        round's real sync call, exactly like attention's own
+        content/position-addressed reasoning elsewhere in this file.
+
+        ``hidden_states_in`` must have exactly ``len(token_ids)`` rows
+        (``Qwen3_5MultiTokenPredictor.forward()`` concatenates it against
+        the embedded ``input_ids`` along the hidden-size dim, so the
+        sequence-length dim must already match)."""
+        if self.mtp_model is None:
+            raise RuntimeError(
+                "no MTP draft model loaded -- build_vllm_config(speculative_config=...) first"
+            )
+        num_new_tokens = len(token_ids)
+        attn_meta = build_attention_metadata(
+            prior_kv_len=self.slot_draft_sync_len[slot],
+            num_new_tokens=num_new_tokens,
+            is_decode=is_decode,
+            slot=slot,
+            block_size=self.block_size,
+            blocks_per_slot=self.blocks_per_slot,
+            device=self.device,
+        )
+        attn_metadata_dict = {name: attn_meta for name in self.mtp_attn_layer_names}
+        slot_mapping = self._slot_mapping(slot, start_pos, num_new_tokens)
+        slot_mapping_dict = {name: slot_mapping for name in self.mtp_attn_layer_names}
+
+        input_ids = torch.tensor(token_ids, dtype=torch.long, device=self.device)
+        positions = torch.arange(
+            start_pos, start_pos + num_new_tokens, dtype=torch.long, device=self.device
+        )
+
+        with set_forward_context(
+            attn_metadata_dict, self.vllm_config, slot_mapping=slot_mapping_dict
+        ):
+            hidden_states_out = self.mtp_model.forward(input_ids, positions, hidden_states_in)
+        torch.cuda.synchronize()
+        logits = self.mtp_model.compute_logits(hidden_states_out)
+        torch.cuda.synchronize()
+        return logits, hidden_states_out
+
+    def _mtp_sync_and_propose(
+        self,
+        slot: int,
+        shifted_input_ids: list[int],
+        target_hidden_states: torch.Tensor,
+        start_pos: int,
+        num_new_tokens: int,
+        k: int,
+    ) -> list[int]:
+        """The centralized sync+propose funnel every MTP-aware entry point
+        (``mtp_prefill``/eventual ``mtp_decode``) routes through -- per
+        2026-07-17's sol-refined design, this is the ONE place draft-sync
+        logic lives, not duplicated per public entry point. Step 0 is the
+        real sync (teacher-forced with the target's OWN just-computed
+        hidden states, covering this step's FULL real query range --
+        matches vLLM's real ``_prepare_prefill_inputs_kernel`` shift-by-one
+        mechanism); steps 1..k-1 are genuinely autoregressive on the
+        draft's own previous hidden state/token, and are NOT committed to
+        ``self.slot_draft_sync_len`` (see ``_mtp_forward``'s docstring)."""
+        step0_logits, step0_hidden = self._mtp_forward(
+            slot, shifted_input_ids, target_hidden_states, start_pos, is_decode=(num_new_tokens == 1)
+        )
+        self.slot_draft_sync_len[slot] += num_new_tokens
+        draft_tokens = [int(step0_logits[-1].argmax(dim=-1).item())]
+        prev_hidden = step0_hidden[-1:]
+        prev_token = draft_tokens[0]
+        next_pos = start_pos + num_new_tokens
+        for _ in range(1, k):
+            step_logits, step_hidden = self._mtp_forward(
+                slot, [prev_token], prev_hidden, next_pos, is_decode=True
+            )
+            prev_token = int(step_logits[-1].argmax(dim=-1).item())
+            draft_tokens.append(prev_token)
+            prev_hidden = step_hidden[-1:]
+            next_pos += 1
+        return draft_tokens
+
+    def mtp_prefill(self, slot: int, prompt_token_ids: list[int]) -> dict:
+        """Unified MTP cycle funnel point for a fresh prefill: real target
+        prefill (with hidden states) -> draft KV sync (step 0, teacher-
+        forced shift over the WHOLE prompt) -> K-1 more autoregressive
+        draft steps. Returns the anchor (target's own greedy next token,
+        matching plain ``prefill()``'s contract -- not yet written into
+        the target's own KV) and the K proposed draft tokens, ready for
+        the caller to submit through ``mtp_verify_and_commit``."""
+        if self.mtp_model is None or self.num_speculative_tokens is None:
+            raise RuntimeError("no MTP draft model loaded")
+        if self.slot_kv_len[slot] != 0 or self.slot_draft_sync_len[slot] != 0:
+            raise RuntimeError(f"slot {slot} is not fresh")
+        target_logits, target_hidden = self._forward(
+            slot, prompt_token_ids, start_pos=0, is_decode=False, return_hidden=True
+        )
+        anchor = int(target_logits[-1].argmax(dim=-1).item())
+        shifted_input_ids = prompt_token_ids[1:] + [anchor]
+        draft_tokens = self._mtp_sync_and_propose(
+            slot,
+            shifted_input_ids,
+            target_hidden,
+            start_pos=0,
+            num_new_tokens=len(prompt_token_ids),
+            k=self.num_speculative_tokens,
+        )
+        self.slot_pending_draft_tokens[slot] = draft_tokens
+        return {"anchor": anchor, "draft_tokens": draft_tokens}
+
+    def mtp_verify_and_commit(self, slot: int, anchor: int, draft_tokens: list[int]) -> dict:
+        """Unified MTP cycle funnel point for verify+commit: submits
+        ``[anchor] + draft_tokens`` through the real, already-verified
+        ``verify_batch`` (``commit=False`` -- see its docstring), applies
+        greedy ``determine_accept_reject``, and on any non-full-accept
+        outcome repairs GDN state (``restore_gdn_state`` + a real
+        recompute forward for exactly the committed length) and corrects
+        ``slot_kv_len``. The draft model's own KV needs no repair either
+        way -- see ``_mtp_forward``'s docstring.
+
+        Recompute input alignment (2026-07-17, fixed after a real bug was
+        caught by direct KV-content reasoning, not just shape/bookkeeping
+        checks -- see notes/direct-model-runner-design.md): the token
+        whose OWN K/V gets written at position ``kv_len_before + i`` is
+        the i-th QUERY INPUT of that forward call, matching
+        ``verify_batch``'s own convention where ``draft[0]=anchor``'s K/V
+        lands at ``kv_len_before`` (mirroring ``prefill()``/``decode()``'s
+        established contract: the anchor/greedy-next token is NOT written
+        into KV until it is fed back in as the FOLLOWING call's input).
+        ``decision["committed"]`` is ``[accepted_draft_0, ..., accepted_
+        draft_{n-1}, recovery]`` -- the recovery/bonus token is, symmetrically,
+        NOT yet written into KV either (it becomes the next round's own
+        anchor-equivalent). So the recompute's real input tokens are
+        ``[anchor] + committed[:-1]`` (anchor followed by the ACCEPTED
+        drafts only, dropping the not-yet-written recovery token) --
+        NOT ``committed`` itself, which would silently write the WRONG
+        token content into the KV cache while still looking correct on
+        every shape/length/bookkeeping check (this is exactly why the
+        verification gradient calls for real numerical/content checks,
+        not just invariant checks).
+
+        Returns the accept/reject decision plus ``last_hidden`` (target
+        hidden state at the LAST of these recomputed/verified real
+        positions -- i.e. the last ACCEPTED draft's position, or anchor's
+        own position if num_accepted==0 -- NOT the recovery token's
+        position, which has no hidden state yet until a future step
+        consumes it as input)."""
+        k = len(draft_tokens)
+        draft = [anchor] + draft_tokens
+        kv_len_before = self.slot_kv_len[slot]
+        snapshot = self.snapshot_gdn_state(slot)
+        verify_logits, verify_hidden = self.verify_batch(
+            [slot], [draft], [kv_len_before], return_hidden=True
+        )
+        decision = determine_accept_reject(draft, verify_logits)
+        committed_len = decision["num_accepted"] + 1
+
+        if decision["num_accepted"] == k:
+            self.slot_kv_len[slot] = kv_len_before + k + 1
+            last_hidden = verify_hidden[-1:]
+        else:
+            self.restore_gdn_state(slot, snapshot)
+            self.slot_kv_len[slot] = kv_len_before
+            # Real input tokens for positions kv_len_before..+committed_len-1:
+            # anchor followed by the accepted drafts (NOT the recovery token
+            # -- see the docstring above).
+            recompute_tokens = [anchor] + decision["committed"][:-1]
+            _, recompute_hidden = self._forward_batch(
+                [slot],
+                [recompute_tokens] if committed_len > 1 else recompute_tokens,
+                [kv_len_before],
+                qo_len=committed_len,
+                commit=True,
+                return_hidden=True,
+            )
+            last_hidden = recompute_hidden[-1:]
+
+        self.slot_pending_draft_tokens[slot] = None
+        return {**decision, "last_hidden": last_hidden}
 
 
 class CapturedBatchDecodeGraph:

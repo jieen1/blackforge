@@ -656,6 +656,62 @@ boundary," and recommended a strictly time-boxed trace-driven
 performance probe (no real drafter) before committing to the full
 faithful integration — adopted, see next section.
 
+### Phase 3, real MTP draft model + centralized state machine (2026-07-17) — Phase 2 / sol's "Option A", verification gradient steps 1-4 done, real bug found and fixed
+
+Full detail in `notes/direct-model-runner-design.md`'s "Phase 2" section.
+Loaded the REAL `Qwen3_5MTP` draft model via vLLM's own
+`load_eagle_model()` (same function real vLLM's `MTPSpeculator` calls --
+not hand-rolled), built a centralized MTP-cycle funnel
+(`_mtp_forward`/`_mtp_sync_and_propose`/`mtp_prefill`/
+`mtp_verify_and_commit` in `runtime/direct_model_runner.py`) so draft-sync
+logic lives in ONE place rather than scattered into every entry point
+(the original `prefill`/`decode`/`decode_batch`/`verify_batch` are
+untouched), added the explicit per-slot state Codex-sol asked for
+(`slot_draft_sync_len`, `slot_pending_draft_tokens`,
+`slot_gdn_snapshot_gen` with stale-snapshot rejection), and fixed
+`_forward_batch`'s physical-write-vs-committed conflation for real
+(`commit: bool` param; `verify_batch` now defaults to `commit=False`).
+
+**A real bug was found and fixed this round**: the recompute-on-reject
+path fed `decision["committed"]` directly as input tokens, which is
+WRONG token alignment (should be `[anchor] + committed[:-1]`, since the
+anchor/greedy token has no KV entry until fed back in as a later call's
+input, matching `prefill()`/`decode()`'s existing contract) — would have
+silently written wrong content into the KV cache while still passing
+every shape/bookkeeping check. Found via direct reasoning about
+position-alignment semantics, not a test failure — then a genuine
+content-correctness check (independent reference-slot replay + real
+continuation, comparing next-token predictions) was added specifically
+to catch this class of bug going forward.
+
+**Verification gradient, steps 1-4, real numerical twin checks (not
+signal-probe), stable across 3 independent runs** (`benchmarks/
+mtp_real_draft_check.py`): (1) target prefill hidden/logits align
+exactly between a plain runner and an MTP-loaded runner — loading the
+draft model doesn't perturb the target. (2) `embed_tokens`/`lm_head`
+sharing confirmed via `data_ptr()` identity (genuinely the same tensor);
+draft's shifted first pass produces correct shape, all finite. (3) real
+`mtp_prefill()` produces exactly K=3 valid draft tokens. (4) both a
+real-draft-proposal scenario (draft's own actual output, whatever
+accept/reject outcome results — not asserted to any specific value,
+since that's the draft's own prediction quality, not this coordinator's
+correctness) and a forced-reject scenario pass: kv_len tracks the real
+committed length, GDN state gets repaired, and the content-correctness
+cross-check agrees with an independent reference replay. All 4 steps:
+**PASS**. One honestly-recorded nuance: the content check's hidden-state
+`allclose` is `false` while cosine similarity is 0.997 and the greedy
+token still matches exactly — attributed to two different kernel
+dispatch paths (prefill-shaped vs. decode/verify-shaped) computing the
+same math, consistent with this project's established practice of using
+cosine-sim + exact greedy-token agreement as the correctness bar, not
+literal hidden-state allclose.
+
+**Not attempted this round** (remain for future rounds): step 5
+(multi-round continuation, needs a not-yet-built `mtp_decode()`
+coordinator), step 6 (4-slot concurrency isolation), step 7 (the real
+W1/W2 ≤1pp acceptance-rate gate against native vLLM), step 8 (CUDA graph
+integration — last in sol's gradient, untouched).
+
 ### Phase 3, trace-driven scheduling-overhead probe (2026-07-17) — sol's Phase 1, GPU-busy% ~100% found and confirmed stable across 2 runs
 
 Full detail in `notes/direct-model-runner-design.md`'s "second follow-up"

@@ -2280,3 +2280,183 @@ round, despite sol's overall recommendation to move to it "immediately,
 regardless of phase 1's result" — that instruction describes the
 recommended route across rounds, not a mandate to compress both phases
 into one. Phase 2 remains the explicit next step.
+
+## 2026-07-17, Phase 2 (real draft model + centralized state machine): verification gradient steps 1-4 done, real bug found and fixed, steps 5-8 remain
+
+Following the coordinator's go-ahead to start Phase 2 ("Option A"),
+implemented in `runtime/direct_model_runner.py`: the real `Qwen3_5MTP`
+draft model loaded via vLLM's own `load_eagle_model()` (also used by
+real vLLM's `MTPSpeculator` -- not hand-rolled), a centralized MTP-cycle
+funnel (`_mtp_forward`/`_mtp_sync_and_propose`/`mtp_prefill`/
+`mtp_verify_and_commit`), explicit per-slot state, and the
+`_forward_batch` physical-write-vs-committed separation Codex-sol
+flagged. Went through the verification gradient's steps 1-4, with real
+numerical twin comparisons at each step (not signal-probe) -- found and
+fixed one real bug via direct content-level reasoning (not caught by
+shape/bookkeeping checks alone). Steps 5-8 (multi-round decode,
+concurrency=4 isolation, W1/W2 acceptance gate, CUDA graph) not
+attempted this round.
+
+### Implementation
+
+**Model loading** (`DirectModelRunner.__init__`, before
+`_allocate_and_bind_kv_caches()`): if `vllm_config.speculative_config`
+is set, snapshot `static_forward_context`'s keys, call
+`load_eagle_model(self.model, vllm_config)` (the SAME function real
+vLLM's `MTPSpeculator.load_draft_model()` calls -- confirmed by reading
+`vllm/v1/worker/gpu/spec_decode/mtp/speculator.py`), diff the keys to
+get `mtp_attn_layer_names` (mirrors `DraftModelSpeculator.load_model()`'s
+own before/after diff pattern at
+`vllm/v1/worker/gpu/spec_decode/speculator.py:153-170`, confirming this
+project's simpler direct-dict-diff achieves the same isolation
+`get_layers_from_vllm_config(..., AttentionLayerBase)` does there).
+`build_vllm_config()` gained a `speculative_config: dict | None` param,
+passed straight to `EngineArgs` (matching
+`vllm_integration/launch_test_server.py`'s exact production JSON
+convention, including the `"attention_backend": "CUSTOM"` inside the
+speculative_config dict itself -- confirmed necessary: the MTP proposer
+does not inherit the top-level attention backend).
+
+**Centralized funnel, not scattered** (per sol's refined design):
+`_mtp_forward()` is the low-level draft-model-forward primitive (mirrors
+`_forward`, but for `self.mtp_model`/`self.mtp_attn_layer_names`, no GDN
+involved since the draft has none). `_mtp_sync_and_propose()` is the ONE
+place sync+propose logic lives: step 0 syncs the draft's KV using the
+target's own just-computed hidden states (teacher-forced, shifted input
+covering the step's FULL query range), steps 1..K-1 are genuinely
+autoregressive on the draft's own previous hidden state/token. Critically,
+`_mtp_forward` does NOT advance `self.slot_draft_sync_len` itself --
+the caller decides: step 0's advance is real (committed), steps 1..K-1's
+advances are NOT persisted (exploratory-only), so the draft's own KV
+cache needs NO explicit rollback on reject -- the next round's real sync
+simply overwrites those same throwaway positions, exactly like
+attention's own content/position-addressed reasoning elsewhere in this
+project. `mtp_prefill()`/`mtp_verify_and_commit()` are the two public
+MTP-aware entry points; the ORIGINAL `prefill`/`decode`/`decode_batch`/
+`verify_batch` are UNTOUCHED and still work exactly as before -- MTP
+awareness lives ONLY in the two new methods, not scattered in.
+
+**Explicit per-slot state** (Codex-sol's ask): `slot_draft_sync_len`
+(the draft's own KV length, separate from `slot_kv_len`),
+`slot_pending_draft_tokens` (in-flight, not-yet-verified proposal),
+`slot_gdn_snapshot_gen` (bumped on every `snapshot_gdn_state()` call;
+`restore_gdn_state()` now rejects a generation mismatch, so a stale
+snapshot can never be restored by mistake).
+
+**`_forward_batch` physical-write-vs-committed separation**: gained a
+`commit: bool = True` parameter. The forward pass always physically
+writes K/V for all `qo_len` positions regardless of this flag; `commit`
+only controls whether `self.slot_kv_len` advances. `decode_batch()`
+keeps the default (`True` -- decode is never ambiguous). `verify_batch()`
+now explicitly passes `commit=False` -- a verify call's real committed
+length is unknowable until `determine_accept_reject` runs on its
+logits, so auto-advancing was the exact conflation Codex-sol flagged.
+`determine_accept_reject()` itself moved from
+`benchmarks/mtp_accept_reject_check.py` into
+`runtime/direct_model_runner.py` as a shared module-level function (that
+benchmark now imports it, rather than keeping a second copy) --
+reusing, not reinventing, per the coordinator's explicit instruction.
+
+Both `_forward`/`_forward_batch` gained a `return_hidden: bool = False`
+parameter (returns `(logits, hidden_states)` when set) -- needed since
+the draft's sync step consumes the target's own hidden states, which
+were previously computed-then-discarded.
+
+### A real bug, found and fixed: recompute input token misalignment
+
+`mtp_verify_and_commit`'s first draft fed `decision["committed"]`
+(`[accepted_draft_0, ..., accepted_draft_{n-1}, recovery]`) directly as
+the recompute forward's input tokens. This is WRONG: the token whose OWN
+K/V lands at position `kv_len_before + i` is that call's i-th QUERY
+INPUT, and per `verify_batch`'s own established convention (`draft =
+[anchor, d_0, d_1, d_2]`, so `anchor`'s K/V lands at `kv_len_before`,
+mirroring `prefill()`/`decode()`'s contract that the greedy/anchor token
+is NOT written into KV until fed back in as a FOLLOWING call's input),
+the correct recompute input is `[anchor] + decision["committed"][:-1]`
+(anchor followed by the ACCEPTED drafts, dropping the recovery token,
+which -- symmetrically -- has no KV entry yet either). Feeding
+`committed` directly would have silently written the WRONG token
+content into the KV cache at every recompute -- while still passing
+every shape/length/`slot_kv_len`-bookkeeping check, since those are
+blind to content. This is exactly why the coordinator's verification
+gradient insists on real numerical/content checks, not just invariant
+checks -- caught by direct reasoning through the position-alignment
+semantics before writing the test that would prove it, not by a test
+failure first.
+
+**The check that would catch this class of bug** (added to
+`benchmarks/mtp_real_draft_check.py`'s step 4, and would have failed
+against the pre-fix code): independently replay the REAL committed
+sequence (`prompt + anchor + accepted_drafts`) from scratch on a FRESH
+reference slot via the plain, long-verified `prefill()` path, then
+continue BOTH the MTP-committed slot (via one real decode call feeding
+the recovery token) and the reference slot the same way, and compare
+their next-token predictions. If the MTP-committed slot's KV cache holds
+the wrong content, this diverges from the reference; if correct, they
+agree.
+
+### Verification gradient results (steps 1-4, real numerical twin checks, stable across 3 independent runs)
+
+Built `benchmarks/mtp_real_draft_check.py`. Uses the SAME prompt as
+prior rounds ("The capital of France is") for direct cross-session
+consistency checking -- `anchor=11751`, `committed=[13, 271]` on a
+forced/organic partial reject exactly match values already seen in
+earlier `mtp_accept_reject_check.py` runs from a previous round, an
+independent (if informal) cross-check that nothing regressed.
+
+1. **Target prefill hidden states/logits alignment**: a plain
+   (no-speculative-config) runner's prefill vs. an MTP-loaded runner's
+   IDENTICAL prefill on the same prompt -- `logits_allclose=true`,
+   `hidden_allclose=true`, `cosine_sim=1.0`, same greedy token. Loading
+   the draft model alongside the target does not perturb the target's
+   own computation. **PASS.**
+2. **Weight sharing + shifted draft first pass**: `embed_tokens`/
+   `lm_head` identity checked via `data_ptr()` equality (genuinely the
+   SAME tensor, not just equal values) between target and draft --
+   `true`/`true`, confirming `load_eagle_model`'s real sharing logic
+   fired. The draft's own step-0 forward produces the correct shape
+   (`[prompt_len, vocab]`), all-finite logits. **PASS.**
+3. **K=3 proposal correctness**: real `mtp_prefill()` produces exactly 3
+   draft tokens, all valid vocab ids (`[13, 248046, 198]` for this
+   prompt). **PASS.**
+4. **Single-round verify/accept-reject/GDN rollback**: two scenarios --
+   `real_draft_proposal` (the draft model's own actual K=3 output,
+   submitted as-is -- NOT asserted to be any specific accept/reject
+   outcome, since an untrained-together MTP head organically agreeing or
+   disagreeing with the target at some positions is the expected,
+   realistic dynamic, not a bug) and `forced_reject_at_1` (a deliberate
+   decoy substitution, same technique `mtp_accept_reject_check.py`
+   already established, guaranteeing a KNOWN partial-reject). Both
+   scenarios: `kv_len` advances by exactly the real committed length,
+   GDN state changes from the pre-verify snapshot (repair happened), and
+   -- the decisive content check -- the reference-slot replay's
+   predicted recovery token matches `determine_accept_reject`'s own
+   recovery token, and continuing both slots by one more real token
+   gives the SAME greedy next token. **PASS**, after the bug above was
+   found and fixed.
+
+   One nuance recorded honestly, not swept under the rug: the
+   content-correctness check's `next_hidden_allclose` is `false` (while
+   `cosine_sim=0.997` and the greedy token still matches exactly). This
+   reflects the reference slot going through `prefill()`'s plain
+   single-request path (`is_decode=False`, one long causal pass over the
+   whole real sequence) while the MTP-committed slot's recompute went
+   through `_forward_batch`'s decode/verify-shaped batched path
+   (`qo_len=committed_len`) -- two DIFFERENT kernel dispatch paths
+   computing the SAME mathematical positions, which this project has
+   already established elsewhere produces small, expected floating-point
+   deviation (not a correctness bug) -- consistent with using cosine
+   similarity + exact greedy-token agreement, not literal hidden-state
+   `allclose`, as the operative bar for decision-level correctness.
+
+**Not attempted this round** (remain for future rounds, per the
+coordinator's explicit "however far you get" scoping): step 5
+(multi-round continuation via a not-yet-built `mtp_decode()` coordinator,
+paralleling `mtp_prefill()` for decode-shaped steps), step 6 (4-slot
+concurrent isolation), step 7 (the real W1/W2 ≤1pp acceptance-rate gate
+against native vLLM), step 8 (CUDA graph integration -- explicitly last
+in sol's gradient, not started). `mtp_verify_and_commit`'s `last_hidden`
+return value is plumbed but not yet consumed by anything (it represents
+the last ACCEPTED position's hidden state, not the recovery token's --
+useful context for whoever builds `mtp_decode` next, not dead code, but
+untested end-to-end in a real multi-round loop yet).

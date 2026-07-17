@@ -41,26 +41,6 @@ PROMPT = "The capital of France is"
 K = 3  # num_speculative_tokens, matching this project's real production MTP K=3
 
 
-def determine_accept_reject(draft_tokens: list[int], verify_logits) -> dict:
-    """Greedy MTP accept/reject. ``draft_tokens`` has K+1 entries (anchor +
-    K drafts); ``verify_logits`` is shaped [K+1, vocab] for ONE request.
-    Returns num_accepted (0..K), the committed real token ids (accepted
-    drafts, if any, plus exactly one recovery/bonus token), and the
-    rejection position (None if all K were accepted)."""
-    k = len(draft_tokens) - 1
-    committed: list[int] = []
-    for p in range(k):
-        predicted = int(verify_logits[p].argmax(dim=-1).item())
-        if predicted == draft_tokens[p + 1]:
-            committed.append(draft_tokens[p + 1])
-        else:
-            committed.append(predicted)
-            return {"num_accepted": p, "committed": committed, "rejected_at": p}
-    bonus = int(verify_logits[k].argmax(dim=-1).item())
-    committed.append(bonus)
-    return {"num_accepted": k, "committed": committed, "rejected_at": None}
-
-
 def _run_once() -> dict:
     import torch
 
@@ -68,7 +48,11 @@ def _run_once() -> dict:
     import register_sm120_backend  # noqa: F401
     from transformers import AutoTokenizer
 
-    from runtime.direct_model_runner import DirectModelRunner, build_vllm_config
+    from runtime.direct_model_runner import (
+        DirectModelRunner,
+        build_vllm_config,
+        determine_accept_reject,
+    )
 
     vllm_config = build_vllm_config(
         model=MODEL, kv_cache_dtype="fp8_e4m3", max_model_len=2048, gpu_memory_utilization=0.5

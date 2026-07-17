@@ -136,7 +136,13 @@ def _run_config(runner, prompt_ids: list[int], label: str, p: float) -> dict:
         for s in range(CONCURRENCY):
             accept_len = accept_lens[s]
             if accept_len == K:
-                continue  # full accept: verify's own advance is already correct
+                # full accept: verify_batch() now always runs with
+                # commit=False (2026-07-17 fix, separating "physically
+                # written" from "committed" -- see direct_model_runner.py's
+                # _forward_batch docstring), so this script must commit
+                # explicitly here instead of relying on verify's own advance.
+                runner.slot_kv_len[s] = kv_lengths[s] + K + 1
+                continue
             num_recompute_slots += 1
             runner.restore_gdn_state(s, snapshots[s])
             runner.slot_kv_len[s] = kv_lengths[s]
