@@ -488,6 +488,72 @@ partial rejection), THEN the real W1/W2 performance comparison
 (configured with actually-sized per-slot capacity, not this round's
 small test value).
 
+### Phase 3, MTP semantics round (2026-07-17) — accept/reject + GDN rollback implemented and verified; real draft generation investigated in depth, honestly deferred (more scope than estimated)
+
+Read `项目实施规划.md`'s actual contract first, per instruction, before
+designing anything: Phase 8 says "先完整复现 vLLM 的 MTP K=3" (replicate
+vLLM's real mechanism, don't invent a simplified one); Phase 1's gate
+says MTP acceptance must not drop >1 percentage point vs vLLM.
+
+**Traced vLLM's real MTP K=3 mechanism from source** (not guessed):
+`Qwen3NextMTP` is a genuinely separate small model (own full-attention
+decoder layer(s), sharing only embed_tokens/lm_head with the target).
+Its own attention layer needs its OWN KV cache kept in sync with the
+target model on EVERY real step, not just during propose loops --
+`_prepare_prefill_inputs_kernel`'s "shift input_ids by one" logic runs
+over the full current query range on every real prefill/decode step,
+because the draft model needs complete causal history to work at all.
+This means faithfully replicating vLLM's MTP requires restructuring the
+main forward path itself (every prefill/decode/_forward_batch call), not
+just adding an isolated propose loop -- substantially more invasive than
+initially scoped. The "complete-replication, not reinvented" loading
+path is also worked out: pass `speculative_config={"method": "mtp",
+"num_speculative_tokens": 3, "attention_backend": "CUSTOM"}` to
+`EngineArgs` (matching `launch_test_server.py` exactly) so
+`vllm_config.speculative_config.draft_model_config` is built by vLLM's
+own logic, then `get_model()` with that config loads
+`Qwen3NextMTP` -- and its attention layer registers into the SAME
+`static_forward_context` this project's existing KV-cache-allocation
+machinery already iterates over, so its cache "just works" once loaded
+before allocation (confirmed by reading the code, not yet exercised).
+
+**Honest scope decision**: rather than rush the full draft-model
+integration (which does not fit this round's remaining budget with the
+rigor this project requires), implemented and verified the two pieces
+that are genuinely self-contained and checkable without it:
+
+1. **Accept/reject boundary logic** (`benchmarks/mtp_accept_reject_check.py`):
+   greedy verification against the already-working, CUDA-graph-capable
+   `verify_batch()` (draft = `[anchor, d_0..d_{K-1}]`, K=3). Verified via
+   3 constructed scenarios per run (all-accept; reject at position 1;
+   reject at position 0), each using a deliberate decoy token at a KNOWN
+   position and REAL trusted continuation tokens as ground truth.
+   **Decisive check**: on rejection, the recovery token equals the TRUE
+   next token (the target model's real prediction), not the decoy and
+   not garbage. **3/3 repeats, all PASS**, exact token-id comparison.
+2. **GDN state rollback -- "Option A" (snapshot/restore)**:
+   `DirectModelRunner.snapshot_gdn_state()`/`restore_gdn_state()`. Chosen
+   over Option B (exploit chunked FLA's own chunk boundaries for a
+   cheaper partial recompute) because it's simple to verify in complete
+   isolation and doesn't depend on unverified assumptions about whether
+   K=3 aligns safely with FLA's chunk granularity (not ruled out, just
+   not attempted this round). Verified via
+   `benchmarks/mtp_gdn_rollback_check.py`: a real "detour" (4 genuine
+   extra decode steps) followed by restore, compared against a twin
+   slot that never took the detour. **Result: `logits_exact_equal=true`
+   (bytewise identical), all 48 GDN layers show 0.0 diff. 3/3 repeats,
+   all PASS.**
+
+**Not implemented this round** (tracked for its own dedicated round):
+real draft generation via `Qwen3NextMTP` -- needs the draft model loaded
++ its KV cache kept in sync on every real step + the K-step propose loop
++ wiring the two verified pieces above into a real end-to-end cycle +
+comparing acceptance rate against a real vLLM MTP server (the ≤1pp
+gate). Reported honestly as larger in scope than initially estimated,
+per the coordinator's explicit invitation to do so rather than force a
+rushed finish -- the concrete design above is the starting point for
+that round, not a re-investigation.
+
 ### Phase 3, main-line redirect (2026-07-16) — direct model runner, replacing the HTTP bridge
 
 The sibling `sm120-flash-attention` project's attention-kernel-tuning main

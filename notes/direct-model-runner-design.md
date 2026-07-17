@@ -1647,3 +1647,159 @@ state cannot be simply rewound), THEN (3) the real W1/W2/concurrency=4/
 MTP-K=3 performance comparison, configured with per-slot capacity
 actually sized for W1 (4K)/W2 (32K), not this round's small 2048-token
 test configuration.
+
+## MTP semantics round (2026-07-17): accept/reject + GDN rollback implemented and verified; real draft generation investigated in depth and honestly deferred -- more scope than initially estimated
+
+Per the coordinator's explicit instruction, read `项目实施规划.md`'s
+actual contract before designing anything: **"1. 先完整复现 vLLM 的 MTP
+K=3"** (Phase 8) and **"MTP acceptance 不得比 vLLM 下降超过 1 个百分点"**
+(Phase 1 gate) -- i.e. replicate vLLM's REAL MTP mechanism, not invent a
+simplified stand-in, and the acceptance-rate bar is an explicit,
+numeric gate, not a vague aspiration.
+
+### What vLLM's real MTP K=3 actually requires (traced from source, not guessed)
+
+Read `vllm/model_executor/models/qwen3_next_mtp.py`
+(`Qwen3NextMTP`/`Qwen3NextMultiTokenPredictor` -- a genuinely SEPARATE
+small model, its own `fc`/decoder-layer(s)/`norm`, sharing only
+`embed_tokens`/`lm_head` with the target model) and
+`vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py` (the real
+propose-loop orchestrator) to understand the exact mechanism:
+
+1. **The MTP model has its OWN full-attention decoder layer(s)**
+   (`Qwen3NextDecoderLayer(layer_type="full_attention")`, count =
+   `num_nextn_predict_layers`, 1 for this model) -- a real transformer
+   layer with real K/V, not just a linear head.
+2. **This MTP attention layer needs its OWN KV cache, kept in sync with
+   the target model on EVERY real step** -- not just during propose
+   loops. `_prepare_prefill_inputs_kernel`'s "shift target_input_ids by
+   one" logic runs over the FULL current query range on every real
+   target-model prefill/decode step (not just the last position),
+   because the draft model's own attention needs COMPLETE causal history
+   to work at all -- exactly like any autoregressive transformer. This
+   means faithfully replicating vLLM's MTP requires restructuring the
+   main forward path itself (every `prefill`/`decode`/`_forward_batch`
+   call) to ALSO run a matching draft-model forward pass, not just adding
+   an isolated `propose_draft()` method called only when speculating.
+3. **The propose loop itself** (`_prefill`/`_multi_step_decode`/
+   `_generate_draft`): step 0 feeds the draft model `hidden_states =
+   target model's own last hidden state` (from the step that just ran)
+   and `input_ids` = the target's own real tokens shifted by one
+   (teacher-forcing); steps 1..K-1 feed the draft model's OWN previous
+   step's hidden state and its own previously-sampled draft token
+   (genuinely autoregressive on the draft side). Matches
+   `Qwen3NextMultiTokenPredictor.forward()`'s `spec_step_idx` parameter
+   (cycles through `self.layers[spec_step_idx % num_mtp_layers]`).
+4. **Loading it the "complete-replication" way** (not reinventing): pass
+   `speculative_config={"method": "mtp", "num_speculative_tokens": 3,
+   "attention_backend": "CUSTOM"}` to `EngineArgs` (matching
+   `launch_test_server.py`'s established convention exactly) so
+   `vllm_config.speculative_config.draft_model_config` is constructed by
+   vLLM's own `SpeculativeConfig.update_arch_()` logic (confirmed via
+   source: for `qwen3_next` models this rewrites `hf_config.model_type`
+   to `"qwen3_next_mtp"` and sets `architectures=["Qwen3NextMTP"]`, same
+   checkpoint path, different vLLM model class), then
+   `get_model(vllm_config=vllm_config, model_config=vllm_config
+   .speculative_config.draft_model_config)` loads it -- reusing real
+   vLLM construction logic end to end, not a hand-rolled substitute.
+   Because this second `get_model()` call registers the MTP layer's own
+   attention into the SAME `vllm_config.compilation_config
+   .static_forward_context` this project's existing
+   `allocate_fixed_slot_kv_caches`/`attn_layer_names` machinery already
+   iterates over, the MTP layer's KV cache allocation would "just work"
+   through the existing generic mechanism once the model is loaded before
+   cache allocation -- a clean integration point, confirmed by reading
+   the code, not yet exercised by running it.
+
+**Honest scope decision**: point 2 above -- restructuring every real
+forward call to also drive a synced draft-model KV cache -- is
+substantially more invasive than "add a propose loop," and combined with
+everything else (the loop itself, accept/reject, GDN rollback,
+verification against real vLLM's acceptance rate) does not fit this
+round's remaining budget with the rigor this project requires. Rather
+than rush an implementation likely to be subtly wrong, this round
+implements and verifies the two pieces that are genuinely self-contained
+and independently checkable without the draft model at all, and defers
+real draft generation to its own dedicated round with this design
+already worked out (not starting from zero next time).
+
+### Implemented and verified this round
+
+**1. Accept/reject boundary logic** (pure logic, no new model-loading
+needed -- exercised against the ALREADY-WORKING, CUDA-graph-capable
+`verify_batch()`): `benchmarks/mtp_accept_reject_check.py`. Draft
+convention matches `verify_batch`'s `qo_len=K+1` layout: `draft_tokens =
+[anchor, d_0, ..., d_{K-1}]` (the anchor is the already-committed last
+real token, K=3 matching production). Verify position `p`'s logits
+predict "what comes after `draft_tokens[p]`", compared against
+`draft_tokens[p+1]` for `p < K`; position `K`'s logits (nothing left to
+compare against) become the bonus token if every prior comparison
+passed -- standard greedy speculative-decoding verification, no
+probabilistic rejection sampling (matching the coordinator's explicit
+"不需要一开始就做完整概率化rejection sampling" simplification).
+
+Verified via three constructed scenarios per run, using REAL trusted
+continuation tokens (from the already-verified qo_len=1 decode path) as
+the ground truth, with a deliberate decoy token injected at a KNOWN
+position:
+- `all_accept` (draft = the real trusted continuation exactly):
+  `num_accepted=3`, committed tokens exactly match the real continuation
+  plus the correct bonus token.
+- `reject_at_1` (position 1 replaced with a decoy): `num_accepted=1`,
+  rejection detected exactly at position 1, and -- the decisive check --
+  the recovery token at the rejection point equals the TRUE next token
+  (what the target model actually predicts), NOT the decoy and not
+  garbage.
+- `reject_at_0` (position 0 replaced with a decoy): `num_accepted=0`,
+  recovery token again equals the true next token.
+
+**3/3 independent repeats, all PASS**, every scenario checked by exact
+token-id comparison against the trusted reference, not "does it look
+plausible."
+
+**2. GDN state commit/rollback -- "Option A" (snapshot/restore),
+implemented and verified**: `DirectModelRunner.snapshot_gdn_state(slot)`/
+`restore_gdn_state(slot, snapshot)`. Design choice, weighed against the
+coordinator's Option B (exploit chunked FLA's own chunk boundaries to
+recompute only the rejected sub-range): Option A was chosen because it
+is simple to reason about correctly and to verify in complete isolation
+from the rest of MTP (no draft model or propose loop needed to test it),
+at the cost of an extra state copy per verify call and a full recompute
+forward pass on rejection. Option B was NOT ruled out as wrong, just not
+attempted this round -- it would require verifying FLA's chunk
+granularity aligns safely with arbitrary per-token accept/reject
+boundaries (K=3 is smaller than `FLA_CHUNK_SIZE` in the general case, so
+a rejection could fall mid-chunk), which this round did not investigate
+deeply enough to trust; Option A's correctness doesn't depend on that
+question at all.
+
+Verified via `benchmarks/mtp_gdn_rollback_check.py` -- a numerical twin
+comparison, not signal-probe: one slot takes a real "detour" (4 extra
+genuine decode steps advancing its GDN state for real, simulating "some
+speculative steps ran"), then gets its state restored from a snapshot
+taken before the detour; a twin slot never takes any detour at all.
+Both are then driven through the identical next real decode step.
+**Result: `logits_exact_equal=true` (bytewise identical, not just
+close), and all 48 GDN layers checked show `conv_diff=0.0`/
+`ssm_diff=0.0`.** Restoring genuinely undoes the detour's real state
+changes, not just makes subsequent output look plausible. **3/3
+independent repeats, all PASS.**
+
+### Not implemented this round (explicitly, tracked for the next round)
+
+Real draft generation via the model's own native MTP head
+(`Qwen3NextMTP`) -- requires: (a) loading the draft model via
+`speculative_config`, (b) restructuring `prefill`/`decode`/
+`_forward_batch` to also drive the draft model's own KV-cache-synced
+forward pass on every real step (not just during propose loops), (c) the
+K-step autoregressive propose loop itself, (d) wiring the two verified
+pieces above (accept/reject, GDN rollback) into a real end-to-end
+verify-then-commit-or-rollback cycle, (e) comparing the resulting
+acceptance rate against a real vLLM MTP server on the same
+prompt/seed against the project's explicit ≤1-percentage-point gate.
+This is a substantially larger, multi-part integration than initially
+scoped when this round started -- reported honestly per the
+coordinator's explicit invitation to do so, not forced to a rushed
+finish. Recommendation: treat this as its own dedicated round, using the
+concrete design above (already traced from source, not requiring
+re-investigation) as the starting point.

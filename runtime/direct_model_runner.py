@@ -792,6 +792,51 @@ class DirectModelRunner:
         self.slot_kv_len[slot] = 0
         self.slot_gdn_initialized[slot] = False
 
+    def snapshot_gdn_state(self, slot: int) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+        """Copy out this slot's ``(conv_state, ssm_state)`` for every GDN
+        layer, keyed by layer name. Building block for MTP verify's GDN
+        state commit/rollback (2026-07-17 round): unlike attention's paged
+        KV cache (content-addressed by position, safe to just stop
+        advancing ``slot_kv_len`` past a rejected boundary), GDN's
+        recurrent/chunked state has no position index to truncate to -- it
+        is a single accumulated value per slot that a verify call updates
+        in place. Snapshotting before a verify call and restoring here on
+        partial rejection (this class's chosen strategy -- "Option A" in
+        notes/direct-model-runner-design.md's MTP-semantics design
+        section) is the correctness-first approach: simple to reason about
+        and to verify independently of the rest of MTP (see
+        ``benchmarks/mtp_gdn_rollback_check.py``), at the cost of an extra
+        state copy per verify call and a recompute forward pass on
+        rejection. Returns CPU-resident clones (not GPU-resident, to avoid
+        holding extra persistent GPU memory for a snapshot that is usually
+        discarded within one verify step) -- restore moves them back to
+        device."""
+        physical = _physical_slot(slot)
+        snapshot: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        for name in self.gdn_layer_names:
+            conv_state, ssm_state = self.kv_caches[name]
+            snapshot[name] = (
+                conv_state[physical].detach().to("cpu", copy=True),
+                ssm_state[physical].detach().to("cpu", copy=True),
+            )
+        return snapshot
+
+    def restore_gdn_state(
+        self, slot: int, snapshot: dict[str, tuple[torch.Tensor, torch.Tensor]]
+    ) -> None:
+        """Restore this slot's GDN state from a prior
+        ``snapshot_gdn_state()`` call -- writes IN PLACE into the same
+        persistent ``kv_caches`` tensors (never reallocates them), so this
+        is safe to call between real forward passes without disturbing any
+        other slot or any fixed-address buffer a CUDA-graph-captured call
+        might depend on."""
+        physical = _physical_slot(slot)
+        for name in self.gdn_layer_names:
+            conv_state, ssm_state = self.kv_caches[name]
+            snap_conv, snap_ssm = snapshot[name]
+            conv_state[physical].copy_(snap_conv.to(self.device))
+            ssm_state[physical].copy_(snap_ssm.to(self.device))
+
 
 class CapturedBatchDecodeGraph:
     """CUDA-graph-captured batch decode/verify for a FIXED batch size and
