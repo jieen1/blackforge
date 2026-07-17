@@ -223,29 +223,82 @@ def _check_numerical_twin(runner, tok) -> dict:
 
 
 def _check_signal_probe(runner, tok) -> dict:
+    """2026-07-17 methodology fix: this check's original pass criterion
+    ("no two slots' committed sequences are ever identical") turned out
+    to be a real, reproducible false-positive trap for THESE SPECIFIC 4
+    prompts -- all share an identical template ("The capital of X is"),
+    differing only in one embedded country name/token. A deep, multi-stage
+    diagnosis (mtp_slot_identity_pinpoint_diag.py +
+    mtp_prefill_draft_logits_diag.py) confirmed this is genuine,
+    deterministic model behavior, NOT a cross-slot data-sharing bug: each
+    slot's OWN raw logits (both the draft model's step-0 logits and the
+    target model's verify logits) are substantially different between
+    slots (e.g. slot1-vs-slot2 max_abs_diff ~7.6, the SAME order of
+    magnitude as slot1-vs-slot3's ~7.8, i.e. no suspicious closeness) --
+    but BOTH slots independently have a near-tie (margin < this
+    project's own established NEAR_TIE_LOGIT_MARGIN=2.0) between the
+    SAME two generic continuation-token candidates after the shared
+    template's factual statement, and that near-tie happens to resolve
+    the same way for both. This is the identical CLASS of phenomenon
+    already documented elsewhere in this codebase (e.g. the "271 vs 198"
+    near-tie found earlier this session) -- batch-size-dependent kernel
+    numerics can tip a genuine near-tie either way, and a template shared
+    across all 4 probe prompts makes hitting the SAME near-tie for
+    multiple slots far more likely than for prompts with less shared
+    structure. Fixed by cross-checking each slot's own committed content
+    against an INDEPENDENT reference replay (the same robust methodology
+    ``_check_numerical_twin`` already uses) instead of the fragile
+    "must differ from every other slot" assumption -- that assumption is
+    demoted to an informational signal only (``no_cross_contamination_signal``),
+    not a pass/fail gate.
+    """
     slots = [0, 1, 2, 3]
+    ref_slots = [4, 5, 6, 7]
     prompt_ids_per_slot = [tok.encode(p, add_special_tokens=False) for p in FOUR_PROMPTS]
-    _reset_if_needed(runner, slots)
+    _reset_if_needed(runner, slots + ref_slots)
 
     prefill_result = runner.mtp_prefill_batch(slots, prompt_ids_per_slot)
     anchors = {s: prefill_result[s]["anchor"] for s in slots}
     drafts = {s: prefill_result[s]["draft_tokens"] for s in slots}
+    for i, s in enumerate(slots):
+        ref_first = runner.prefill(ref_slots[i], prompt_ids_per_slot[i])
+        if ref_first != anchors[s]:
+            return {"passed": False, "error": f"prefill anchor mismatch for slot {s}"}
 
     committed_sequences = {s: [] for s in slots}
+    per_slot_rounds = {s: [] for s in slots}
     for r in range(NUM_ROUNDS):
         decisions = runner.mtp_verify_and_commit_batch(slots, anchors, drafts)
-        for s in slots:
-            committed_sequences[s].extend(decisions[s]["committed"])
-            anchors[s], drafts[s] = decisions[s]["next_anchor"], decisions[s]["next_draft_tokens"]
+        for i, s in enumerate(slots):
+            decision = decisions[s]
+            committed_sequences[s].extend(decision["committed"])
+            real_new_tokens = [anchors[s]] + decision["committed"][:-1]
+            ref_report = _ref_check(runner, ref_slots[i], real_new_tokens, decision["next_anchor"])
+            per_slot_rounds[s].append(
+                {
+                    "round": r,
+                    "draft_sync_len_matches_kv_len": runner.slot_draft_sync_len[s] == runner.slot_kv_len[s],
+                    **ref_report,
+                }
+            )
+            anchors[s], drafts[s] = decision["next_anchor"], decision["next_draft_tokens"]
+
+    per_slot_ok = {}
+    for s in slots:
+        rounds = per_slot_rounds[s]
+        per_slot_ok[s] = all(r["draft_sync_len_matches_kv_len"] for r in rounds) and all(
+            r["content_ok_within_near_tie_tolerance"] for r in rounds
+        )
 
     seqs = list(committed_sequences.values())
-    no_cross_contamination = all(
+    no_cross_contamination_signal = all(
         seqs[i] != seqs[j] for i in range(len(seqs)) for j in range(i + 1, len(seqs))
     )
     decoded = {s: tok.decode(committed_sequences[s]) for s in slots}
     return {
-        "passed": bool(no_cross_contamination),
-        "no_cross_contamination_signal": no_cross_contamination,
+        "passed": bool(all(per_slot_ok.values())),
+        "per_slot_ok": per_slot_ok,
+        "no_cross_contamination_signal": no_cross_contamination_signal,
         "committed_sequences": committed_sequences,
         "decoded_completions": decoded,
     }
@@ -365,6 +418,7 @@ def main() -> int:
         },
         "check2_signal_probe": {
             "passed": result["check2_signal_probe"]["passed"],
+            "per_slot_ok": result["check2_signal_probe"].get("per_slot_ok"),
             "no_cross_contamination_signal": result["check2_signal_probe"]["no_cross_contamination_signal"],
             "decoded_completions": result["check2_signal_probe"]["decoded_completions"],
         },

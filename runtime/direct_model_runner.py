@@ -225,6 +225,17 @@ def build_gdn_metadata(
     )
 
 
+_MAX_DECODE_QO_LEN = 16
+# Matches the real SM120GQAMetadataBuilder's own _MAX_DECODE_QO_LEN
+# (vllm/v1/attention/backends/sm120_gqa.py) -- the decode/verify-shaped
+# fast kernel's tested qo_len upper bound. Every real call in this project
+# stays well under this (K+1 <= 4), so this cap was previously a latent,
+# never-exercised gap (the old unconditional ``decode_qo_len = qo_len``
+# formula had no cap at all) -- added here as part of the 2026-07-17
+# ragged-qo_len generalization below, for faithfulness to the real
+# formula, not because it currently changes any real call's outcome.
+
+
 def build_attention_metadata_batch(
     *,
     slots: list[int],
@@ -232,7 +243,7 @@ def build_attention_metadata_batch(
     block_size: int,
     blocks_per_slot: int,
     device: torch.device,
-    qo_len: int = 1,
+    qo_len: int | list[int] = 1,
     is_decode: bool = True,
     fixed_kv_split_size: int | None = None,
     fixed_max_num_splits: int | None = None,
@@ -323,12 +334,47 @@ def build_attention_metadata_batch(
     num_splits(k) = ceil(k/s) <= ceil(L/s) <= target_splits (s >= L/target_splits
     by construction) -- so a single fixed pair is a valid upper bound for
     the entire decode lifetime of any request in this slot.
+
+    ``qo_len`` as a RAGGED per-request list (2026-07-17 generalization,
+    for the recompute-fallback batching round): previously a single
+    scalar shared by the whole batch (the uniform case, e.g. verify's
+    K+1 or a single decode token). A ``list[int]`` (one value per slot)
+    is now also accepted -- this is what lets
+    ``mtp_verify_and_commit_batch``'s recompute-fallback group (each
+    slot needing a DIFFERENT number of real committed tokens replayed)
+    batch into ONE call instead of one single-slot call per affected
+    slot. A scalar ``qo_len`` is treated as a uniform list (broadcast to
+    every slot) -- this is a strict generalization, not a parallel code
+    path: every existing scalar call site produces byte-identical
+    tensors to before.
+
+    ``decode_qo_len``/``is_pure_decode`` now match the real
+    ``SM120GQAMetadataBuilder.build()`` formula exactly, including its
+    non-uniform-batch behavior: ``decode_qo_len = max(qo_lens) if
+    (is_decode and is_uniform and max(qo_lens) <= _MAX_DECODE_QO_LEN)
+    else 0``. A RAGGED (non-uniform) qo_lens list therefore ALWAYS gets
+    ``decode_qo_len=0`` -- this deliberately routes ragged batches
+    through the SAME general/chunked-prefix attention kernel
+    (``flash_attn_sm120_fp8_kv_paged`` et al.) that this project's own
+    genuine multi-token PREFILL calls already use, NOT a new kernel path
+    invented for this round: that kernel is already documented (source
+    comment in ``vllm/v1/attention/backends/sm120_gqa.py``) as "correct
+    for pure prefill, chunked-prefill continuation, and ARBITRARY MIXED
+    prefill+decode batches" -- i.e. real, ragged, per-request-varying
+    query lengths within one batched call are exactly its designed use
+    case, not new territory for the kernel itself, only for how THIS
+    project's Python-side metadata construction reaches it.
     """
     num_reqs = len(slots)
     if len(prior_kv_lens) != num_reqs:
         raise ValueError("slots and prior_kv_lens must have equal length")
+    qo_lens = [qo_len] * num_reqs if isinstance(qo_len, int) else list(qo_len)
+    if len(qo_lens) != num_reqs:
+        raise ValueError("qo_len list must have exactly one entry per slot")
+    is_uniform = len(set(qo_lens)) <= 1
+
     page_size = block_size
-    new_kv_lens = [kv_len + qo_len for kv_len in prior_kv_lens]
+    new_kv_lens = [kv_len + qo for kv_len, qo in zip(prior_kv_lens, qo_lens)]
     num_pages_per_req = [(kv_len + page_size - 1) // page_size for kv_len in new_kv_lens]
     for slot, kv_len, num_pages in zip(slots, new_kv_lens, num_pages_per_req):
         if num_pages > blocks_per_slot:
@@ -337,7 +383,10 @@ def build_attention_metadata_batch(
                 f"{blocks_per_slot * page_size}-token capacity"
             )
 
-    qo_indptr = torch.arange(0, num_reqs + 1, dtype=torch.int32, device=device) * qo_len
+    qo_indptr_list = [0]
+    for qo in qo_lens:
+        qo_indptr_list.append(qo_indptr_list[-1] + qo)
+    qo_indptr = torch.tensor(qo_indptr_list, dtype=torch.int32, device=device)
 
     kv_page_indptr_list = [0]
     for num_pages in num_pages_per_req:
@@ -376,18 +425,21 @@ def build_attention_metadata_batch(
         # decode_batch/verify_batch paths.
         kv_split_size = max(max(new_kv_lens, default=1), 1)
         max_num_splits = 1
+
+    max_qo_len = max(qo_lens) if qo_lens else 0
+    decode_qo_len = max_qo_len if (is_decode and is_uniform and max_qo_len <= _MAX_DECODE_QO_LEN) else 0
     return SM120GQAMetadata(
-        num_actual_tokens=num_reqs * qo_len,
+        num_actual_tokens=sum(qo_lens),
         num_reqs=num_reqs,
         qo_indptr=qo_indptr,
         kv_page_indptr=kv_page_indptr,
         kv_page_indices=kv_page_indices,
         kv_last_page_len=kv_last_page_len,
         page_size=page_size,
-        is_pure_decode=(is_decode and qo_len == 1),
+        is_pure_decode=(is_decode and max_qo_len == 1),
         kv_split_size=kv_split_size,
         max_num_splits=max_num_splits,
-        decode_qo_len=(qo_len if is_decode else 0),
+        decode_qo_len=decode_qo_len,
     )
 
 
@@ -395,7 +447,7 @@ def build_gdn_metadata_batch(
     *,
     slots: list[int],
     device: torch.device,
-    qo_len: int = 1,
+    qo_len: int | list[int] = 1,
     slot_initialized: list[bool] | None = None,
 ) -> GDNAttentionMetadata:
     """Hand-built GDNAttentionMetadata for a real batch of requests, each
@@ -413,7 +465,31 @@ def build_gdn_metadata_batch(
     exactly to the previously-verified values -- a generalization, not a
     parallel implementation.
 
-    ``qo_len>1`` is MTP/speculative-decode verify. Rather than
+    **2026-07-17 real bug, found via a batch=1 forced-reject equivalence
+    test** (``benchmarks/mtp_ragged_recompute_verify_check.py``): an
+    earlier version of this fast path was gated on
+    ``isinstance(qo_len, int) and qo_len == 1`` -- i.e. a UNIFORM list
+    where every entry happens to be 1 (exactly what the new
+    ragged-recompute-batching caller always constructs, even for a
+    single recompute slot with ``committed_len == 1``, since it always
+    passes a list) fell through to the chunked/general branch instead,
+    unlike a bare scalar ``1``. That asymmetry is NOT what
+    ``build_attention_metadata_batch``'s own analogous ``decode_qo_len``
+    logic does (it already treats a uniform list and a scalar
+    identically, via ``is_uniform``/``max_qo_len``) -- this function's
+    old condition was a real, narrower special-case that diverged from
+    the sibling function's already-correct generalization, and the
+    chunked/general GDN path is NOT a drop-in numerically-equivalent
+    substitute for the fast single-token decode path (confirmed by the
+    test finding real committed-content divergence between the two,
+    not just a near-tie). Fixed below by making the fast-path condition
+    VALUE-based (uniform, all entries equal to 1) instead of
+    TYPE-based (bare scalar only) -- this treats scalar ``1`` and a
+    uniform ``[1, 1, ...]`` list identically, exactly mirroring
+    ``build_attention_metadata_batch``'s own already-correct pattern.
+
+    ``qo_len>1`` (or a ragged per-request list, 2026-07-17 generalization
+    -- see below) is MTP/speculative-decode verify. Rather than
     replicating the real builder's much more involved ``spec_decode``
     branch (accept/reject bookkeeping, sorting spec vs non-spec tokens --
     explicitly out of scope this round, see notes/direct-model-runner-
@@ -426,12 +502,35 @@ def build_gdn_metadata_batch(
     numerically correct (the chunked FLA kernel handles arbitrary query
     length, GDN state update included) even though it foregoes the
     real builder's spec-decode-specific optimizations.
+
+    ``qo_len`` as a RAGGED per-request list (2026-07-17, for the
+    recompute-fallback batching round -- mirrors
+    ``build_attention_metadata_batch``'s identical generalization):
+    ``query_start_loc`` is built from a per-request cumulative sum
+    instead of ``arange(n+1) * qo_len`` -- a strict generalization (a
+    scalar ``qo_len`` broadcasts to a uniform list, reducing to the exact
+    same tensor as before). Crucially, this is NOT the same padding
+    concern flagged when this generalization was first scoped: a
+    genuinely ragged CSR construction feeds EVERY request EXACTLY its own
+    real token count into the chunked FLA kernel (``prepare_chunk_indices``/
+    ``prepare_chunk_offsets``/``compute_causal_conv1d_metadata`` are all
+    already CSR/``cu_seqlens``-generic -- this project's own prior
+    uniform-only usage was a special case of what these functions already
+    support, not a hand-restriction on them). There is no padding token
+    ever fed to any request's GDN state under this design, so the
+    recurrent-state-corruption concern that made a padding-based ragged
+    batch design hard does not apply here -- it only would have applied
+    to a design that forced a shared qo_len via padding, which this is
+    deliberately NOT doing.
     """
     num_reqs = len(slots)
     state_indices = torch.tensor(
         [_physical_slot(slot) for slot in slots], dtype=torch.int32, device=device
     )
-    if qo_len == 1:
+    qo_lens = [qo_len] * num_reqs if isinstance(qo_len, int) else list(qo_len)
+    if len(qo_lens) != num_reqs:
+        raise ValueError("qo_len list must have exactly one entry per slot")
+    if num_reqs > 0 and all(qo == 1 for qo in qo_lens):
         non_spec_qsl = torch.arange(0, num_reqs + 1, dtype=torch.int32, device=device)
         return GDNAttentionMetadata(
             num_prefills=0,
@@ -446,8 +545,11 @@ def build_gdn_metadata_batch(
         )
 
     if slot_initialized is None or len(slot_initialized) != num_reqs:
-        raise ValueError("slot_initialized (one bool per slot) is required when qo_len > 1")
-    query_start_loc = torch.arange(0, num_reqs + 1, dtype=torch.int32, device=device) * qo_len
+        raise ValueError("slot_initialized (one bool per slot) is required when qo_len != 1")
+    qsl_list = [0]
+    for qo in qo_lens:
+        qsl_list.append(qsl_list[-1] + qo)
+    query_start_loc = torch.tensor(qsl_list, dtype=torch.int32, device=device)
     query_start_loc_cpu = query_start_loc.cpu()
     has_initial_state = torch.tensor(slot_initialized, dtype=torch.bool, device=device)
     chunk_indices = prepare_chunk_indices(query_start_loc, FLA_CHUNK_SIZE)
@@ -455,7 +557,7 @@ def build_gdn_metadata_batch(
     nums_dict, batch_ptr, token_chunk_offset_ptr = compute_causal_conv1d_metadata(
         query_start_loc_cpu, device=device
     )
-    num_actual_tokens = num_reqs * qo_len
+    num_actual_tokens = sum(qo_lens)
     return GDNAttentionMetadata(
         num_prefills=num_reqs,
         num_prefill_tokens=num_actual_tokens,
@@ -786,16 +888,22 @@ class DirectModelRunner:
         return int(logits[-1].argmax(dim=-1).item())
 
     def _slot_mapping_batch(
-        self, slots: list[int], kv_lengths: list[int], qo_len: int = 1
+        self, slots: list[int], kv_lengths: list[int], qo_len: int | list[int] = 1
     ) -> torch.Tensor:
         """Batched analogue of ``_slot_mapping``: each request contributes
         ``qo_len`` new tokens starting at its own ``kv_lengths[i]``,
         flattened in the SAME per-request-contiguous order ``_forward_batch``
         uses for ``input_ids``/``positions`` (request 0's ``qo_len`` tokens,
         then request 1's, ...). At ``qo_len=1`` this reduces exactly to the
-        previously-verified one-position-per-request mapping."""
-        positions = [kv_len + j for kv_len in kv_lengths for j in range(qo_len)]
-        slots_per_token = [slot for slot in slots for _ in range(qo_len)]
+        previously-verified one-position-per-request mapping. ``qo_len`` may
+        also be a per-slot RAGGED list (2026-07-17, mirrors
+        ``build_attention_metadata_batch``'s identical generalization) --
+        a scalar broadcasts to a uniform list, so every existing call site
+        is unaffected."""
+        num_reqs = len(slots)
+        qo_lens = [qo_len] * num_reqs if isinstance(qo_len, int) else list(qo_len)
+        positions = [kv_len + j for kv_len, qo in zip(kv_lengths, qo_lens) for j in range(qo)]
+        slots_per_token = [slot for slot, qo in zip(slots, qo_lens) for _ in range(qo)]
         block_ids = torch.tensor(
             [
                 _physical_slot(slot) * self.blocks_per_slot + pos // self.block_size
@@ -815,7 +923,7 @@ class DirectModelRunner:
         token_ids,
         kv_lengths: list[int],
         *,
-        qo_len: int = 1,
+        qo_len: int | list[int] = 1,
         commit: bool = True,
         return_hidden: bool = False,
         is_decode: bool = True,
@@ -883,9 +991,22 @@ class DirectModelRunner:
         story (2026-07-17, found after the coordinator's own nvidia-smi
         monitoring caught persistently low GPU utilization in the batched
         MTP path despite high CUDA-event-measured busy time).
+
+        ``qo_len`` as a RAGGED per-request list (2026-07-17, for the
+        recompute-fallback batching round): each slot may contribute a
+        DIFFERENT number of new tokens this call -- forwarded as-is to
+        ``build_attention_metadata_batch``/``build_gdn_metadata_batch``
+        (both already generalized for this, see their docstrings) and
+        used locally to build per-slot-correct ``positions``/kv_len
+        bookkeeping. A scalar ``qo_len`` broadcasts to a uniform list, so
+        every existing call site is byte-for-byte unaffected.
         """
         num_reqs = len(slot_ids)
-        if qo_len == 1:
+        qo_lens = [qo_len] * num_reqs if isinstance(qo_len, int) else list(qo_len)
+        if len(qo_lens) != num_reqs:
+            raise ValueError("qo_len list must have exactly one entry per slot")
+
+        if isinstance(qo_len, int) and qo_len == 1:
             if not (len(token_ids) == num_reqs and len(kv_lengths) == num_reqs):
                 raise ValueError("slot_ids/token_ids/kv_lengths must have equal length")
             flat_token_ids = token_ids
@@ -893,11 +1014,11 @@ class DirectModelRunner:
             if not (
                 len(token_ids) == num_reqs
                 and len(kv_lengths) == num_reqs
-                and all(len(t) == qo_len for t in token_ids)
+                and all(len(t) == qo for t, qo in zip(token_ids, qo_lens))
             ):
                 raise ValueError(
                     "slot_ids/token_ids/kv_lengths must have equal length, and "
-                    f"every token_ids[i] must have exactly qo_len={qo_len} tokens"
+                    "every token_ids[i] must have exactly qo_len[i] tokens"
                 )
             flat_token_ids = [tok for slot_tokens in token_ids for tok in slot_tokens]
 
@@ -940,7 +1061,11 @@ class DirectModelRunner:
             slots=slot_ids,
             device=self.device,
             qo_len=qo_len,
-            slot_initialized=[self.slot_gdn_initialized[s] for s in slot_ids] if qo_len > 1 else None,
+            slot_initialized=(
+                [self.slot_gdn_initialized[s] for s in slot_ids]
+                if not (isinstance(qo_len, int) and qo_len == 1)
+                else None
+            ),
         )
         attn_metadata_dict = {name: attn_meta for name in self.attn_layer_names}
         attn_metadata_dict.update({name: gdn_meta for name in self.gdn_layer_names})
@@ -949,7 +1074,7 @@ class DirectModelRunner:
 
         input_ids = torch.tensor(flat_token_ids, dtype=torch.long, device=self.device)
         positions = torch.tensor(
-            [kv_len + j for kv_len in kv_lengths for j in range(qo_len)],
+            [kv_len + j for kv_len, qo in zip(kv_lengths, qo_lens) for j in range(qo)],
             dtype=torch.long,
             device=self.device,
         )
@@ -962,9 +1087,9 @@ class DirectModelRunner:
         logits = self.model.compute_logits(hidden_states)
         torch.cuda.synchronize()
 
-        for slot in slot_ids:
+        for slot, qo in zip(slot_ids, qo_lens):
             if commit:
-                self.slot_kv_len[slot] += qo_len
+                self.slot_kv_len[slot] += qo
             self.slot_gdn_initialized[slot] = True
         if return_hidden:
             return logits, hidden_states
@@ -1430,7 +1555,7 @@ class DirectModelRunner:
         prior_kv_lens: list[int],
         start_pos_list: list[int],
         *,
-        qo_len: int,
+        qo_len: int | list[int],
         is_decode: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Batched analogue of ``_mtp_forward`` for the draft model
@@ -1438,9 +1563,11 @@ class DirectModelRunner:
         ``self.mtp_attn_layer_names``, no GDN metadata since the draft model
         registers no GDN layers -- see ``__init__``'s ``mtp_attn_layer_names``
         derivation) and ONE ``mtp_model.forward()`` call covering every
-        listed slot. Requires the SAME ``qo_len`` (new-token count) for
-        every slot this call, exactly like ``build_attention_metadata_batch``
-        (the underlying metadata builder) already requires.
+        listed slot. ``qo_len`` may be a per-slot RAGGED list (2026-07-17,
+        for the recompute-fallback batching round -- mirrors
+        ``build_attention_metadata_batch``'s identical generalization,
+        forwarded through as-is); a scalar broadcasts to a uniform list,
+        so every existing call site is byte-for-byte unaffected.
 
         ``prior_kv_lens``/``start_pos_list`` are explicit per-slot lists,
         kept as TWO separate parameters (not collapsed into one) to mirror
@@ -1453,10 +1580,11 @@ class DirectModelRunner:
         of the single-slot one.
 
         ``token_ids`` is a flat list (one token id per slot, in ``slots``
-        order) when ``qo_len == 1``, or a list of per-slot token-id lists
-        (each of length ``qo_len``) otherwise -- same convention
-        ``_forward_batch`` uses. Returns logits/hidden_states shaped
-        ``[len(slots) * qo_len, ...]`` in request-then-position order.
+        order) when ``qo_len`` is the literal scalar ``1``, or a list of
+        per-slot token-id lists (each of length ``qo_len[i]``, possibly
+        ragged) otherwise -- same convention ``_forward_batch`` uses.
+        Returns logits/hidden_states shaped ``[sum(qo_lens), ...]`` in
+        request-then-position order.
         """
         if self.mtp_model is None:
             raise RuntimeError(
@@ -1465,13 +1593,16 @@ class DirectModelRunner:
         num_reqs = len(slots)
         if not (len(prior_kv_lens) == num_reqs and len(start_pos_list) == num_reqs):
             raise ValueError("slots/prior_kv_lens/start_pos_list must have equal length")
-        if qo_len == 1:
+        qo_lens = [qo_len] * num_reqs if isinstance(qo_len, int) else list(qo_len)
+        if len(qo_lens) != num_reqs:
+            raise ValueError("qo_len list must have exactly one entry per slot")
+        if isinstance(qo_len, int) and qo_len == 1:
             if len(token_ids) != num_reqs:
                 raise ValueError("token_ids must have one entry per slot when qo_len == 1")
             flat_token_ids = token_ids
         else:
-            if not (len(token_ids) == num_reqs and all(len(t) == qo_len for t in token_ids)):
-                raise ValueError("every slot's token_ids must have exactly qo_len entries")
+            if not (len(token_ids) == num_reqs and all(len(t) == qo for t, qo in zip(token_ids, qo_lens))):
+                raise ValueError("every slot's token_ids must have exactly qo_len[i] entries")
             flat_token_ids = [tok for slot_tokens in token_ids for tok in slot_tokens]
 
         attn_meta = build_attention_metadata_batch(
@@ -1506,7 +1637,7 @@ class DirectModelRunner:
 
         input_ids = torch.tensor(flat_token_ids, dtype=torch.long, device=self.device)
         positions = torch.tensor(
-            [start_pos + j for start_pos in start_pos_list for j in range(qo_len)],
+            [start_pos + j for start_pos, qo in zip(start_pos_list, qo_lens) for j in range(qo)],
             dtype=torch.long,
             device=self.device,
         )
@@ -1525,32 +1656,44 @@ class DirectModelRunner:
         shifted_input_ids_per_slot: list[list[int]],
         target_hidden_states: torch.Tensor,
         start_pos_list: list[int],
-        num_new_tokens: int,
+        num_new_tokens: int | list[int],
         k: int,
     ) -> dict[int, list[int]]:
         """Batched analogue of ``_mtp_sync_and_propose``: one batched step-0
-        sync call (uniform ``num_new_tokens`` across every listed slot --
-        the caller guarantees this; see ``mtp_prefill_batch``'s uniform-
-        prompt-length requirement and ``mtp_verify_and_commit_batch``'s
-        full-accept-only slot grouping for the two real call sites), followed
-        by ``k-1`` batched autoregressive steps (each contributing exactly 1
-        new token per slot -- always uniform, regardless of ``num_new_tokens``).
+        sync call, followed by ``k-1`` batched autoregressive steps (each
+        contributing exactly 1 new token per slot -- always uniform,
+        regardless of ``num_new_tokens``).
+
+        ``num_new_tokens`` may be a per-slot RAGGED list (2026-07-17, for
+        the recompute-fallback batching round -- mirrors
+        ``_mtp_forward_batch``'s identical generalization): different
+        slots' committed lengths from a partial-reject round genuinely
+        differ, so a single shared scalar can no longer describe every
+        real call site (``mtp_prefill_batch``'s uniform-prompt-length
+        group and ``mtp_verify_and_commit_batch``'s full-accept group
+        still pass a uniform value -- a scalar broadcasts to a uniform
+        list, so those call sites are byte-for-byte unaffected;
+        ``mtp_verify_and_commit_batch``'s recompute group is the new,
+        genuinely-ragged caller).
 
         Tracks ONE ``running_prior_kv_len`` PER SLOT (a list, not a scalar)
         -- the direct batched generalization of the single-slot 2026-07-17
         fix documented on ``_mtp_forward``: each slot's own draft-sync
-        length can differ even though every slot shares this call's
-        ``num_new_tokens``/``k``, so a single shared counter would silently
-        reintroduce the exact bug that fix addressed. Returns a dict keyed
-        by slot id (not a positional list) so callers can freely pass a
-        SUBSET of the runner's active slots (e.g. only the full-accept
-        group from ``mtp_verify_and_commit_batch``) without index confusion.
+        length can differ even though every slot shares this call's ``k``,
+        so a single shared counter would silently reintroduce the exact
+        bug that fix addressed. Returns a dict keyed by slot id (not a
+        positional list) so callers can freely pass a SUBSET of the
+        runner's active slots (e.g. only the full-accept group from
+        ``mtp_verify_and_commit_batch``) without index confusion.
         """
         num_reqs = len(slots)
         if not (len(shifted_input_ids_per_slot) == num_reqs and len(start_pos_list) == num_reqs):
             raise ValueError("slots/shifted_input_ids_per_slot/start_pos_list must have equal length")
-        if not all(len(t) == num_new_tokens for t in shifted_input_ids_per_slot):
-            raise ValueError("every slot's shifted_input_ids must have exactly num_new_tokens entries")
+        num_new_tokens_list = [num_new_tokens] * num_reqs if isinstance(num_new_tokens, int) else list(num_new_tokens)
+        if len(num_new_tokens_list) != num_reqs:
+            raise ValueError("num_new_tokens list must have exactly one entry per slot")
+        if not all(len(t) == n for t, n in zip(shifted_input_ids_per_slot, num_new_tokens_list)):
+            raise ValueError("every slot's shifted_input_ids must have exactly num_new_tokens[i] entries")
 
         prior_kv_lens_step0 = [self.slot_draft_sync_len[s] for s in slots]
         step0_logits, step0_hidden = self._mtp_forward_batch(
@@ -1560,24 +1703,33 @@ class DirectModelRunner:
             prior_kv_lens_step0,
             start_pos_list,
             qo_len=num_new_tokens,
-            is_decode=(num_new_tokens == 1),
+            is_decode=all(n == 1 for n in num_new_tokens_list),
         )
-        for s in slots:
-            self.slot_draft_sync_len[s] += num_new_tokens
+        for s, n in zip(slots, num_new_tokens_list):
+            self.slot_draft_sync_len[s] += n
+
+        # Per-request row offsets into step0's flattened [sum(num_new_tokens), ...]
+        # output (request-then-position order) -- generalizes the old
+        # ``i * num_new_tokens + num_new_tokens - 1`` uniform-stride formula
+        # to a ragged cumulative-sum offset; reduces to the exact same
+        # indices when num_new_tokens_list is uniform.
+        row_offsets = [0]
+        for n in num_new_tokens_list:
+            row_offsets.append(row_offsets[-1] + n)
 
         draft_tokens: dict[int, list[int]] = {s: [] for s in slots}
         last_hidden_rows = []
         prev_tokens = []
         for i in range(num_reqs):
-            last_idx = i * num_new_tokens + num_new_tokens - 1
+            last_idx = row_offsets[i + 1] - 1
             tok = int(step0_logits[last_idx].argmax(dim=-1).item())
             draft_tokens[slots[i]].append(tok)
             prev_tokens.append(tok)
             last_hidden_rows.append(step0_hidden[last_idx : last_idx + 1])
         prev_hidden = torch.cat(last_hidden_rows, dim=0)
 
-        next_pos_list = [sp + num_new_tokens for sp in start_pos_list]
-        running_prior_kv_len = list(prior_kv_lens_step0[i] + num_new_tokens for i in range(num_reqs))
+        next_pos_list = [sp + n for sp, n in zip(start_pos_list, num_new_tokens_list)]
+        running_prior_kv_len = [prior_kv_lens_step0[i] + num_new_tokens_list[i] for i in range(num_reqs)]
         for _ in range(1, k):
             step_logits, step_hidden = self._mtp_forward_batch(
                 slots,
@@ -1678,21 +1830,38 @@ class DirectModelRunner:
           (``_mtp_sync_and_propose_batch``).
         - NEEDS-RECOMPUTE slots (partial reject -- and the rejection
           position, hence ``committed_len``, can differ PER SLOT even
-          within the same round): rather than building variable-length
-          batch padding/masking machinery for this uncommon case, falls
-          back to the EXISTING, already-verified single-slot recompute
-          path (``_forward_batch([slot], ...)`` + ``_mtp_sync_and_propose
-          (slot, ...)``, called once per affected slot -- byte-for-byte
-          the same calls ``mtp_verify_and_commit`` itself makes, not new
-          code), so this uncommon path carries no additional correctness
-          risk beyond what is already verified.
+          within the same round): **2026-07-17, now ALSO batched in ONE
+          call**, not a per-slot loop. Originally (same-day, earlier
+          commit) this fell back to the single-slot recompute path
+          per affected slot, reported honestly at the time as "no
+          variable-length batch padding/masking machinery built for this
+          uncommon case." That framing turned out to be wrong on the
+          empirical premise, not just the engineering scope: direct
+          measurement (``benchmarks/mtp_batch_recompute_cost_diag.py``)
+          found recompute is NOT uncommon -- 84.4% of real rounds hit it,
+          accounting for ~56% of total wall time. The actual fix needed
+          no padding/masking at all: ``_forward_batch``/
+          ``_mtp_sync_and_propose_batch`` (and the ``build_attention_
+          metadata_batch``/``build_gdn_metadata_batch`` builders under
+          them) were generalized to accept a per-request RAGGED
+          ``qo_len``/``num_new_tokens`` list -- each recompute slot's own
+          real ``committed_len`` is fed to the kernel directly via CSR
+          (``qo_indptr``/``query_start_loc``), the same ragged-batch
+          representation vLLM's own general/chunked attention kernel and
+          FLA's chunked GDN kernel already support for real prefill
+          batches with heterogeneous prompt lengths -- no fake padding
+          tokens are ever fed to any slot's GDN recurrent state, so the
+          padding-based recurrent-state-corruption concern that made this
+          look hard up front never actually applied to the ragged-CSR
+          design used here.
 
-        GDN state independence across the two groups is preserved because
-        ``snapshot_gdn_state``/``restore_gdn_state`` already index by
-        physical slot (see their docstrings) -- restoring a recompute
-        slot's GDN state cannot disturb a full-accept slot's, even though
-        both slots' states live in the same underlying batched tensor and
-        were just updated by the SAME shared ``verify_batch`` forward call.
+        GDN state independence across slots (full-accept, and now also
+        across DIFFERENT recompute slots sharing one ragged batched call)
+        is preserved because ``snapshot_gdn_state``/``restore_gdn_state``
+        already index by physical slot (see their docstrings) -- restoring
+        one slot's GDN state cannot disturb another's, even though every
+        slot's state lives in the same underlying batched tensor and was
+        just updated by the SAME shared forward call.
 
         Returns a dict keyed by slot id, each value shaped exactly like
         ``mtp_verify_and_commit``'s own return dict (plus ``next_anchor``/
@@ -1723,22 +1892,31 @@ class DirectModelRunner:
                 i = slots.index(s)
                 real_new_hidden[s] = verify_hidden[i * (k + 1) : (i + 1) * (k + 1)]
 
-        for s in recompute_slots:
-            self.restore_gdn_state(s, snapshots[s])
-            self.slot_kv_len[s] = kv_lens_before[s]
-            committed_len = decisions[s]["num_accepted"] + 1
-            tokens = real_new_tokens[s]
-            _, hidden = self._forward_batch(
-                [s],
-                [tokens] if committed_len > 1 else tokens,
-                [kv_lens_before[s]],
-                qo_len=committed_len,
+        # Real per-slot committed lengths (RAGGED across recompute_slots --
+        # this is exactly the case build_attention_metadata_batch/
+        # build_gdn_metadata_batch's 2026-07-17 ragged-qo_len
+        # generalization exists for). Batched in ONE forward call across
+        # every recompute slot, not a per-slot loop.
+        recompute_committed_lens = {s: decisions[s]["num_accepted"] + 1 for s in recompute_slots}
+        hidden_recompute = None
+        if recompute_slots:
+            for s in recompute_slots:
+                self.restore_gdn_state(s, snapshots[s])
+                self.slot_kv_len[s] = kv_lens_before[s]
+            qo_lens_recompute = [recompute_committed_lens[s] for s in recompute_slots]
+            tokens_recompute = [real_new_tokens[s] for s in recompute_slots]
+            kv_lens_recompute = [kv_lens_before[s] for s in recompute_slots]
+            _, hidden_recompute = self._forward_batch(
+                recompute_slots,
+                tokens_recompute,
+                kv_lens_recompute,
+                qo_len=qo_lens_recompute,
                 commit=True,
                 return_hidden=True,
+                is_decode=True,
                 fixed_kv_split_size=self.decode_fixed_kv_split_size,
                 fixed_max_num_splits=self.decode_fixed_max_num_splits,
             )
-            real_new_hidden[s] = hidden
 
         next_anchors = {s: decisions[s]["committed"][-1] for s in slots}
         result: dict[int, dict] = {}
@@ -1763,18 +1941,24 @@ class DirectModelRunner:
                     "next_draft_tokens": next_drafts_batch[s],
                 }
 
-        for s in recompute_slots:
-            committed_len = decisions[s]["num_accepted"] + 1
-            next_drafts = self._mtp_sync_and_propose(
-                s,
-                real_new_tokens[s][1:] + [next_anchors[s]],
-                real_new_hidden[s],
-                start_pos=self.slot_draft_sync_len[s],
-                num_new_tokens=committed_len,
+        if recompute_slots:
+            shifted_recompute = [real_new_tokens[s][1:] + [next_anchors[s]] for s in recompute_slots]
+            start_pos_list_recompute = [self.slot_draft_sync_len[s] for s in recompute_slots]
+            next_drafts_recompute = self._mtp_sync_and_propose_batch(
+                recompute_slots,
+                shifted_recompute,
+                hidden_recompute,
+                start_pos_list_recompute,
+                num_new_tokens=[recompute_committed_lens[s] for s in recompute_slots],
                 k=k,
             )
-            self.slot_pending_draft_tokens[s] = next_drafts
-            result[s] = {**decisions[s], "next_anchor": next_anchors[s], "next_draft_tokens": next_drafts}
+            for s in recompute_slots:
+                self.slot_pending_draft_tokens[s] = next_drafts_recompute[s]
+                result[s] = {
+                    **decisions[s],
+                    "next_anchor": next_anchors[s],
+                    "next_draft_tokens": next_drafts_recompute[s],
+                }
 
         return result
 

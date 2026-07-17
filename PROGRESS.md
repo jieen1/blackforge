@@ -915,17 +915,110 @@ below max_model_len): ~112 CTAs, a real ~7x increase but still well under
 188 SMs — consistent with (not contradicting) Finding 2's modest, real
 +13% measured gain.
 
-**Round summary**: three real, independently-verified, additive
-findings — (1) cross-slot batching +43% (11.60→16.61 tok/s), (2)
-split-KV fix +13% more (16.61→18.78 tok/s), (3) recompute-fallback
-batching NOT fixed this round, the largest single remaining lever
-(~56% of wall time / ~2.28x potential, top-priority next step, requires
-generalizing both metadata builders for per-request ragged qo_len).
-**Bottom line: native 144.54 tok/s vs. this runtime's 18.78 — ~7.7x
-slower**, down from ~8.7x/12.46x at earlier rounds but still a large
-gap. ncu data shows real headroom remains on the kernel-occupancy
-dimension even independent of Finding 1 — fixing the recompute fallback
-alone would not by itself close the gap to native.
+**Round summary (superseded by the ragged-qo_len generalization and its
+perf re-measurement below — the final bottom line is the one after those
+sections)**: three real, independently-verified, additive findings — (1)
+cross-slot batching +43% (11.60→16.61 tok/s), (2) split-KV fix +13% more
+(16.61→18.78 tok/s), (3) recompute-fallback batching NOT fixed this
+round, the largest single remaining lever (~56% of wall time / ~2.28x
+potential, top-priority next step, requires generalizing both metadata
+builders for per-request ragged qo_len).
+
+### Phase 3, ragged-qo_len generalization: fixing the recompute-fallback path for real (2026-07-17)
+
+Full detail in `notes/direct-model-runner-design.md`. Generalized
+`build_attention_metadata_batch`/`build_gdn_metadata_batch` to accept a
+per-request RAGGED `qo_len` list (not just a shared scalar) so
+`mtp_verify_and_commit_batch`'s recompute-fallback group batches into
+ONE call across all affected slots even with different real committed
+lengths — replacing the per-slot Python loop Finding 1 identified.
+Simpler than first scoped: a genuinely ragged CSR construction (no
+padding) sidesteps the GDN recurrent-state-corruption concern entirely
+— the underlying general attention kernel and FLA's chunked GDN
+primitives already support arbitrary per-request lengths natively (this
+project's prior uniform-only usage was a special case, not a
+restriction). Scalar `qo_len` broadcasts to a uniform list everywhere,
+so existing call sites are byte-for-byte unaffected.
+
+**A real bug caught by re-running the existing 4-check regression suite**
+(standing project discipline: any production-code change gets
+re-verified against the full existing suite): `build_gdn_metadata_batch`'s
+fast-decode-path condition was TYPE-based (`isinstance(qo_len, int) and
+qo_len == 1`) instead of VALUE-based, so the new code's `[1]`-list
+committed_len=1 case wrongly fell through to the chunked GDN path
+(not numerically equivalent to the fast path). Fixed to
+`all(qo == 1 for qo in qo_lens)`, mirroring the attention side's
+already-correct `is_uniform`/`max_qo_len` pattern. Caught and confirmed
+via a new dedicated batch=1 forced-reject equivalence test
+(`benchmarks/mtp_ragged_recompute_verify_check.py`), re-verified clean
+after the fix (including genuinely ragged multi-value committed-len
+batches, e.g. `{0:1, 1:2, 2:3, 3:1}` in one call).
+
+**A second, separate finding that was NOT a bug**: `check2_signal_probe`
+still showed 2 of 4 signal-probe slots (structurally-similar "The
+capital of X is" prompts) committing identical content — a deterministic
+(bit-reproducible across independent runs), genuine model near-tie
+coincidence, NOT a cross-slot data bug. Proven via raw-logit
+instrumentation at the draft-model and target-model stages: each slot's
+own logits differ substantially from the other's (comparable in
+magnitude to an unrelated slot pair — ruling out shared memory/addressing),
+but both independently sit inside a near-tie (under this project's own
+established `NEAR_TIE_LOGIT_MARGIN=2.0`) between the same two generic
+continuation tokens, resolving the same way because all 4 prompts share
+an identical template. Same class of phenomenon as the earlier-documented
+"271 vs 198" near-tie. Fixed `check2_signal_probe`'s test methodology
+(not the runtime) to use independent-reference-replay like
+`check1_numerical_twin` already does, instead of the fragile "no two
+slots ever identical" assumption. Both the new and original suites now
+pass cleanly.
+
+### Phase 3, ragged-qo_len fix re-measured: flat, not the expected ~2.28x (2026-07-17)
+
+Same W1-S perf script (`mtp_w1s_our_runtime_perf.py --batched`, n=16,
+K=3, concurrency=4, 3 reps), re-run after the ragged-recompute-batching
+fix above was fully verified correct. **Result: 18.50 / 18.75 / 18.38
+accepted tok/s, mean 18.54** — essentially FLAT versus the pre-fix
+18.78 (-1.3%, within run-to-run noise), not the ~2.28x the earlier
+`mtp_batch_recompute_cost_diag.py` finding projected. Reported exactly
+as measured — the correctness work itself is not in question (the
+recompute-fallback group genuinely now shares one kernel launch instead
+of one per slot, verified via the dedicated test suite above), only the
+earlier throughput PROJECTION was wrong.
+
+**Why the projection overshot**: that earlier "~2.28x potential" number
+came from comparing raw wall-clock time per round bucketed by
+`num_recompute_slots` (0 recompute: 292.8ms/round; 4 recompute:
+1148.4ms/round) and assuming every round could run at the 0-recompute
+rate if batched. This silently conflated two things: rounds with more
+recompute slots also commit FEWER total tokens on average (a recompute
+round is, by definition, at least one partial/full reject), so part of
+that wall-clock gap was "less useful work happening," not "fixed
+per-launch overhead paid multiple times." Finding 3's `ncu` data — ~94-
+95% GPU-busy% and only 16 CTAs/16.7% occupancy in the batched verify
+kernel, unchanged across every configuration measured this entire
+session, including the very first single-slot baseline — is the more
+reliable signal: idle time between launches was never the dominant cost
+here; the dominant cost is per-launch compute/memory-bandwidth time,
+which cutting launch COUNT alone does not address.
+
+**Final round bottom line**: native 144.54 vs. this runtime's 18.54
+accepted tok/s — **~7.8x slower**, plateauing at roughly the same ratio
+(~7.7-7.8x) across the last three rounds (cross-slot batching, split-KV,
+ragged-recompute batching) despite each being a real, verified,
+individually-positive-or-neutral fix. What this session's four findings
+establish together: scheduling/launch-gap overhead was never the primary
+bottleneck (GPU-busy% ~94-95% from the start); the real constraint is
+low per-kernel SM occupancy at this concurrency (16/188 SMs, ~16.7%), a
+property of serving only 4 concurrent slots relative to the GPU's own
+parallelism budget — something coordinator-level batching among 4 slots
+cannot fully overcome by itself. Split-KV (Finding 2) is the one lever
+so far that measurably helped, consistent with this: more CTAs helps,
+but ~112 (this session's own back-of-envelope post-split-KV estimate)
+is still far from 188. The clearer remaining path is architectural —
+either genuinely higher concurrency (if the real target workload
+supports it) or a kernel-level redesign extracting more parallelism
+from a single request's own computation — rather than further
+coordinator/batching-level changes of the kind this session explored.
 
 ### Phase 3, expanded W1-S sample (2026-07-17) — the 6.45pp gap collapses to 1.34pp: it WAS small-sample noise
 
