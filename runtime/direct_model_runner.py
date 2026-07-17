@@ -55,6 +55,43 @@ def _physical_slot(logical_slot: int) -> int:
     return logical_slot + RESERVED_PHYSICAL_SLOTS
 
 
+def _ssm_spec_row(logical_slot: int, col: int, total_physical_slots: int, num_spec: int) -> int:
+    """Physical SSM-state row for MTP verify's K+1 candidate positions
+    (Phase 2, 2026-07-18 -- ``notes/2026-07-17-post-ragged-round-next-steps.md``
+    section 10/11). Re-derived and reconfirmed directly against the real
+    kernel this round (``fused_sigmoid_gating_delta_rule_update_kernel``,
+    ``vllm/model_executor/layers/fla/ops/fused_sigmoid_gating.py``): that
+    kernel reads its initial state from
+    ``ssm_state_indices[i_n, num_accepted_tokens[i_n] - 1]`` and
+    unconditionally WRITES a result into ``ssm_state_indices[i_n, t]`` for
+    every candidate position ``t`` in this round's batch -- i.e. real
+    vLLM's own ``spec_state_indices_tensor`` is a FIXED per-(request,
+    column) physical-row mapping (there, a slice of that request's own
+    persistent block table, allocated once and never reshuffled across
+    rounds), and it is ``num_accepted_tokens`` -- supplied fresh each
+    round from the PREVIOUS round's real accept/reject outcome -- that
+    selects which of those fixed rows holds the valid incoming state.
+    This function is the fixed-slot-runtime analogue of that same fixed
+    per-(slot, column) mapping: column 0 always resolves to
+    ``_physical_slot(logical_slot)`` -- the SAME row the ordinary
+    chunked/non-spec GDN path already writes to (this is what makes the
+    bootstrap case -- the first spec verify round right after a real
+    prefill -- correct: passing ``num_accepted_tokens_prev=1`` selects
+    ``i_t=0``, i.e. column 0, i.e. exactly the row the prefill's chunked
+    forward wrote into). Columns 1..num_spec each get their own
+    dedicated row in a separate address range (past every slot's column-0
+    row), written unconditionally every verify round regardless of which
+    candidate later turns out to be the real one -- a rejected
+    candidate's row is simply never selected by any future round's
+    ``num_accepted_tokens``-derived read, which is what eliminates the
+    need for any explicit snapshot/restore or recompute-forward repair.
+    """
+    physical = _physical_slot(logical_slot)
+    if col == 0:
+        return physical
+    return total_physical_slots + physical * num_spec + (col - 1)
+
+
 def _ensure_sm120_backend_registered() -> None:
     """register_backend() is a plain dict write (see registry.py's
     _ATTN_OVERRIDES) -- safe to call more than once."""
@@ -69,6 +106,7 @@ def allocate_fixed_slot_kv_caches(
     num_slots: int,
     block_size: int,
     blocks_per_slot: int,
+    num_speculative_tokens: int = 0,
 ) -> dict[str, object]:
     """Allocate our own num_slots-fixed-slot KV (attention) and state (GDN)
     tensors and bind them via vLLM's own real ``bind_kv_cache()`` -- shared
@@ -109,7 +147,18 @@ def allocate_fixed_slot_kv_caches(
         conv_dtype, ssm_dtype = layer.get_state_dtype()
         total_physical_slots = num_slots + RESERVED_PHYSICAL_SLOTS
         conv_state = torch.zeros((total_physical_slots, *conv_shape), dtype=conv_dtype, device=device)
-        ssm_state = torch.zeros((total_physical_slots, *ssm_shape), dtype=ssm_dtype, device=device)
+        # Phase 2 (2026-07-18): SSM/recurrent state gets num_speculative_tokens
+        # EXTRA dedicated rows per physical slot -- one per non-anchor MTP
+        # candidate position -- on top of the ordinary one row per physical
+        # slot ("column 0", shared with the non-spec/chunked/prefill path).
+        # See _ssm_spec_row's docstring for the addressing scheme and its
+        # direct verification against the real spec-decode GDN kernel.
+        # num_speculative_tokens=0 (no MTP configured) reduces this to
+        # exactly the previous allocation -- byte-for-byte unaffected.
+        ssm_rows_per_slot = 1 + num_speculative_tokens
+        ssm_state = torch.zeros(
+            (total_physical_slots * ssm_rows_per_slot, *ssm_shape), dtype=ssm_dtype, device=device
+        )
         kv_caches[name] = (conv_state, ssm_state)
 
     runner_kv_caches: list[torch.Tensor] = []
@@ -580,6 +629,78 @@ def build_gdn_metadata_batch(
     )
 
 
+def build_gdn_metadata_spec_batch(
+    *,
+    slots: list[int],
+    device: torch.device,
+    qo_len: int,
+    num_accepted_tokens_prev: list[int],
+    total_physical_slots: int,
+    num_spec: int,
+) -> GDNAttentionMetadata:
+    """Real spec-decode GDN metadata (Phase 2, 2026-07-18) -- the
+    ``num_prefills=0, num_decodes=0, num_spec_decodes=len(slots)`` branch
+    of the real ``GDNAttentionMetadataBuilder.build()`` (``gdn_attn.py``),
+    hand-built for our fixed-slot runtime instead of vLLM's paged block
+    table. Replaces ``build_gdn_metadata_batch``'s chunked/prefill-shaped
+    treatment of an MTP verify step for ``mtp_verify_and_commit_batch``
+    specifically (``mtp_verify_and_commit``, the singular/looped sibling,
+    keeps using the chunked path + snapshot/restore/recompute -- an
+    intentional, documented divergence, see notes doc section 10/11).
+
+    ``qo_len`` here is always ``num_spec + 1`` (the K draft continuations
+    + 1 bonus/anchor position) -- unlike ``build_gdn_metadata_batch``,
+    this is NOT generalized to a ragged per-request list: every slot in
+    one spec-decode verify call always submits the SAME K+1-token draft
+    (a global engine config), matching ``verify_batch``'s own existing
+    uniform-qo_len contract.
+
+    ``spec_state_indices_tensor[i, col] = _ssm_spec_row(slots[i], col,
+    total_physical_slots, num_spec)`` -- a FIXED per-(slot, column)
+    physical-row mapping, unchanging round to round (see
+    ``_ssm_spec_row``'s docstring for why this matches the real kernel's
+    own block-table-derived addressing). ``num_accepted_tokens_prev[i]``
+    is slot ``slots[i]``'s real committed length from its OWN previous
+    verify round (or exactly ``1`` for a slot's first-ever verify right
+    after a real prefill -- the bootstrap case, selecting column 0, the
+    row the chunked prefill forward itself wrote into).
+
+    ``spec_token_indx``/``non_spec_token_indx``/``has_initial_state``
+    are deliberately left ``None`` -- confirmed by direct reading of
+    ``qwen_gdn_linear_attn.py``'s ``_forward_core`` that the
+    ``num_prefills=0 and num_decodes=0`` branch takes ``mixed_qkv_spec =
+    mixed_qkv`` directly (no ``index_select``) and never reads
+    ``has_initial_state`` at all in that branch (real drafts always
+    resume from real prior state -- there is no "fresh" spec-decode
+    request in this project's design, since every slot has already gone
+    through a real ``mtp_prefill_batch`` before its first verify call)."""
+    num_reqs = len(slots)
+    if len(num_accepted_tokens_prev) != num_reqs:
+        raise ValueError("num_accepted_tokens_prev must have exactly one entry per slot")
+    spec_query_start_loc = torch.arange(0, num_reqs + 1, dtype=torch.int32, device=device) * qo_len
+    state_indices_list = [
+        [_ssm_spec_row(slot, col, total_physical_slots, num_spec) for col in range(qo_len)]
+        for slot in slots
+    ]
+    spec_state_indices_tensor = torch.tensor(state_indices_list, dtype=torch.int32, device=device)
+    spec_sequence_masks = torch.ones(num_reqs, dtype=torch.bool, device=device)
+    num_accepted_tokens = torch.tensor(num_accepted_tokens_prev, dtype=torch.int32, device=device)
+    num_actual_tokens = num_reqs * qo_len
+    return GDNAttentionMetadata(
+        num_prefills=0,
+        num_prefill_tokens=0,
+        num_decodes=0,
+        num_decode_tokens=0,
+        num_spec_decodes=num_reqs,
+        num_spec_decode_tokens=num_actual_tokens,
+        num_actual_tokens=num_actual_tokens,
+        spec_query_start_loc=spec_query_start_loc,
+        spec_state_indices_tensor=spec_state_indices_tensor,
+        spec_sequence_masks=spec_sequence_masks,
+        num_accepted_tokens=num_accepted_tokens,
+    )
+
+
 def build_vllm_config(
     *,
     model: str,
@@ -816,6 +937,20 @@ class DirectModelRunner:
         self.slot_pending_draft_tokens: list[list[int] | None] = [None] * num_slots
         self.slot_gdn_snapshot_gen = [0] * num_slots
 
+        # Phase 2 (2026-07-18): per-slot "real committed length from this
+        # slot's own last spec-decode GDN verify round" -- read by
+        # build_gdn_metadata_spec_batch to select which of the previous
+        # round's K+1 dedicated SSM rows holds the valid state to resume
+        # from (see _ssm_spec_row/build_gdn_metadata_spec_batch). Bootstrap
+        # value is 1 (not 0) for a slot's first-ever spec verify right
+        # after a real prefill -- selects column 0, the same physical row
+        # the chunked prefill forward itself wrote into. Reset to 1 on
+        # ``reset_slot`` and explicitly re-set to 1 in ``mtp_prefill_batch``
+        # for defense in depth. Unused by ``mtp_verify_and_commit`` (the
+        # singular/looped sibling), which still uses the old chunked +
+        # snapshot/restore + recompute-forward mechanism unconditionally.
+        self.slot_num_accepted_tokens = [1] * num_slots
+
         # Split-KV parallelism for decode/verify-shaped batched kernel calls
         # (2026-07-17, found via direct source comparison after the
         # coordinator's own nvidia-smi monitoring caught persistently low
@@ -985,6 +1120,7 @@ class DirectModelRunner:
             num_slots=self.num_slots,
             block_size=self.block_size,
             blocks_per_slot=self.blocks_per_slot,
+            num_speculative_tokens=self.num_speculative_tokens or 0,
         )
 
     def _allocate_gdn_snapshot_buffers(self) -> None:
@@ -1208,6 +1344,7 @@ class DirectModelRunner:
         is_decode: bool = True,
         fixed_kv_split_size: int | None = None,
         fixed_max_num_splits: int | None = None,
+        gdn_spec_num_accepted_tokens_prev: list[int] | None = None,
     ) -> torch.Tensor:
         """Real batched decode/verify: ONE batched attention/GDN metadata
         object and ONE ``model.forward()`` call covering every listed slot
@@ -1279,6 +1416,20 @@ class DirectModelRunner:
         used locally to build per-slot-correct ``positions``/kv_len
         bookkeeping. A scalar ``qo_len`` broadcasts to a uniform list, so
         every existing call site is byte-for-byte unaffected.
+
+        ``gdn_spec_num_accepted_tokens_prev`` (2026-07-18, Phase 2, default
+        ``None`` preserving every existing call site byte-for-byte): when
+        given (one entry per slot), GDN metadata is built via the REAL
+        spec-decode mechanism (``build_gdn_metadata_spec_batch``) instead
+        of the chunked/prefill-shaped ``build_gdn_metadata_batch`` --
+        K+1 dedicated SSM state rows per slot, acceptance-aware addressing
+        selecting which row survives to be read next round, no
+        snapshot/restore or recompute-forward needed. Requires a SCALAR,
+        uniform ``qo_len`` (always ``num_speculative_tokens + 1`` in
+        practice) -- unlike the chunked path this is not generalized to a
+        ragged per-request list, since every real spec-decode verify call
+        submits the same K+1-token draft for every slot. Only
+        ``verify_batch_spec`` passes this.
         """
         num_reqs = len(slot_ids)
         qo_lens = [qo_len] * num_reqs if isinstance(qo_len, int) else list(qo_len)
@@ -1336,16 +1487,28 @@ class DirectModelRunner:
             fixed_kv_split_size=fixed_kv_split_size,
             fixed_max_num_splits=fixed_max_num_splits,
         )
-        gdn_meta = build_gdn_metadata_batch(
-            slots=slot_ids,
-            device=self.device,
-            qo_len=qo_len,
-            slot_initialized=(
-                [self.slot_gdn_initialized[s] for s in slot_ids]
-                if not (isinstance(qo_len, int) and qo_len == 1)
-                else None
-            ),
-        )
+        if gdn_spec_num_accepted_tokens_prev is not None:
+            if not isinstance(qo_len, int):
+                raise ValueError("gdn_spec_num_accepted_tokens_prev requires a scalar qo_len")
+            gdn_meta = build_gdn_metadata_spec_batch(
+                slots=slot_ids,
+                device=self.device,
+                qo_len=qo_len,
+                num_accepted_tokens_prev=gdn_spec_num_accepted_tokens_prev,
+                total_physical_slots=self.num_slots + RESERVED_PHYSICAL_SLOTS,
+                num_spec=self.num_speculative_tokens,
+            )
+        else:
+            gdn_meta = build_gdn_metadata_batch(
+                slots=slot_ids,
+                device=self.device,
+                qo_len=qo_len,
+                slot_initialized=(
+                    [self.slot_gdn_initialized[s] for s in slot_ids]
+                    if not (isinstance(qo_len, int) and qo_len == 1)
+                    else None
+                ),
+            )
         attn_metadata_dict = {name: attn_meta for name in self.attn_layer_names}
         attn_metadata_dict.update({name: gdn_meta for name in self.gdn_layer_names})
         slot_mapping = self._slot_mapping_batch(slot_ids, kv_lengths, qo_len=qo_len)
@@ -1425,6 +1588,46 @@ class DirectModelRunner:
             fixed_max_num_splits=self.decode_fixed_max_num_splits,
         )
 
+    def verify_batch_spec(
+        self,
+        slot_ids: list[int],
+        draft_token_ids: list[list[int]],
+        kv_lengths: list[int],
+        *,
+        num_accepted_tokens_prev: list[int],
+        return_hidden: bool = False,
+    ) -> torch.Tensor:
+        """MTP/speculative-decode verify via the REAL spec-decode GDN
+        mechanism (Phase 2, 2026-07-18) -- ``verify_batch``'s sibling for
+        ``mtp_verify_and_commit_batch`` only. Same call shape/return
+        convention as ``verify_batch`` (raw logits AND hidden states,
+        request-then-position order, ``commit=False`` -- caller advances
+        ``slot_kv_len``/``slot_num_accepted_tokens`` after accept/reject).
+        The only difference is GDN metadata construction: K+1 dedicated
+        SSM state rows per slot (``build_gdn_metadata_spec_batch``,
+        ``_ssm_spec_row``) instead of the chunked/prefill-shaped path,
+        so a partial reject needs no snapshot/restore or recompute-forward
+        repair -- the "wrong" candidates' rows are simply never read by
+        any future round. ``num_accepted_tokens_prev[i]`` is slot
+        ``slot_ids[i]``'s real committed length from its own last verify
+        round (or exactly 1 on a slot's first-ever verify right after a
+        real prefill -- see ``build_gdn_metadata_spec_batch``'s
+        docstring). See notes/2026-07-17-post-ragged-round-next-steps.md
+        section 10/11 for the derivation and validation history that
+        underlies this method."""
+        qo_len = len(draft_token_ids[0]) if draft_token_ids else 0
+        return self._forward_batch(
+            slot_ids,
+            draft_token_ids,
+            kv_lengths,
+            qo_len=qo_len,
+            commit=False,
+            return_hidden=return_hidden,
+            fixed_kv_split_size=self.decode_fixed_kv_split_size,
+            fixed_max_num_splits=self.decode_fixed_max_num_splits,
+            gdn_spec_num_accepted_tokens_prev=num_accepted_tokens_prev,
+        )
+
     def reset_slot(self, slot: int) -> None:
         """Release a slot for reuse by a new logical request. Does not zero
         the underlying tensors -- the next prefill's has_initial_state=False
@@ -1448,6 +1651,9 @@ class DirectModelRunner:
         self.slot_gdn_initialized[slot] = False
         self.slot_draft_sync_len[slot] = 0
         self.slot_pending_draft_tokens[slot] = None
+        # Phase 2 (2026-07-18): bootstrap value for the spec-decode GDN
+        # mechanism -- see __init__'s field comment.
+        self.slot_num_accepted_tokens[slot] = 1
 
     def snapshot_gdn_state(self, slot: int) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
         """Copy out this slot's ``(conv_state, ssm_state)`` for every GDN
@@ -2167,6 +2373,13 @@ class DirectModelRunner:
         for s in slots:
             if self.slot_kv_len[s] != 0 or self.slot_draft_sync_len[s] != 0:
                 raise RuntimeError(f"slot {s} is not fresh")
+            # Phase 2 (2026-07-18), defense in depth: bootstrap value for
+            # the spec-decode GDN mechanism's first-ever verify round on
+            # this slot -- already 1 via __init__/reset_slot for any slot
+            # that actually went through one of those, set explicitly here
+            # too so this invariant holds regardless of how the slot got
+            # to "fresh".
+            self.slot_num_accepted_tokens[s] = 1
 
         target_logits, target_hidden = self._forward_batch(
             slots,
@@ -2203,220 +2416,118 @@ class DirectModelRunner:
         anchors: dict[int, int],
         draft_tokens: dict[int, list[int]],
     ) -> dict[int, dict]:
-        """Batched analogue of ``mtp_verify_and_commit``. ALWAYS batches the
-        verify step across every listed slot in ONE real batched forward
-        (``verify_batch``) -- unconditionally safe, since every slot submits
-        the SAME K+1-token draft (``num_speculative_tokens`` is a global
-        engine config, matching ``verify_batch``'s own uniform-``qo_len``
-        contract).
+        """Batched analogue of ``mtp_verify_and_commit`` -- **Phase 2,
+        2026-07-18 rewrite** (``notes/2026-07-17-post-ragged-round-next-steps.md``
+        section 10/11): now uses the REAL spec-decode GDN mechanism
+        (``verify_batch_spec`` / ``build_gdn_metadata_spec_batch`` /
+        ``_ssm_spec_row``) instead of Phase 0-3's chunked-GDN-metadata +
+        snapshot/restore + recompute-forward mechanism. This eliminates an
+        entire class of extra work this function used to do on every
+        partial-reject round (``benchmarks/mtp_batch_recompute_cost_diag.py``
+        found that was 84.4% of real rounds, ~56% of round wall time):
+        there is no more snapshot, no more restore, no more separate
+        recompute forward pass, and (as a direct consequence) no more
+        full-accept/recompute GROUP SPLIT at all -- every slot in this
+        call, regardless of its own accept/reject outcome, is handled by
+        the exact same code path below.
 
-        After seeing each slot's real accept/reject outcome, this explicitly
-        does NOT assume every slot stays at the same MTP-cycle stage
-        (2026-07-17, per the coordinator's specific instruction): it splits
-        the batch into two groups and handles each correctly --
+        Why one uniform code path is now correct (not just simpler): GDN's
+        recurrent state, under the real spec-decode kernel
+        (``fused_sigmoid_gating_delta_rule_update_kernel`` -- re-verified
+        directly against source this round, see ``_ssm_spec_row``'s
+        docstring), computes a causally-valid PER-POSITION output for
+        every one of the K+1 candidate positions in a single verify
+        forward, unconditionally, regardless of which candidates later
+        turn out to be real -- exactly like attention already was
+        (content/position-addressed, so a rejected position's KV is
+        simply never read again). Only the recurrent STATE COMMIT (which
+        physical row is read next round) is acceptance-aware, via
+        ``num_accepted_tokens``/``_ssm_spec_row`` -- the per-position
+        OUTPUT itself needs no rollback or recomputation. This means
+        every slot's hidden states for positions ``0..committed_len-1``
+        are already sitting in ``verify_hidden``, correct, from the ONE
+        verify forward this method issues -- a straight ragged SLICE
+        (never a second forward pass) is all the draft resync step needs,
+        for full-accept slots (``committed_len == k+1``) exactly as much
+        as for any partial-reject slot (``committed_len < k+1``).
 
-        - FULL-ACCEPT slots (``num_accepted == k``): every slot in this
-          group has the SAME ``committed_len == k + 1``, so their draft
-          catch-up+propose step is ALSO safely batchable
-          (``_mtp_sync_and_propose_batch``).
-        - NEEDS-RECOMPUTE slots (partial reject -- and the rejection
-          position, hence ``committed_len``, can differ PER SLOT even
-          within the same round): **2026-07-17, now ALSO batched in ONE
-          call**, not a per-slot loop. Originally (same-day, earlier
-          commit) this fell back to the single-slot recompute path
-          per affected slot, reported honestly at the time as "no
-          variable-length batch padding/masking machinery built for this
-          uncommon case." That framing turned out to be wrong on the
-          empirical premise, not just the engineering scope: direct
-          measurement (``benchmarks/mtp_batch_recompute_cost_diag.py``)
-          found recompute is NOT uncommon -- 84.4% of real rounds hit it,
-          accounting for ~56% of total wall time. The actual fix needed
-          no padding/masking at all: ``_forward_batch``/
-          ``_mtp_sync_and_propose_batch`` (and the ``build_attention_
-          metadata_batch``/``build_gdn_metadata_batch`` builders under
-          them) were generalized to accept a per-request RAGGED
-          ``qo_len``/``num_new_tokens`` list -- each recompute slot's own
-          real ``committed_len`` is fed to the kernel directly via CSR
-          (``qo_indptr``/``query_start_loc``), the same ragged-batch
-          representation vLLM's own general/chunked attention kernel and
-          FLA's chunked GDN kernel already support for real prefill
-          batches with heterogeneous prompt lengths -- no fake padding
-          tokens are ever fed to any slot's GDN recurrent state, so the
-          padding-based recurrent-state-corruption concern that made this
-          look hard up front never actually applied to the ragged-CSR
-          design used here.
+        Persistent per-slot bookkeeping this round introduces:
+        ``self.slot_num_accepted_tokens`` (this slot's real committed
+        length from ITS OWN last verify round, or bootstrap 1 right after
+        a real prefill) -- read by ``build_gdn_metadata_spec_batch`` to
+        select which of last round's K+1 dedicated SSM rows holds the
+        valid state to resume from, and updated here after every round.
 
-        GDN state independence across slots (full-accept, and now also
-        across DIFFERENT recompute slots sharing one ragged batched call)
-        is preserved because ``snapshot_gdn_state``/``restore_gdn_state``
-        already index by physical slot (see their docstrings) -- restoring
-        one slot's GDN state cannot disturb another's, even though every
-        slot's state lives in the same underlying batched tensor and was
-        just updated by the SAME shared forward call.
+        Known, deliberate scope limits of this rewrite (see the notes doc
+        for the full reasoning): (1) the verify forward here is EAGER
+        only -- it does not (yet) go through ``CapturedBatchDecodeGraph``
+        (that class is built around the OLD chunked GDN metadata path;
+        reconciling it with the new spec-decode metadata is follow-up
+        work, not done this round) -- ``self.enable_cudagraph`` therefore
+        no longer affects this method's verify step at all (the draft
+        model's OWN step-0/continuation graphs, unrelated to GDN state,
+        are unaffected and still used via ``_mtp_sync_and_propose_batch``).
+        (2) ``mtp_verify_and_commit`` (the singular/looped sibling) is
+        intentionally NOT migrated -- it still uses the old chunked +
+        snapshot/restore + recompute-forward mechanism unconditionally,
+        so ``snapshot_gdn_state``/``restore_gdn_state`` remain in place
+        (still exercised by ``benchmarks/mtp_gdn_rollback_check.py`` and
+        by the singular path), just no longer called from here.
 
         Returns a dict keyed by slot id, each value shaped exactly like
         ``mtp_verify_and_commit``'s own return dict (plus ``next_anchor``/
-        ``next_draft_tokens``).
-
-        **2026-07-17, Phase 3** (``notes/2026-07-17-post-ragged-round-next-steps.md``):
-        two changes to the verify step specifically, both targeting Phase
-        0's finding that the verify/recompute/draft COMPUTE phases (not
-        just the since-fixed GDN snapshot/restore phases) carry a large
-        eager-dispatch no-kernel gap (~37-42% of every round's wall time):
-
-        1. The verify forward itself now goes through a CUDA-graph replay
-           (``CapturedBatchDecodeGraph``, via ``self._get_verify_graph``)
-           whenever ``self.enable_cudagraph`` is on AND this runner was
-           configured with enough spare slot capacity for that batch_size
-           (``num_slots >= 2*len(slots)``) -- one pre-recorded sequence of
-           kernel launches replayed with fresh data ``.copy_()``'d into
-           fixed-address buffers, instead of eager dispatch through
-           ``verify_batch``/``_forward_batch`` (which alone launches ~3634
-           kernels per call per Phase 0's ledger). Falls back to the
-           already-verified eager ``verify_batch`` path -- correctly, not
-           silently -- whenever the graph isn't available for this call's
-           batch_size (e.g. ``enable_cudagraph`` is off, matching every
-           existing correctness suite in this project; or a caller's
-           real active-slot count shrinks below what was pre-captured).
-        2. Accept/reject is now computed via ``determine_accept_reject_batch``
-           -- ONE batched GPU argmax + ONE host round-trip for the WHOLE
-           batch, instead of a per-slot Python loop each calling
-           ``determine_accept_reject`` (up to ``k+1`` sequential
-           ``.item()`` calls per slot)."""
-        num_reqs = len(slots)
+        ``next_draft_tokens``) -- the external contract is unchanged."""
         k = len(draft_tokens[slots[0]])
         drafts_by_slot = {s: [anchors[s]] + draft_tokens[s] for s in slots}
         drafts = [drafts_by_slot[s] for s in slots]
         kv_lens_before = {s: self.slot_kv_len[s] for s in slots}
-        snapshots = {s: self.snapshot_gdn_state(s) for s in slots}
+        num_accepted_prev = [self.slot_num_accepted_tokens[s] for s in slots]
 
-        graph = self._get_verify_graph(len(slots), k + 1) if self.enable_cudagraph else None
-        if graph is not None:
-            verify_logits, verify_hidden = graph.replay(
-                slots, drafts, [kv_lens_before[s] for s in slots], commit=False, return_hidden=True
-            )
-        else:
-            verify_logits, verify_hidden = self.verify_batch(
-                slots, drafts, [kv_lens_before[s] for s in slots], return_hidden=True
-            )
+        verify_logits, verify_hidden = self.verify_batch_spec(
+            slots,
+            drafts,
+            [kv_lens_before[s] for s in slots],
+            num_accepted_tokens_prev=num_accepted_prev,
+            return_hidden=True,
+        )
 
         decisions = determine_accept_reject_batch(slots, drafts_by_slot, verify_logits, k)
 
         real_new_tokens = {s: [anchors[s]] + decisions[s]["committed"][:-1] for s in slots}
-        full_accept_slots = [s for s in slots if decisions[s]["num_accepted"] == k]
-        recompute_slots = [s for s in slots if decisions[s]["num_accepted"] != k]
-        real_new_hidden: dict[int, torch.Tensor] = {}
-
-        if full_accept_slots:
-            for s in full_accept_slots:
-                self.slot_kv_len[s] = kv_lens_before[s] + k + 1
-                i = slots.index(s)
-                real_new_hidden[s] = verify_hidden[i * (k + 1) : (i + 1) * (k + 1)]
-
-        # Real per-slot committed lengths (RAGGED across recompute_slots --
-        # this is exactly the case build_attention_metadata_batch/
-        # build_gdn_metadata_batch's 2026-07-17 ragged-qo_len
-        # generalization exists for). Batched in ONE forward call across
-        # every recompute slot, not a per-slot loop.
-        recompute_committed_lens = {s: decisions[s]["num_accepted"] + 1 for s in recompute_slots}
-        hidden_recompute = None
-        if recompute_slots:
-            for s in recompute_slots:
-                self.restore_gdn_state(s, snapshots[s])
-                self.slot_kv_len[s] = kv_lens_before[s]
-            qo_lens_recompute = [recompute_committed_lens[s] for s in recompute_slots]
-            tokens_recompute = [real_new_tokens[s] for s in recompute_slots]
-            kv_lens_recompute = [kv_lens_before[s] for s in recompute_slots]
-            # 2026-07-17, Phase 3 round 2: the recompute forward is a
-            # SECOND full target-model forward, numerically identical in
-            # shape/kernel-cost to the verify forward (Phase 0's ledger:
-            # 97.2% kernel-time ratio) -- but its batch is RAGGED
-            # (committed_len differs per recompute slot in general), which
-            # blocks a general captured-graph replacement the same way
-            # padding would corrupt GDN state (see this round's notes).
-            # Opportunistic exception: when every recompute slot in THIS
-            # round happens to share the SAME committed_len (a real,
-            # non-rare case -- greedy rejection position is drawn from one
-            # shared underlying per-position acceptance distribution), the
-            # batch is NOT actually ragged, and the existing verify-graph
-            # cache (already keyed by (batch_size, qo_len), see
-            # ``_get_verify_graph``) is directly reusable: a recompute
-            # forward at (num_reqs=len(recompute_slots), qo_len=committed_len,
-            # is_decode=True) is the SAME shape ``CapturedBatchDecodeGraph``
-            # already supports (it always treats itself as decode/verify-
-            # shaped, matching this call's own ``is_decode=True``). Falls
-            # back to the eager path -- correctly, not silently -- whenever
-            # the group is genuinely ragged or the graph isn't available.
-            recompute_graph = None
-            if self.enable_cudagraph and len(set(qo_lens_recompute)) == 1:
-                recompute_graph = self._get_verify_graph(len(recompute_slots), qo_lens_recompute[0])
-            if recompute_graph is not None:
-                # CapturedBatchDecodeGraph's qo_len==1 case expects FLAT
-                # token_ids (one int per slot), not the list-of-per-slot-
-                # lists ``tokens_recompute`` always is here (mirrors
-                # _forward_batch's own qo_len==1-vs->1 convention) -- flatten
-                # only for that case; qo_len>1 already matches as-is.
-                tokens_for_graph = (
-                    [t[0] for t in tokens_recompute] if qo_lens_recompute[0] == 1 else tokens_recompute
-                )
-                _, hidden_recompute = recompute_graph.replay(
-                    recompute_slots, tokens_for_graph, kv_lens_recompute, commit=True, return_hidden=True
-                )
-            else:
-                _, hidden_recompute = self._forward_batch(
-                    recompute_slots,
-                    tokens_recompute,
-                    kv_lens_recompute,
-                    qo_len=qo_lens_recompute,
-                    commit=True,
-                    return_hidden=True,
-                    is_decode=True,
-                    fixed_kv_split_size=self.decode_fixed_kv_split_size,
-                    fixed_max_num_splits=self.decode_fixed_max_num_splits,
-                )
-
         next_anchors = {s: decisions[s]["committed"][-1] for s in slots}
+        committed_lens = {s: decisions[s]["num_accepted"] + 1 for s in slots}
+
+        for s in slots:
+            self.slot_kv_len[s] = kv_lens_before[s] + committed_lens[s]
+            self.slot_num_accepted_tokens[s] = committed_lens[s]
+
+        # Ragged slice of the ONE verify forward's hidden states -- see
+        # this method's docstring for why this is valid for EVERY slot
+        # regardless of committed_len, not just full-accept ones.
+        real_new_hidden: dict[int, torch.Tensor] = {}
+        for i, s in enumerate(slots):
+            real_new_hidden[s] = verify_hidden[i * (k + 1) : i * (k + 1) + committed_lens[s]]
+
+        shifted = [real_new_tokens[s][1:] + [next_anchors[s]] for s in slots]
+        hidden_concat = torch.cat([real_new_hidden[s] for s in slots], dim=0)
+        start_pos_list = [self.slot_draft_sync_len[s] for s in slots]
+        next_drafts_batch = self._mtp_sync_and_propose_batch(
+            slots,
+            shifted,
+            hidden_concat,
+            start_pos_list,
+            num_new_tokens=[committed_lens[s] for s in slots],
+            k=k,
+        )
+
         result: dict[int, dict] = {}
-
-        if full_accept_slots:
-            shifted = [real_new_tokens[s][1:] + [next_anchors[s]] for s in full_accept_slots]
-            hidden_concat = torch.cat([real_new_hidden[s] for s in full_accept_slots], dim=0)
-            start_pos_list = [self.slot_draft_sync_len[s] for s in full_accept_slots]
-            next_drafts_batch = self._mtp_sync_and_propose_batch(
-                full_accept_slots,
-                shifted,
-                hidden_concat,
-                start_pos_list,
-                num_new_tokens=k + 1,
-                k=k,
-            )
-            for s in full_accept_slots:
-                self.slot_pending_draft_tokens[s] = next_drafts_batch[s]
-                result[s] = {
-                    **decisions[s],
-                    "next_anchor": next_anchors[s],
-                    "next_draft_tokens": next_drafts_batch[s],
-                }
-
-        if recompute_slots:
-            shifted_recompute = [real_new_tokens[s][1:] + [next_anchors[s]] for s in recompute_slots]
-            start_pos_list_recompute = [self.slot_draft_sync_len[s] for s in recompute_slots]
-            next_drafts_recompute = self._mtp_sync_and_propose_batch(
-                recompute_slots,
-                shifted_recompute,
-                hidden_recompute,
-                start_pos_list_recompute,
-                num_new_tokens=[recompute_committed_lens[s] for s in recompute_slots],
-                k=k,
-            )
-            for s in recompute_slots:
-                self.slot_pending_draft_tokens[s] = next_drafts_recompute[s]
-                result[s] = {
-                    **decisions[s],
-                    "next_anchor": next_anchors[s],
-                    "next_draft_tokens": next_drafts_recompute[s],
-                }
-
+        for s in slots:
+            self.slot_pending_draft_tokens[s] = next_drafts_batch[s]
+            result[s] = {
+                **decisions[s],
+                "next_anchor": next_anchors[s],
+                "next_draft_tokens": next_drafts_batch[s],
+            }
         return result
 
 

@@ -1530,3 +1530,210 @@ accepted tok/s, ~2.185x gap to native's 144.54** (commit `51a216e`),
 with this Phase 2 investigation (commit `49a4ff7` plus this addendum)
 recorded as a well-documented piece of deferred future work, not a
 failure.
+
+## 11. Phase 2 landed for real (2026-07-18) -- the "inherent bf16 noise"
+finding was a green light, not a stop sign
+
+Per explicit coordinator direction after section 10.5: the conclusion
+that the residual full-model gap is inherent bf16 batching-order noise
+(the SAME class this project already accepts elsewhere, e.g. attention's
+kv_split_size noise) was reframed as grounds to actually FINISH Phase 2
+(validate with this project's own established near-tie/cosine-similarity
+methodology instead of demanding bit-exactness), not grounds to abandon
+it. This section documents that completion.
+
+### 11.1 What changed in `runtime/direct_model_runner.py`
+
+Before touching code, the K+1-row SSM addressing scheme from section 10
+was **re-verified directly against the real kernel source** (not just
+trusted from memory) -- `fused_sigmoid_gating_delta_rule_update_kernel`
+(`vllm/model_executor/layers/fla/ops/fused_sigmoid_gating.py`) confirms:
+initial state is read from `ssm_state_indices[i_n, num_accepted_tokens[i_n]
+- 1]`, and a result is unconditionally WRITTEN to `ssm_state_indices[i_n,
+t]` for every one of this round's `T` candidate positions, where
+`ssm_state_indices` is itself a FIXED per-(request, column) row mapping
+(there, a slice of that request's own persistent block table, allocated
+once, never reshuffled across rounds). This is exactly the fixed-slot
+analogue `_ssm_spec_row` already implemented -- confirmed, not just
+assumed.
+
+Added: `_ssm_spec_row(logical_slot, col, total_physical_slots, num_spec)`
+(column 0 -> `_physical_slot(logical_slot)`, the same row the ordinary
+chunked/prefill path already writes -- this is what makes bootstrap
+`num_accepted_tokens_prev=1` correct; columns 1..num_spec each get a
+dedicated row in a separate address range). `allocate_fixed_slot_kv_caches`
+now takes `num_speculative_tokens` and allocates
+`total_physical_slots * (1 + num_speculative_tokens)` SSM rows instead of
+`total_physical_slots` (conv state allocation is UNCHANGED -- conv uses a
+single-slot sliding window via `causal_conv1d_update`'s own
+`num_accepted_tokens`-driven addressing, confirmed by direct reading of
+`qwen_gdn_linear_attn.py`'s `conv_state_indices=spec_state_indices_tensor[:,
+0]`, not one row per candidate). Added
+`build_gdn_metadata_spec_batch`/`verify_batch_spec` (the real
+`num_prefills=0, num_decodes=0, num_spec_decodes=len(slots)` branch,
+hand-built for this runtime's fixed slots instead of vLLM's paged block
+table). Added a new persistent per-slot field,
+`self.slot_num_accepted_tokens` (bootstrap 1, threaded round-to-round,
+reset alongside the other per-slot MTP fields in `reset_slot`).
+
+`mtp_verify_and_commit_batch` was rewritten from the ground up: gone are
+`snapshot_gdn_state`/`restore_gdn_state`/the recompute-forward branch/the
+full-accept-vs-recompute group split entirely. The key insight that makes
+ONE uniform code path correct (not just simpler): under the real
+spec-decode kernel, GDN's per-position OUTPUT (not just attention's) is
+already causally valid for every one of the K+1 candidate positions in a
+single verify forward, regardless of which candidates later turn out to
+be real -- only the recurrent STATE COMMIT (which physical row survives
+to be read next round) is acceptance-aware. So every slot's hidden states
+for `0..committed_len-1` are already sitting in one verify forward's
+output; the draft resync step now gets its input via a plain ragged SLICE
+of that output, never a second forward pass, for full-accept slots
+exactly as much as for any partial-reject slot. Net result: one verify
+forward per round, period -- no more "84.4% of rounds pay for a second
+full recompute forward" (the number `mtp_batch_recompute_cost_diag.py`
+measured against the OLD mechanism).
+
+`mtp_verify_and_commit` (the singular/looped sibling) was deliberately
+**left unchanged** -- it still uses the old chunked + snapshot/restore +
+recompute-forward mechanism. `snapshot_gdn_state`/`restore_gdn_state`
+therefore remain in the codebase, still exercised by
+`benchmarks/mtp_gdn_rollback_check.py` and by the singular path; they are
+simply no longer called from the batched entry point. This is an
+intentional scope boundary, not an oversight.
+
+**Known, deliberate scope limit**: the verify forward in
+`mtp_verify_and_commit_batch` is now EAGER only -- it does not go through
+`CapturedBatchDecodeGraph` (that class is still built around the OLD
+chunked GDN metadata path; reconciling it with the new spec-decode
+metadata is follow-up work, not attempted this round).
+`self.enable_cudagraph` therefore no longer affects this method's verify
+step at all. The draft model's OWN step-0/continuation graphs (no GDN
+state involved) are completely unaffected and still used.
+
+### 11.2 Correctness verification
+
+Real methodology problem found and fixed along the way: `check0`
+("batch=1 equivalence", in both `mtp_batch_verify_check.py` and
+`mtp_ragged_recompute_verify_check.py`) used to require BIT-EXACT
+agreement between the singular (`mtp_verify_and_commit`) and batched
+(`mtp_verify_and_commit_batch`) entry points -- valid through 2026-07-17
+because both shared the exact same mechanism, differing only in call
+convention (this is what caught the real `decode_qo_len` bug that round).
+Once the batched path switched to a genuinely different mechanism, a
+first run of `mtp_ragged_recompute_verify_check.py`'s `check0` failed:
+round 3 (forced reject at position 0) diverged to committed token 271
+(looped) vs. 198 (batched). Rather than assume this was acceptable, a
+direct isolated measurement was taken (not inferred) at the exact
+divergence point: raw verify logits from BOTH mechanisms at the identical
+prior state showed `looped margin (top1 vs. logit[198]) = 0.125`,
+`batched margin (top1 vs. logit[271]) = 0.0` -- both far under this
+project's established `NEAR_TIE_LOGIT_MARGIN=2.0` -- with a full-vocab
+max_abs_diff of 6.84 and mean_abs_diff of 0.80 between the two
+mechanisms' raw logits at that position, unremarkable and consistent with
+the same class of bf16 kernel-path noise this project already accepts
+elsewhere. This is the SAME "271 vs 198" near-tie pair
+`mtp_batch_verify_check.py`'s own docstring already documented for this
+exact prompt (previously observed as a batch-size-1-vs-4 phenomenon; here
+recurring as a chunked-vs-spec-decode-mechanism phenomenon) -- a genuine
+near-tie tie-break flip, not a correctness bug.
+
+Fixed both files' `check0` by adopting this project's own already-
+established per-round independent-reference-replay methodology (checks
+1-3 in the same files): each mechanism's own committed choice is now
+validated against its OWN untouched reference slot (near-tie tolerant); a
+divergence between the two mechanisms only fails the test if either
+side's own choice ALSO fails its own reference check (an "unexplained"
+mismatch). Cross-mechanism kv_len/draft_sync_len equality was demoted
+from a hard gate to an informational note for the same reason (commit
+counts can differ once content legitimately differs) -- each mechanism's
+own internal kv_len==draft_sync_len self-consistency is the real
+bookkeeping gate now. Every loosened assertion above is justified by a
+direct measurement, not just changed to make a red test green.
+
+`mtp_verify_cudagraph_check.py` also needed an update, for a different
+reason: it asserts (via `replay_count`) that the verify-side CUDA graph
+actually gets replayed -- structurally impossible now that
+`mtp_verify_and_commit_batch` never calls `_get_verify_graph` (section
+11.1's documented scope limit). Confirmed directly: content correctness
+(`per_slot_ok`) passes across every one of this test's scenarios (organic,
+mixed forced-reject, fully ragged forced-reject, single-slot forced-
+reject, two different uniform forced-reject committed_lens, and a
+shrinking active-slot-count), while the four verify-side coverage flags
+are all `False` and the two draft-step coverage flags remain `True`. The
+four now-moot flags were demoted to informational
+(`known_moot_post_phase2`); content correctness and draft-step coverage
+remain the real pass/fail gates.
+
+Full suite results, this round, fresh runs, no shortcuts:
+
+| Suite | Result |
+|---|---|
+| `mtp_gdn_rollback_check.py` (unaffected primitives) | PASS, bit-exact (`logits_max_abs_diff: 0.0` across 48 GDN layers) |
+| `mtp_batch_verify_check.py` (4 checks, near-tie-tolerant `check0`) | PASS -- 0 exact mismatches, 0 near-tie divergences this run, 0 ref failures |
+| `mtp_ragged_recompute_verify_check.py` (3 checks, near-tie-tolerant `check0`) | PASS -- 0 exact mismatches; 3 near-tie divergences (the 271/198 pair and its 2 cascaded rounds), all independently ref-validated on both sides |
+| `mtp_verify_cudagraph_check.py` (updated pass criterion) | PASS -- content correct across all 8 scenarios + shrinking-batch; verify-graph coverage correctly now-moot, draft-step coverage intact |
+
+Generation quality: `mtp_batch_verify_check.py`'s signal-probe check
+decodes real multi-round completions through the new mechanism (e.g.
+`". The capital of Germany is Berlin. The capital of Italy is Rome"`) --
+coherent, not degenerate -- confirming the acceptable-noise conclusion
+holds at the level that actually matters (real generations), not just
+per-round logit comparisons.
+
+### 11.3 Performance: real W1-S 3-rep measurement
+
+`python -m benchmarks.mtp_w1s_our_runtime_perf --batched --cudagraph --repeats 3 --max-tokens 256 --concurrency 4 --fixture n16`
+(identical protocol/config to every prior W1-S measurement this project
+has used -- `num_requests=16`, `max_tokens=256`, `concurrency=4`, `k=3`).
+
+| Rep | accepted_tokens/s | ms/accepted token | draft acceptance % | gpu_busy_pct |
+|---|---:|---:|---:|---:|
+| 1 | 84.300 | 11.862 | 70.292 | 91.09% |
+| 2 | 82.622 | 12.103 | 70.292 | 90.90% |
+| 3 | 68.773 | 14.540 | 70.292 | 91.22% |
+| **mean** | **78.565** | 12.835 | 70.292 | 91.07% |
+
+`total_committed_tokens` (4116) is identical bit-for-bit across all 3
+reps -- expected for this deterministic greedy pipeline, and a useful
+passive cross-check (2 tokens off the pre-Phase-2 baseline's 4118, a
+near-tie-scale difference consistent with section 11.2's finding, not a
+correctness concern). Rep 3's slower number reproduces a pattern this
+project already documented and ruled non-blocking in section 9.7 (`nvidia-smi`-reported `memory_used_mib` climbing across reps within one
+process, most likely PyTorch's caching allocator high-water-mark growing)
+-- confirmed NOT new: this round's memory returned to the same ~2.4GB
+baseline after process exit, and `gpu_busy_pct` stayed pinned at ~91%
+across all 3 reps (the slowdown shows up as more real GPU-busy seconds
+for the identical amount of work, not more launch-gap), matching the
+already-accepted explanation from that section.
+
+**Comparison against the reference numbers**:
+- **vs. the 66.152 tok/s Phase 3 baseline: 78.565/66.152 = 1.188x -- a
+  real +18.76% throughput improvement**, from eliminating the
+  recompute-forward pass entirely (no longer "1 verify forward + an
+  ~84%-of-the-time second recompute forward", now always exactly one
+  verify forward per round) -- this net win holds DESPITE giving up the
+  verify step's CUDA-graph replay (section 11.1's scope limit), which
+  confirms the recompute-forward elimination is a bigger win than the
+  graph-capture loss costs.
+- **vs. native's 144.54 tok/s: gap narrows from ~2.185x to ~1.840x.**
+- **vs. the plan's own post-Phase-3 target (>=110 accepted tok/s, "within
+  ~1.3x of native"): still not met**, but this round moved materially
+  closer without yet attempting the natural next lever (reconciling
+  `CapturedBatchDecodeGraph` with the new spec-decode metadata, which
+  would recover verify-side graph capture ON TOP of this round's
+  recompute-elimination win -- section 11.1's documented follow-up).
+
+### 11.4 Bottom line
+
+Phase 2 is landed: **78.565 accepted tok/s, ~1.840x gap to native's
+144.54** (up from Phase 3's 66.152 tok/s / ~2.185x gap). The mechanism is
+the real, production spec-decode GDN path (K+1 dedicated SSM rows,
+acceptance-aware addressing, zero snapshot/restore/recompute-forward),
+not a shortcut -- validated via this project's own established near-tie/
+independent-reference-replay methodology, with every loosened test
+assertion backed by a direct measurement, not just asserted. The
+remaining gap to native is now most plausibly split between (a) not yet
+reconciling CUDA graph capture with the new verify mechanism (this
+round's own documented scope limit) and (b) the same per-kernel-
+efficiency-at-M=16 delta section 9.5 already identified. Both are
+concrete, named next steps, not "we've run out of things to try."

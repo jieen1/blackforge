@@ -19,15 +19,36 @@ batched run's OWN real committed tokens into an independent single-slot
 reference forward every round, so one round's tie-break flip cannot
 compound into the next round's check).
 
-0. Batch=1 strict equivalence: the batched-path API called with a SINGLE
-   slot must reproduce the original single-slot path's output BIT-EXACTLY
-   (no near-tie tolerance -- both paths should, after the 2026-07-17
-   ``decode_qo_len``/``is_decode`` fix, construct numerically identical
-   attention metadata at batch size 1). This is what actually caught the
-   real bug this round (a latent ``decode_qo_len`` formula gap in
-   ``build_attention_metadata_batch``, exposed for the first time by
-   genuine batched-prefill usage) -- kept here as a permanent regression
-   guard, not just a one-off diagnostic.
+0. Batch=1 equivalence: the batched-path API called with a SINGLE slot is
+   compared against the original single-slot path's output. Through
+   2026-07-17 this required BIT-EXACT agreement (no near-tie tolerance) --
+   valid at the time because both paths shared the exact same underlying
+   mechanism (chunked GDN metadata), differing only in call convention, so
+   any divergence was necessarily a real bug (this is what actually caught
+   the real ``decode_qo_len`` formula gap that round).
+
+   **2026-07-18, Phase 2**: ``mtp_verify_and_commit_batch`` now uses a
+   genuinely different mechanism from ``mtp_verify_and_commit`` (the real
+   spec-decode GDN path -- K+1 dedicated SSM rows, no snapshot/restore/
+   recompute-forward -- vs. the singular path's unchanged chunked +
+   snapshot/restore/recompute mechanism; see ``runtime/direct_model_runner.py``).
+   Bit-exact agreement between two genuinely different numerical paths is
+   no longer a valid invariant in general -- a direct measurement in
+   ``benchmarks/mtp_ragged_recompute_verify_check.py`` (this file's
+   sibling, exercising the SAME two mechanisms) found a real near-tie
+   tie-break flip at this exact prompt (committed token 271 vs. 198,
+   margins 0.125/0.0 -- both far under ``NEAR_TIE_LOGIT_MARGIN``) once a
+   forced reject was involved. This check happens not to hit that
+   specific near-tie in its own (organic, non-forced) scenario, but is
+   structurally just as exposed to the same risk, so it now uses this
+   file's own already-established per-round independent-reference-replay
+   methodology (matching checks 1-3 below) instead of a raw bit-exact
+   comparison, for the same reason those checks needed it: a real
+   near-tie divergence must not fail this test, only an UNEXPLAINED one
+   (a mismatch that also fails independent reference validation) should.
+   Kept here as a permanent regression guard for real bugs -- just no
+   longer conflating "real bug" with "expected near-tie noise between two
+   now-legitimately-different mechanisms."
 
 1. Numerical-twin (real batch=4): 4 slots run through the batched path
    concurrently; each round, each slot's real committed tokens are
@@ -122,44 +143,73 @@ def _ref_check(runner, ref_slot, real_new_tokens, mtp_next_anchor) -> dict:
 
 def _check_batch1_equivalence(runner, tok) -> dict:
     looped_slot, batched_slot = 0, 1
+    # 2026-07-18, Phase 2: independent, untouched reference slots -- see
+    # this module's docstring update for why bit-exact looped-vs-batched
+    # agreement is no longer a valid invariant on its own.
+    looped_ref_slot, batched_ref_slot = 2, 3
     prompt = FOUR_PROMPTS[0]
     prompt_ids = tok.encode(prompt, add_special_tokens=False)
-    _reset_if_needed(runner, [looped_slot, batched_slot])
+    _reset_if_needed(runner, [looped_slot, batched_slot, looped_ref_slot, batched_ref_slot])
 
     pr_looped = runner.mtp_prefill(looped_slot, prompt_ids)
     pr_batched = runner.mtp_prefill_batch([batched_slot], [prompt_ids])[batched_slot]
     anchor_l, drafts_l = pr_looped["anchor"], pr_looped["draft_tokens"]
     anchor_b, drafts_b = pr_batched["anchor"], pr_batched["draft_tokens"]
 
-    mismatches = []
+    exact_mismatches = []
     if anchor_l != anchor_b or drafts_l != drafts_b:
-        mismatches.append({"stage": "prefill", "looped": pr_looped, "batched": pr_batched})
+        exact_mismatches.append({"stage": "prefill", "looped": pr_looped, "batched": pr_batched})
 
+    ref_first_l = runner.prefill(looped_ref_slot, prompt_ids)
+    ref_first_b = runner.prefill(batched_ref_slot, prompt_ids)
+    if ref_first_l != anchor_l or ref_first_b != anchor_b:
+        exact_mismatches.append(
+            {"stage": "reference_prefill", "ref_first_l": ref_first_l, "ref_first_b": ref_first_b}
+        )
+
+    near_tie_divergences = []
+    ref_failures = []
     for r in range(NUM_ROUNDS):
         decision_l = runner.mtp_verify_and_commit(looped_slot, anchor_l, drafts_l)
         decision_b = runner.mtp_verify_and_commit_batch(
             [batched_slot], {batched_slot: anchor_b}, {batched_slot: drafts_b}
         )[batched_slot]
+
+        real_new_tokens_l = [anchor_l] + decision_l["committed"][:-1]
+        real_new_tokens_b = [anchor_b] + decision_b["committed"][:-1]
+        ref_report_l = _ref_check(runner, looped_ref_slot, real_new_tokens_l, decision_l["next_anchor"])
+        ref_report_b = _ref_check(runner, batched_ref_slot, real_new_tokens_b, decision_b["next_anchor"])
+        if not ref_report_l["content_ok_within_near_tie_tolerance"]:
+            ref_failures.append({"round": r, "mechanism": "looped", **ref_report_l})
+        if not ref_report_b["content_ok_within_near_tie_tolerance"]:
+            ref_failures.append({"round": r, "mechanism": "batched", **ref_report_b})
+
         if decision_l["committed"] != decision_b["committed"]:
-            mismatches.append(
-                {
-                    "round": r,
-                    "looped_committed": decision_l["committed"],
-                    "batched_committed": decision_b["committed"],
-                }
-            )
+            entry = {
+                "round": r,
+                "looped_committed": decision_l["committed"],
+                "batched_committed": decision_b["committed"],
+            }
+            if ref_report_l["content_ok_within_near_tie_tolerance"] and ref_report_b["content_ok_within_near_tie_tolerance"]:
+                near_tie_divergences.append(entry)
+            else:
+                exact_mismatches.append(entry)
+
         anchor_l, drafts_l = decision_l["next_anchor"], decision_l["next_draft_tokens"]
         anchor_b, drafts_b = decision_b["next_anchor"], decision_b["next_draft_tokens"]
 
-    bookkeeping_ok = (
-        runner.slot_kv_len[looped_slot] == runner.slot_kv_len[batched_slot]
-        and runner.slot_draft_sync_len[looped_slot] == runner.slot_draft_sync_len[batched_slot]
+    self_consistent = (
+        runner.slot_kv_len[looped_slot] == runner.slot_draft_sync_len[looped_slot]
+        and runner.slot_kv_len[batched_slot] == runner.slot_draft_sync_len[batched_slot]
     )
+    passed = bool(len(exact_mismatches) == 0 and len(ref_failures) == 0 and self_consistent)
     return {
-        "passed": bool(len(mismatches) == 0 and bookkeeping_ok),
+        "passed": passed,
         "num_rounds": NUM_ROUNDS,
-        "mismatches": mismatches,
-        "bookkeeping_ok": bookkeeping_ok,
+        "exact_mismatches": exact_mismatches,
+        "near_tie_divergences": near_tie_divergences,
+        "ref_failures": ref_failures,
+        "self_consistent": self_consistent,
         "final_looped_kv_len": runner.slot_kv_len[looped_slot],
         "final_batched_kv_len": runner.slot_kv_len[batched_slot],
     }
@@ -409,8 +459,10 @@ def main() -> int:
         "passed": result["passed"],
         "check0_batch1_equivalence": {
             "passed": result["check0_batch1_equivalence"]["passed"],
-            "mismatches": result["check0_batch1_equivalence"]["mismatches"],
-            "bookkeeping_ok": result["check0_batch1_equivalence"]["bookkeeping_ok"],
+            "exact_mismatches": result["check0_batch1_equivalence"]["exact_mismatches"],
+            "near_tie_divergences": result["check0_batch1_equivalence"].get("near_tie_divergences"),
+            "ref_failures": result["check0_batch1_equivalence"].get("ref_failures"),
+            "self_consistent": result["check0_batch1_equivalence"]["self_consistent"],
         },
         "check1_numerical_twin": {
             "passed": result["check1_numerical_twin"]["passed"],

@@ -8,14 +8,53 @@ Three checks, following this project's established methodology
 numerical-twin + forced mixed-stage), specifically targeting the new
 ragged code path:
 
-0. Strict batch=1 forced-reject equivalence: a SINGLE slot forced to
-   reject at a specific draft position (so the recompute path is
-   definitely exercised, not just organically maybe-hit) must produce
-   IDENTICAL committed tokens/next_anchor/bookkeeping whether driven
-   through the single-slot ``mtp_verify_and_commit`` or the batched
-   ``mtp_verify_and_commit_batch`` (batch of 1) -- no near-tie tolerance,
-   this is the same class of check that caught the real
-   ``decode_qo_len`` bug earlier this round.
+0. Batch=1 forced-reject equivalence: a SINGLE slot forced to reject at
+   a specific draft position (so the recompute path is definitely
+   exercised, not just organically maybe-hit) is driven through BOTH the
+   single-slot ``mtp_verify_and_commit`` and the batched
+   ``mtp_verify_and_commit_batch`` (batch of 1). Originally (through
+   2026-07-17) this required committed tokens/next_anchor/bookkeeping to
+   match BIT-EXACTLY, no near-tie tolerance -- valid at the time because
+   both entry points shared the exact SAME underlying mechanism (chunked
+   GDN metadata + snapshot/restore/recompute-forward), differing only in
+   call convention, so any divergence was necessarily a real bug (this
+   is what caught the real ``decode_qo_len`` formula gap that round).
+
+   **2026-07-18, Phase 2**: ``mtp_verify_and_commit_batch`` now uses a
+   GENUINELY DIFFERENT mechanism (the real spec-decode GDN path -- K+1
+   dedicated SSM rows, acceptance-aware addressing, no snapshot/restore/
+   recompute-forward -- see ``runtime/direct_model_runner.py``'s
+   ``mtp_verify_and_commit_batch``/``verify_batch_spec``/
+   ``build_gdn_metadata_spec_batch``) while ``mtp_verify_and_commit``
+   (the singular/looped sibling) deliberately still uses the OLD chunked
+   mechanism. Bit-exact agreement between two genuinely different
+   numerical paths is no longer a valid invariant -- confirmed by a
+   direct, isolated measurement (not just inferred from the failure):
+   running this exact scenario found round 3 (force_position=0) diverges
+   to committed token 271 (looped) vs. 198 (batched) for the identical
+   prior state, and a direct raw-logit dump at that exact point showed
+   ``looped margin (top1 - logit[198]) = 0.125``, ``batched margin (top1
+   - logit[271]) = 0.0`` -- both far under this project's established
+   ``NEAR_TIE_LOGIT_MARGIN=2.0`` -- with a full-vocab max_abs_diff of
+   6.84 and mean_abs_diff of 0.80 between the two mechanisms' raw logit
+   vectors at that position, unremarkable and consistent with the same
+   class of bf16 batching/kernel-path noise this project already accepts
+   elsewhere (e.g. attention's kv_split_size noise, the "271 vs 198"
+   near-tie ``mtp_batch_verify_check.py`` independently documented for
+   this SAME prompt). This is a genuine near-tie tie-break flip, not a
+   correctness bug. Fixed by adopting this file's own already-established
+   per-round independent-reference-replay methodology (checks 1/2 below)
+   for check 0 too: each mechanism's own committed choice is validated
+   against its OWN untouched reference slot (near-tie tolerant); a
+   divergence between the two mechanisms is only a FAILURE if either
+   side's own choice fails ITS OWN reference check (an "unexplained"
+   mismatch) -- a near-tie-explained divergence is recorded but does not
+   fail the test. Cross-mechanism kv_len/draft_sync_len equality is
+   likewise no longer required once a real near-tie divergence has
+   legitimately split the two trajectories (their commit COUNTS can
+   still differ once content differs) -- each mechanism's own
+   kv_len==draft_sync_len internal self-consistency is the real
+   bookkeeping gate now.
 
 1. Multi-slot RAGGED recompute: 4 slots, each forced to reject at a
    DIFFERENT draft position (committed_len 1, 2, 3, and 1 again),
@@ -109,9 +148,15 @@ def _ref_check(runner, ref_slot, real_new_tokens, mtp_next_anchor) -> dict:
 
 def _check_batch1_forced_reject_equivalence(runner, tok) -> dict:
     looped_slot, batched_slot = 0, 1
+    # 2026-07-18, Phase 2: independent, untouched reference slots -- one
+    # per mechanism -- so a genuine near-tie divergence between looped and
+    # batched (see module docstring) can still be judged correct/incorrect
+    # on its own merits, instead of only ever being comparable to the
+    # OTHER mechanism's (now not-necessarily-matching) choice.
+    looped_ref_slot, batched_ref_slot = 2, 3
     prompt = FOUR_PROMPTS[0]
     prompt_ids = tok.encode(prompt, add_special_tokens=False)
-    _reset_if_needed(runner, [looped_slot, batched_slot])
+    _reset_if_needed(runner, [looped_slot, batched_slot, looped_ref_slot, batched_ref_slot])
 
     pr_looped = runner.mtp_prefill(looped_slot, prompt_ids)
     pr_batched = runner.mtp_prefill_batch([batched_slot], [prompt_ids])[batched_slot]
@@ -120,8 +165,16 @@ def _check_batch1_forced_reject_equivalence(runner, tok) -> dict:
     if anchor_l != anchor_b or drafts_l != drafts_b:
         return {"passed": False, "error": "prefill mismatch before forced-reject rounds even started"}
 
-    mismatches = []
+    ref_first_l = runner.prefill(looped_ref_slot, prompt_ids)
+    ref_first_b = runner.prefill(batched_ref_slot, prompt_ids)
+    if ref_first_l != anchor_l or ref_first_b != anchor_b:
+        return {"passed": False, "error": "reference prefill anchor mismatch"}
+
+    exact_mismatches = []
+    near_tie_divergences = []
+    ref_failures = []
     landed_elsewhere_notes = []
+    bookkeeping_notes = []
     for r in range(NUM_ROUNDS):
         force_position = r % K  # cycles through 0, 1, 2 -- committed_len 1, 2, 3
         submitted_l = _decoy_at(drafts_l, force_position)
@@ -136,33 +189,72 @@ def _check_batch1_forced_reject_equivalence(runner, tok) -> dict:
         # decoy landed at the exact intended position depends on the
         # model's own organic behavior at earlier positions too (an
         # organic earlier reject is real, expected model behavior, not a
-        # runtime bug) -- see the module docstring. The actual gate is
-        # whether looped and batched AGREE, whatever position they both
-        # land at.
+        # runtime bug) -- see the module docstring.
         if decision_l["num_accepted"] != force_position:
-            landed_elsewhere_notes.append({"round": r, "num_accepted": decision_l["num_accepted"]})
+            landed_elsewhere_notes.append({"round": r, "mechanism": "looped", "num_accepted": decision_l["num_accepted"]})
+        if decision_b["num_accepted"] != force_position:
+            landed_elsewhere_notes.append({"round": r, "mechanism": "batched", "num_accepted": decision_b["num_accepted"]})
+
+        # Independent-reference-replay validation, per mechanism (this
+        # file's own established check1/check2 pattern) -- the real
+        # correctness bar now: each mechanism's own committed choice must
+        # check out against ITS OWN untouched reference slot.
+        real_new_tokens_l = [anchor_l] + decision_l["committed"][:-1]
+        real_new_tokens_b = [anchor_b] + decision_b["committed"][:-1]
+        ref_report_l = _ref_check(runner, looped_ref_slot, real_new_tokens_l, decision_l["next_anchor"])
+        ref_report_b = _ref_check(runner, batched_ref_slot, real_new_tokens_b, decision_b["next_anchor"])
+        if not ref_report_l["content_ok_within_near_tie_tolerance"]:
+            ref_failures.append({"round": r, "mechanism": "looped", **ref_report_l})
+        if not ref_report_b["content_ok_within_near_tie_tolerance"]:
+            ref_failures.append({"round": r, "mechanism": "batched", **ref_report_b})
+
         if decision_l["committed"] != decision_b["committed"]:
-            mismatches.append(
-                {
-                    "round": r,
-                    "force_position": force_position,
-                    "looped_committed": decision_l["committed"],
-                    "batched_committed": decision_b["committed"],
-                }
-            )
+            entry = {
+                "round": r,
+                "force_position": force_position,
+                "looped_committed": decision_l["committed"],
+                "batched_committed": decision_b["committed"],
+            }
+            # A divergence between the two mechanisms is acceptable ONLY
+            # if both sides' own committed choice independently checks out
+            # against their own reference -- otherwise this is a real,
+            # unexplained mismatch (a genuine bug, not a near-tie).
+            if ref_report_l["content_ok_within_near_tie_tolerance"] and ref_report_b["content_ok_within_near_tie_tolerance"]:
+                near_tie_divergences.append(entry)
+            else:
+                exact_mismatches.append(entry)
+
+        bookkeeping_notes.append(
+            {
+                "round": r,
+                "kv_len_matches_across_mechanisms": runner.slot_kv_len[looped_slot] == runner.slot_kv_len[batched_slot],
+                "looped_self_consistent": runner.slot_kv_len[looped_slot] == runner.slot_draft_sync_len[looped_slot],
+                "batched_self_consistent": runner.slot_kv_len[batched_slot] == runner.slot_draft_sync_len[batched_slot],
+            }
+        )
+
         anchor_l, drafts_l = decision_l["next_anchor"], decision_l["next_draft_tokens"]
         anchor_b, drafts_b = decision_b["next_anchor"], decision_b["next_draft_tokens"]
 
-    bookkeeping_ok = (
-        runner.slot_kv_len[looped_slot] == runner.slot_kv_len[batched_slot]
-        and runner.slot_draft_sync_len[looped_slot] == runner.slot_draft_sync_len[batched_slot]
-    )
+    # The real pass/fail gate (2026-07-18, Phase 2): no UNEXPLAINED
+    # mismatch (one that fails independent reference validation on either
+    # side), no reference-check failure standing alone, and each
+    # mechanism's OWN kv_len/draft_sync_len bookkeeping stays internally
+    # self-consistent every round. Cross-mechanism kv_len equality is
+    # demoted to an informational note -- see module docstring for why
+    # that is no longer guaranteed once a real near-tie divergence has
+    # legitimately split the two trajectories.
+    self_consistent = all(b["looped_self_consistent"] and b["batched_self_consistent"] for b in bookkeeping_notes)
+    passed = bool(len(exact_mismatches) == 0 and len(ref_failures) == 0 and self_consistent)
     return {
-        "passed": bool(len(mismatches) == 0 and bookkeeping_ok),
+        "passed": passed,
         "num_rounds": NUM_ROUNDS,
-        "mismatches": mismatches,
+        "exact_mismatches": exact_mismatches,
+        "near_tie_divergences": near_tie_divergences,
+        "ref_failures": ref_failures,
         "landed_elsewhere_notes": landed_elsewhere_notes,
-        "bookkeeping_ok": bookkeeping_ok,
+        "self_consistent": self_consistent,
+        "bookkeeping_notes": bookkeeping_notes,
     }
 
 
@@ -358,8 +450,10 @@ def main() -> int:
         "passed": result["passed"],
         "check0_batch1_forced_reject_equivalence": {
             "passed": result["check0_batch1_forced_reject_equivalence"]["passed"],
-            "mismatches": result["check0_batch1_forced_reject_equivalence"].get("mismatches"),
-            "bookkeeping_ok": result["check0_batch1_forced_reject_equivalence"].get("bookkeeping_ok"),
+            "exact_mismatches": result["check0_batch1_forced_reject_equivalence"].get("exact_mismatches"),
+            "near_tie_divergences": result["check0_batch1_forced_reject_equivalence"].get("near_tie_divergences"),
+            "ref_failures": result["check0_batch1_forced_reject_equivalence"].get("ref_failures"),
+            "self_consistent": result["check0_batch1_forced_reject_equivalence"].get("self_consistent"),
         },
         "check1_ragged_recompute": {
             "passed": result["check1_ragged_recompute"]["passed"],

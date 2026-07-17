@@ -5,6 +5,33 @@ initial round -- verify forward + K-1 draft steps -- and the fast-iteration
 follow-up round -- recompute-forward graph reuse, full precapture, and
 step-0 draft-resync generalization).
 
+**2026-07-18, Phase 2 update**: ``mtp_verify_and_commit_batch``'s verify
+step itself was rewritten to use the real spec-decode GDN mechanism
+(``verify_batch_spec``/``build_gdn_metadata_spec_batch`` -- K+1 dedicated
+SSM rows, no snapshot/restore/recompute-forward), which is NOT (yet)
+reconciled with ``CapturedBatchDecodeGraph`` (that class is still built
+around the OLD chunked GDN metadata path -- see
+``mtp_verify_and_commit_batch``'s docstring for this explicitly documented
+scope limit). This means the verify/recompute-reuse CUDA-graph coverage
+this test was designed to confirm (``verify_graph_batch4_replayed``,
+``verify_graph_batch2_replayed``, ``recompute_reuse_qo2_replayed``,
+``recompute_reuse_qo1_replayed``) is now EXPECTED to be ``False`` --
+``mtp_verify_and_commit_batch`` never calls ``_get_verify_graph`` at all
+any more, regardless of ``enable_cudagraph``. Confirmed directly (not just
+inferred): a real run shows exactly this -- all four verify-side coverage
+flags False, while the draft-model's OWN step-0/continuation graphs
+(unrelated to GDN state, unaffected by Phase 2) remain correctly True.
+These four fields are demoted from pass/fail gates to informational
+fields (``known_moot_post_phase2``) documenting the CURRENT state; the
+draft-step graph coverage and (most importantly) per-slot CONTENT
+correctness across every scenario this test exercises (organic, mixed
+forced-reject, fully ragged forced-reject, single-slot forced-reject,
+uniform forced-reject at two different committed_lens, and a shrinking
+active-slot-count) remain the real pass/fail bar -- and these still pass.
+Reconciling ``CapturedBatchDecodeGraph`` with the new spec-decode metadata
+(so verify-side graph capture works again) is documented follow-up work,
+not done this round.
+
 Unlike ``cudagraph_eager_parity_check.py``/``cudagraph_mtp_regression.py``
 (which drive ``CapturedBatchDecodeGraph`` directly via ``.capture()``/
 ``.replay()`` in isolation), this test constructs a runner with
@@ -277,6 +304,13 @@ def _run_once() -> dict:
     # satisfies that regardless of use) but "was it actually REPLAYED"
     # (replay_count > 0), i.e. the real round loop actually took this code
     # path at least once, not silently falling back to eager throughout.
+    #
+    # 2026-07-18, Phase 2: the four verify-side entries are now demoted to
+    # informational (``known_moot_post_phase2``) -- see module docstring
+    # for why ``mtp_verify_and_commit_batch`` no longer replays a verify
+    # graph at all, regardless of ``enable_cudagraph``. The draft-step
+    # entries are UNCHANGED, still real pass/fail gates (draft-model
+    # graphs are unaffected by Phase 2's GDN-mechanism rewrite).
     coverage = {
         "verify_graph_batch4_replayed": bool(verify_graph_b4 and verify_graph_b4.replay_count > 0),
         "verify_graph_batch2_replayed": bool(verify_graph_b2 and verify_graph_b2.replay_count > 0),
@@ -285,12 +319,20 @@ def _run_once() -> dict:
         "draft_step0_qo2_graph_replayed": bool(draft_step0_qo2_graph and draft_step0_qo2_graph.replay_count > 0),
         "draft_continuation_graph_replayed": bool(draft_cont_graph_b4 and draft_cont_graph_b4.replay_count > 0),
     }
+    known_moot_post_phase2 = (
+        "verify_graph_batch4_replayed",
+        "verify_graph_batch2_replayed",
+        "recompute_reuse_qo2_replayed",
+        "recompute_reuse_qo1_replayed",
+    )
+    draft_step_coverage_ok = all(coverage[k] for k in coverage if k not in known_moot_post_phase2)
 
-    passed = bool(all(per_slot_ok.values()) and all(coverage.values()))
+    passed = bool(all(per_slot_ok.values()) and draft_step_coverage_ok)
     return {
         "passed": passed,
         "per_slot_ok": per_slot_ok,
         "coverage": coverage,
+        "known_moot_post_phase2": list(known_moot_post_phase2),
         "verify_graph_cache_keys": sorted(str(k) for k in runner._verify_graphs.keys()),
         "draft_step_graph_cache_keys": sorted(str(k) for k in runner._draft_step_graphs.keys()),
         "per_slot_rounds": per_slot_rounds,

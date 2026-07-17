@@ -1796,6 +1796,59 @@ exactly, no broken/incomplete code left in the working tree. Full
 writeup, including the precise next-step recommendation for whoever
 picks this up, in the plan doc's new section 10.
 
+### Phase 2 landed for real (2026-07-18) — real +18.76% W1-S (66.152→78.565), gap to native down from 2.185x to 1.840x
+
+Per explicit coordinator direction, the "inherent bf16 batching-order
+noise" conclusion from the prior round's residual gap (above) was
+reframed as a green light to actually finish Phase 2 (validate with
+near-tie/cosine-similarity tolerance, not bit-exactness) rather than a
+reason to stop. Re-verified the K+1-row SSM addressing scheme directly
+against the real kernel source (`fused_sigmoid_gating_delta_rule_update_kernel`)
+before touching code, then implemented it for real:
+`_ssm_spec_row`/`build_gdn_metadata_spec_batch`/`verify_batch_spec`, a new
+persistent per-slot `slot_num_accepted_tokens` field, and a from-the-
+ground-up rewrite of `mtp_verify_and_commit_batch` that removes
+`snapshot_gdn_state`/`restore_gdn_state`/the recompute-forward branch
+entirely (GDN's per-position output is causally valid for every K+1
+candidate regardless of accept/reject -- only the state COMMIT is
+acceptance-aware -- so the draft resync's hidden states are now a plain
+ragged slice of the ONE verify forward, never a second forward pass).
+`mtp_verify_and_commit` (singular) deliberately left unchanged.
+
+A real methodology fix was needed along the way: `check0` in both
+`mtp_batch_verify_check.py` and `mtp_ragged_recompute_verify_check.py`
+required bit-exact singular-vs-batched agreement, which stopped being a
+valid invariant once the two paths became genuinely different mechanisms
+-- confirmed via a direct raw-logit measurement at the actual divergence
+point (margins 0.125/0.0, both far under `NEAR_TIE_LOGIT_MARGIN=2.0`,
+the same "271 vs 198" near-tie this project's own docstrings already
+named), not just assumed. Fixed by extending the project's own
+established per-round independent-reference-replay methodology to
+`check0` too. `mtp_verify_cudagraph_check.py` needed a similar update:
+its verify-side `replay_count` coverage gates are now structurally moot
+(the new mechanism never touches `CapturedBatchDecodeGraph`, a known,
+documented scope limit — CUDA graph capture for verify is not
+reconciled with the new metadata this round), demoted to informational;
+content correctness across all 8 of its scenarios still passes.
+
+**Correctness: `mtp_gdn_rollback_check.py` (bit-exact, unaffected
+primitives), `mtp_batch_verify_check.py` (4 checks), `mtp_ragged_recompute_verify_check.py`
+(3 checks), `mtp_verify_cudagraph_check.py` (updated pass criterion) —
+all PASS**, fresh runs, no shortcuts. Real multi-round generations
+through the new mechanism are coherent (signal-probe completions read as
+normal text, not garbage).
+
+**Performance: real W1-S 3-rep mean 78.565 accepted tok/s** (84.300 /
+82.622 / 68.773 — rep 3's slower number reproduces the already-documented,
+already-ruled-non-blocking within-process memory-growth pattern from the
+prior Phase 3 measurement, not a new issue) — **+18.76% vs. the 66.152
+Phase-3 baseline, gap to native's 144.54 narrows from ~2.185x to
+~1.840x.** This net win holds despite giving up the verify step's own
+CUDA-graph replay, confirming eliminating the recompute-forward pass
+(previously needed 84.4% of rounds) is worth more than that graph-capture
+loss costs. Full derivation, the direct kernel-source re-verification, and
+the complete near-tie measurement are in the plan doc's new section 11.
+
 ### Phase 0 — Baseline contract
 
 - Frozen W1 (4K input / 1K output) and W2 (32K / 1K) workloads for
