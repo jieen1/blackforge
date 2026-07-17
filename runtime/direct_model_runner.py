@@ -898,9 +898,25 @@ class DirectModelRunner:
         """Release a slot for reuse by a new logical request. Does not zero
         the underlying tensors -- the next prefill's has_initial_state=False
         and kv_len bookkeeping starting from 0 is what makes reuse correct,
-        matching this project's established fixed-slot-generation design."""
+        matching this project's established fixed-slot-generation design.
+
+        **2026-07-17 fix** (Codex-sol review, confirmed real): this used to
+        leave ``slot_draft_sync_len``/``slot_pending_draft_tokens`` at
+        whatever stale value the PREVIOUS logical request left behind. A
+        fresh ``mtp_prefill()`` on this slot starts its real target KV at
+        position 0, but its draft-sync step-0 call reads
+        ``self.slot_draft_sync_len[slot]`` as ``prior_kv_len`` -- if that
+        was never reset, the very first MTP cycle for the NEW request
+        would build attention metadata against the OLD request's leftover
+        history length, an immediate correctness bug for any slot that is
+        ever reused (which is this project's whole fixed-slot-generation
+        premise). Now cleared alongside the pre-existing fields, matching
+        the same "every persistent per-slot MTP field must be reset on
+        reuse" discipline."""
         self.slot_kv_len[slot] = 0
         self.slot_gdn_initialized[slot] = False
+        self.slot_draft_sync_len[slot] = 0
+        self.slot_pending_draft_tokens[slot] = None
 
     def snapshot_gdn_state(self, slot: int) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
         """Copy out this slot's ``(conv_state, ssm_state)`` for every GDN
@@ -922,15 +938,32 @@ class DirectModelRunner:
         discarded within one verify step) -- restore moves them back to
         device.
 
-        Tags the snapshot with this slot's current generation counter
-        (``self.slot_gdn_snapshot_gen``, bumped on every snapshot) --
-        2026-07-17 addition per Codex-sol's explicit ask for explicit
-        per-slot state so a STALE snapshot (e.g. a caller accidentally
-        holding on to one from two rounds ago) can never be restored by
-        mistake; ``restore_gdn_state`` rejects a generation mismatch."""
+        Tags the snapshot with the SOURCE slot id and this slot's current
+        generation counter (``self.slot_gdn_snapshot_gen``, bumped on
+        every snapshot) -- 2026-07-17 addition per Codex-sol's explicit
+        ask for explicit per-slot state so a STALE snapshot (e.g. a caller
+        accidentally holding on to one from two rounds ago) can never be
+        restored by mistake; ``restore_gdn_state`` rejects a generation
+        mismatch. The slot-id tag was added in a follow-up fix the same
+        day: without it, a caller mistakenly restoring slot A's snapshot
+        into slot B could still pass the generation check (both slots
+        typically climb their OWN counters in lockstep in a symmetric
+        multi-slot workload, so equal generation numbers say nothing about
+        SLOT identity) -- ``restore_gdn_state`` now also rejects a
+        slot-id mismatch. Also marks the snapshot ``__consumed__`` on a
+        successful restore -- restoring the SAME snapshot object a second
+        time now raises instead of silently succeeding (idempotent in
+        this specific case since both restores would write the same
+        bytes, but a caller path that restores twice by mistake is exactly
+        the kind of latent bug this project's "no silent passes" standard
+        exists to catch)."""
         physical = _physical_slot(slot)
         self.slot_gdn_snapshot_gen[slot] += 1
-        snapshot: dict = {"__generation__": self.slot_gdn_snapshot_gen[slot]}
+        snapshot: dict = {
+            "__slot__": slot,
+            "__generation__": self.slot_gdn_snapshot_gen[slot],
+            "__consumed__": False,
+        }
         for name in self.gdn_layer_names:
             conv_state, ssm_state = self.kv_caches[name]
             snapshot[name] = (
@@ -948,7 +981,17 @@ class DirectModelRunner:
         is safe to call between real forward passes without disturbing any
         other slot or any fixed-address buffer a CUDA-graph-captured call
         might depend on. Rejects a stale snapshot (generation counter
-        mismatch -- see ``snapshot_gdn_state``'s docstring)."""
+        mismatch), a snapshot taken for a DIFFERENT slot, or a snapshot
+        that has already been consumed by a prior restore -- see
+        ``snapshot_gdn_state``'s docstring for why each of these was
+        added (2026-07-17, Codex-sol review)."""
+        if snapshot.get("__slot__") != slot:
+            raise RuntimeError(
+                f"GDN snapshot was taken for slot {snapshot.get('__slot__')}, "
+                f"not slot {slot} -- refusing a cross-slot restore"
+            )
+        if snapshot.get("__consumed__"):
+            raise RuntimeError(f"GDN snapshot for slot {slot} was already restored once")
         gen = snapshot.get("__generation__")
         if gen != self.slot_gdn_snapshot_gen[slot]:
             raise RuntimeError(
@@ -961,6 +1004,7 @@ class DirectModelRunner:
             snap_conv, snap_ssm = snapshot[name]
             conv_state[physical].copy_(snap_conv.to(self.device))
             ssm_state[physical].copy_(snap_ssm.to(self.device))
+        snapshot["__consumed__"] = True
 
     def _mtp_forward(
         self,
@@ -969,23 +1013,64 @@ class DirectModelRunner:
         hidden_states_in: torch.Tensor,
         start_pos: int,
         *,
+        prior_kv_len: int,
         is_decode: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Real draft-model (``Qwen3_5MTP``) forward for ONE slot -- the
         low-level primitive the centralized MTP-cycle coordinator methods
-        (``mtp_prefill``/``mtp_verify_and_commit``) build on. Deliberately
-        does NOT touch ``self.slot_draft_sync_len`` itself (unlike
-        ``_forward``/``_forward_batch``'s unconditional-or-commit-flag
-        bookkeeping) -- the caller decides whether this call's advance
-        represents the real synced history (step 0, teacher-forced with
-        the target's own just-computed hidden state) or a throwaway
-        exploratory propose step (steps 1..K-1, autoregressive on the
-        draft's own previous hidden state/token) that must NOT be counted
-        as committed. This is what makes the draft model's own KV cache
-        need no explicit rollback on accept/reject, unlike GDN: an
-        exploratory step's positions are simply overwritten by the next
-        round's real sync call, exactly like attention's own
-        content/position-addressed reasoning elsewhere in this file.
+        (``mtp_prefill``/``mtp_verify_and_commit``) build on.
+
+        ``prior_kv_len`` (2026-07-17 fix -- see below) is an EXPLICIT
+        caller-supplied argument, NOT read from ``self.slot_draft_sync_len``
+        internally as an earlier version of this method did. This method
+        does NOT touch ``self.slot_draft_sync_len`` itself either way (the
+        caller decides whether this call's advance represents the real
+        synced history -- step 0, teacher-forced with the target's own
+        just-computed hidden state -- or a throwaway exploratory propose
+        step -- steps 1..K-1, autoregressive on the draft's own previous
+        hidden state/token -- that must NOT be counted as committed). This
+        is what makes the draft model's own KV cache need no explicit
+        rollback on accept/reject, unlike GDN: an exploratory step's
+        positions are simply overwritten by the next round's real sync
+        call, exactly like attention's own content/position-addressed
+        reasoning elsewhere in this file.
+
+        **2026-07-17 real bug, caught by an independent Codex-sol review
+        and independently re-verified by the coordinator before being
+        relayed**: this method used to read ``prior_kv_len=self
+        .slot_draft_sync_len[slot]`` directly. That field is deliberately
+        NOT updated after step 0 (see above) -- correct for THAT field's
+        job (tracking the real committed sync length across rounds), but
+        WRONG when reused as this call's OWN attention-metadata history
+        length for the exploratory loop's 2nd-and-later steps: those
+        steps' actual physical write position (``start_pos``, which DOES
+        advance every exploratory iteration in
+        ``_mtp_sync_and_propose``) drifts away from the frozen
+        ``slot_draft_sync_len``, so the attention metadata told the
+        kernel a SMALLER history length than where the write actually
+        landed -- the exploratory step's own query would then fail to
+        attend to the PREVIOUS exploratory step's just-written K/V (it
+        wasn't in the "prior" range the metadata declared), silently
+        computing over an incomplete/wrong causal history for every
+        exploratory step from the 2nd one onward. K=3 (this project's
+        real production setting) has exactly 2 exploratory steps, so the
+        1st (which happens to immediately follow step 0, where the frozen
+        field and the real position still coincide) was fine, but the 2nd
+        was not -- meaning every real K=3 proposal's 3rd draft token was
+        computed against a subtly wrong causal history. Fixed by making
+        the caller (``_mtp_sync_and_propose``) track its own LOCAL running
+        prior-length counter that DOES advance every exploratory
+        iteration, passed in here explicitly, while ``self
+        .slot_draft_sync_len`` itself still only updates once (after step
+        0) -- decoupling "what this call's attention needs" from "what the
+        cross-round bookkeeping should remember" fixes both correctly at
+        once. Not shape-checkable (see notes/direct-model-runner-design.md's
+        2026-07-17 methodology-fix entry): this bug produced the right
+        SHAPE and vocab-range output at every step, only the CONTENT was
+        wrong from the 2nd exploratory step on -- exactly why the
+        verification gradient's steps 3-4 (shape/length checks only) never
+        caught it, and why the fix needed a per-step oracle-aligned logits
+        comparison, not another shape check, to confirm.
 
         ``hidden_states_in`` must have exactly ``len(token_ids)`` rows
         (``Qwen3_5MultiTokenPredictor.forward()`` concatenates it against
@@ -997,7 +1082,7 @@ class DirectModelRunner:
             )
         num_new_tokens = len(token_ids)
         attn_meta = build_attention_metadata(
-            prior_kv_len=self.slot_draft_sync_len[slot],
+            prior_kv_len=prior_kv_len,
             num_new_tokens=num_new_tokens,
             is_decode=is_decode,
             slot=slot,
@@ -1041,23 +1126,40 @@ class DirectModelRunner:
         matches vLLM's real ``_prepare_prefill_inputs_kernel`` shift-by-one
         mechanism); steps 1..k-1 are genuinely autoregressive on the
         draft's own previous hidden state/token, and are NOT committed to
-        ``self.slot_draft_sync_len`` (see ``_mtp_forward``'s docstring)."""
+        ``self.slot_draft_sync_len`` (see ``_mtp_forward``'s docstring).
+
+        **2026-07-17 fix**: tracks its OWN local ``running_prior_kv_len``
+        counter, separate from ``self.slot_draft_sync_len`` -- the local
+        counter advances every exploratory iteration (matching where each
+        step's write actually lands), while the persistent field only
+        ever advances once, after step 0. Passing the persistent field
+        directly into every exploratory `_mtp_forward` call (the previous,
+        buggy version) left steps 2..k-1's attention metadata pointing at
+        a stale, non-advancing history length -- see `_mtp_forward`'s
+        docstring for the full analysis of what that broke."""
         step0_logits, step0_hidden = self._mtp_forward(
-            slot, shifted_input_ids, target_hidden_states, start_pos, is_decode=(num_new_tokens == 1)
+            slot,
+            shifted_input_ids,
+            target_hidden_states,
+            start_pos,
+            prior_kv_len=self.slot_draft_sync_len[slot],
+            is_decode=(num_new_tokens == 1),
         )
         self.slot_draft_sync_len[slot] += num_new_tokens
         draft_tokens = [int(step0_logits[-1].argmax(dim=-1).item())]
         prev_hidden = step0_hidden[-1:]
         prev_token = draft_tokens[0]
         next_pos = start_pos + num_new_tokens
+        running_prior_kv_len = self.slot_draft_sync_len[slot]
         for _ in range(1, k):
             step_logits, step_hidden = self._mtp_forward(
-                slot, [prev_token], prev_hidden, next_pos, is_decode=True
+                slot, [prev_token], prev_hidden, next_pos, prior_kv_len=running_prior_kv_len, is_decode=True
             )
             prev_token = int(step_logits[-1].argmax(dim=-1).item())
             draft_tokens.append(prev_token)
             prev_hidden = step_hidden[-1:]
             next_pos += 1
+            running_prior_kv_len += 1
         return draft_tokens
 
     def mtp_prefill(self, slot: int, prompt_token_ids: list[int]) -> dict:
@@ -1547,13 +1649,33 @@ class CapturedBatchDecodeGraph:
             self._static_logits = self._forward_no_sync()
         self._graph = g
 
-    def replay(self, slot_ids: list[int], token_ids, kv_lengths: list[int]) -> torch.Tensor:
+    def replay(
+        self, slot_ids: list[int], token_ids, kv_lengths: list[int], *, commit: bool = True
+    ) -> torch.Tensor:
         """Replay the captured graph at REAL (slot_ids, token_ids,
         kv_lengths) data -- may (and, per this round's explicit test
         scope, deliberately does) differ drastically from capture()'s
         warmup data, including kv_len values much larger or smaller than
         whatever was used at capture time. Returns logits shaped
         ``[batch_size * qo_len, vocab]`` (request-then-position order).
+
+        ``commit`` (2026-07-17 fix, Codex-sol review, confirmed real):
+        mirrors ``_forward_batch``'s own ``commit`` parameter -- this
+        method used to advance ``self.runner.slot_kv_len`` by
+        ``self.qo_len`` UNCONDITIONALLY, the exact physical-write-vs-
+        committed conflation already fixed on the eager path (see
+        ``_forward_batch``'s docstring) but left inconsistent here, since
+        this class has its own separate captured-graph call path that
+        never goes through ``_forward_batch``. For ``qo_len==1`` (plain
+        decode) this default is harmless (never ambiguous). For
+        ``qo_len>1`` (MTP verify), a caller integrating this graph into
+        the real accept/reject flow (not done yet -- CUDA graph
+        integration is still explicitly the last, unstarted step of the
+        verification gradient) MUST pass ``commit=False`` and apply the
+        same real-committed-length correction ``mtp_verify_and_commit``
+        already does on the eager path, or every verify replay would
+        silently auto-accept the full draft regardless of the real
+        accept/reject outcome.
 
         No ``torch.cuda.synchronize()`` here (removed 2026-07-17, a
         correctness-review finding): ``_fill_buffers``'s ``.copy_()`` calls
@@ -1590,6 +1712,7 @@ class CapturedBatchDecodeGraph:
         self._fill_buffers(slot_ids, token_ids, kv_lengths)
         self._graph.replay()
         for slot in slot_ids:
-            self.runner.slot_kv_len[slot] += self.qo_len
+            if commit:
+                self.runner.slot_kv_len[slot] += self.qo_len
             self.runner.slot_gdn_initialized[slot] = True
         return self._static_logits

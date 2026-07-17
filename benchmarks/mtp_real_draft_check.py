@@ -131,7 +131,8 @@ def _run_once() -> dict:
     anchor = int(mtp_target_logits[-1].argmax(dim=-1).item())
     shifted_input_ids = prompt_ids[1:] + [anchor]
     step0_logits, step0_hidden = mtp_runner._mtp_forward(
-        0, shifted_input_ids, mtp_target_hidden, start_pos=0, is_decode=False
+        0, shifted_input_ids, mtp_target_hidden, start_pos=0,
+        prior_kv_len=mtp_runner.slot_draft_sync_len[0], is_decode=False
     )
     mtp_runner.slot_draft_sync_len[0] += len(prompt_ids)
     step0_finite = bool(torch.isfinite(step0_logits).all().item())

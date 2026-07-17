@@ -2609,3 +2609,150 @@ already used (4 full model-loading test runs plus 2 targeted diagnostic
 runs). Not blocked on anything technical -- a scope/pacing call, reported
 per the coordinator's explicit "get to whatever step feels reasonable,
 report honestly" instruction.
+
+## 2026-07-17, MAJOR CORRECTION: a real, structural bug in the propose loop was caught by an independent Codex-sol review after this round's steps 1-6 were reported as passing -- fixed and re-verified, and the exact methodology gap that let it through is now closed for this specific case
+
+**This corrects work reported as verified/passing above.** Before
+starting step 7 (W1/W2), the coordinator commissioned an independent
+Codex-sol review of the Phase 2 implementation. It came back
+REQUEST-CHANGES-level, and the coordinator personally re-read
+`_mtp_sync_and_propose`'s source and confirmed the core finding was real
+before relaying it -- the correct discipline this project has followed
+since the earlier CUDA-Graph state-pollution correction, and the right
+one: an "independent review flagged it" claim should not be propagated
+into an implementation decision without checking it first.
+
+### The core bug (confirmed real, fixed)
+
+`_mtp_sync_and_propose`'s exploratory propose loop (steps 1..K-1) passed
+`self.slot_draft_sync_len[slot]` -- a field intentionally frozen after
+step 0 (by design, so the draft's own KV needs no rollback on
+accept/reject) -- as EVERY exploratory step's `prior_kv_len` for
+`_mtp_forward`'s attention metadata. But the actual physical write
+position (`start_pos`/`next_pos`) keeps advancing every exploratory
+iteration. For K=3 (this project's real production setting, 2
+exploratory steps), the 1st exploratory step happens to still be
+correct (it immediately follows step 0, where the frozen field and the
+real position still coincide) -- but the 2nd is not: its attention
+metadata claimed a SHORTER history than where its own K/V actually got
+written, meaning that step's query silently failed to attend to the
+PREVIOUS exploratory step's own contribution. Every real K=3 proposal's
+3rd draft token was computed against an incomplete causal history.
+
+**Why this was not caught by steps 3-4's verification** (the coordinator's
+explicit methodology critique, confirmed correct): those steps only
+checked SHAPE and vocab-range of the proposed tokens, never per-step
+numerical content against an independent oracle. This bug produces
+exactly the right shape/vocab-range output at every step -- only the
+CONTENT is wrong from the 2nd exploratory step onward. A shape check
+structurally cannot catch a content-only bug like this one.
+
+**Fix**: decouple "what this call's attention needs" from "what the
+cross-round bookkeeping should remember." `_mtp_forward` now takes an
+EXPLICIT `prior_kv_len` argument (no longer reads
+`self.slot_draft_sync_len` internally). `_mtp_sync_and_propose` tracks
+its own LOCAL `running_prior_kv_len` counter that advances every
+exploratory iteration (matching where each step's write actually
+lands), while `self.slot_draft_sync_len` itself still only advances once
+after step 0 -- both correctly now, decoupled instead of conflated.
+
+**Decisive verification, not another shape check** (per the coordinator's
+explicit ask): built `benchmarks/mtp_prior_kv_len_fix_check.py` with two
+independent checks:
+1. **White-box invariant** (the actual decisive proof, directly targeting
+   the root cause): the correct invariant is `prior_kv_len == start_pos`
+   for every `_mtp_forward` call in the propose loop. Instrumented via
+   monkeypatching to record every call's arguments during a real
+   `mtp_prefill`, checked at K=3 (production) and K=5 (stress, 4
+   exploratory steps). **Result: zero mismatches at both K values,
+   confirmed stable.**
+2. **Black-box numerical demonstration** (a concrete, quantified
+   illustration, not a pass/fail gate -- whether a specific prompt/
+   position is numerically sensitive enough to visibly flip is
+   prompt-dependent, not itself a correctness property): reproduces the
+   OLD buggy semantics (frozen `prior_kv_len`) side-by-side with the
+   fixed semantics, letting each side's own draft tokens propagate
+   autoregressively (not artificially forced identical partway through --
+   this is what actually happened in production, not a partial repro).
+   At K=3 (production), the two sequences happened to match exactly for
+   this specific prompt -- reported honestly, not suppressed, with the
+   explanation that a single missing token of causal context at that
+   specific position did not happen to be decision-relevant for greedy
+   top-1 there. At K=8 (stress, larger accumulated gap), the two
+   sequences matched for the first 4 tokens then diverged completely
+   (`[13, 248046, 198, 248045, 198, 248045, 198, 248069]` vs. `[13,
+   248046, 198, 248045, 561, 11, 369, 11]`) -- concrete, quantified proof
+   the bug's mechanism has real numerical consequences once the
+   accumulated gap is large enough, and that the fix eliminates them.
+
+### Other findings from the same review, verified one by one (not accepted wholesale)
+
+1. **`reset_slot()` incomplete -- CONFIRMED, fixed.** It cleared
+   `slot_kv_len`/`slot_gdn_initialized` but not
+   `slot_draft_sync_len`/`slot_pending_draft_tokens`. A slot reused for a
+   NEW logical request would start its real target KV at position 0 but
+   its draft-sync step-0 call would read a STALE, nonzero
+   `slot_draft_sync_len` -- an immediate correctness bug for any slot
+   ever reused, which is this project's whole fixed-slot-generation
+   premise. Now cleared alongside the pre-existing fields.
+2. **GDN snapshot generation not slot-bound, and not marked consumed
+   after restore -- CONFIRMED, fixed.** `snapshot_gdn_state`/
+   `restore_gdn_state`'s generation-counter check only compared numbers,
+   not slot identity -- a caller mistakenly restoring slot A's snapshot
+   into slot B could still pass (both slots typically climb their own
+   counters in lockstep in a symmetric multi-slot workload, so equal
+   generation numbers say nothing about slot identity). Fixed by tagging
+   each snapshot with its source slot id and rejecting a mismatch. Also
+   added a `__consumed__` marker so restoring the SAME snapshot object
+   twice now raises instead of silently succeeding (idempotent in this
+   specific case, but exactly the kind of latent bug this project's
+   "no silent passes" standard exists to catch).
+3. **`CapturedBatchDecodeGraph.replay()` unconditionally commits, no
+   `commit` flag -- CONFIRMED, fixed.** This class has its own separate
+   captured-graph call path that never goes through `_forward_batch`, so
+   it was never updated when `commit` was added there earlier this round
+   -- a real inconsistency, though not yet triggering an observed failure
+   (CUDA graph integration into the real MTP accept/reject flow is still
+   explicitly the last, unstarted step of the gradient). Added a matching
+   `commit: bool = True` parameter (default preserves all existing
+   callers' behavior unchanged).
+4. **Methodology gap: steps 3-4 only checked shape, never per-step
+   oracle-aligned logits -- CONFIRMED, this is exactly why the K>1 bug
+   survived.** Addressed for THIS specific bug via
+   `mtp_prior_kv_len_fix_check.py` above. NOT addressed as a blanket
+   retrofit of oracle-aligned numerical checks into every existing
+   verification step (steps 1-6's existing tests still rely on
+   shape/bookkeeping/reference-replay checks, which are each individually
+   reasoned about but were not re-audited end-to-end for this same class
+   of "right shape, wrong content" gap beyond the one bug found). Worth
+   treating as a standing practice going forward, not a one-time patch.
+5. **Capacity: `block_size=16 × blocks_per_slot=128 = 2048` tokens/slot
+   across every existing MTP test script, vs. W1's 4096/W2's 32768 need
+   -- CONFIRMED, real, and not yet addressed.** Every existing MTP test
+   this round and the prior one used this same undersized default. A
+   real W1/W2 run would hit `build_attention_metadata`'s own
+   `RuntimeError` guard (`kv_len exceeds this slot's ... capacity`) well
+   before reaching a meaningful acceptance-rate sample. This is the
+   coordinator's stated step-3 priority (after bug fixes and methodology,
+   both addressed above) -- NOT attempted this round, remains the
+   concrete blocker before step 7 (W1/W2) can even start.
+
+### Regression check across the whole existing MTP test suite (all re-run after all 4 fixes above)
+
+`mtp_real_draft_check.py` (needed one call-site update: a direct
+`_mtp_forward` call in the script itself had to pass the new required
+`prior_kv_len` argument -- caught immediately by the signature change,
+not a silent bug), `mtp_multiround_check.py`, `mtp_accept_reject_check.py`,
+`mtp_gdn_rollback_check.py`, `mtp_trace_driven_probe.py` -- **all pass,
+same results as before the fixes** (e.g. the multi-round test's
+7/8-exact-match near-tie finding reproduces identically), confirming
+none of the 4 fixes regressed anything already verified.
+
+### Status
+
+Bug fixes (coordinator's item 1) and the specific-case methodology fix
+(item 2, partial -- see point 4 above) are done and re-verified this
+round. Capacity expansion (item 3) is NOT done -- confirmed necessary,
+not yet started. Step 7 (W1/W2) remains blocked on item 3, as it was
+before this correction, now for a documented reason rather than an
+unexamined one.

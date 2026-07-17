@@ -656,6 +656,76 @@ boundary," and recommended a strictly time-boxed trace-driven
 performance probe (no real drafter) before committing to the full
 faithful integration — adopted, see next section.
 
+### Phase 3, MAJOR CORRECTION (2026-07-17) — real structural bug in the propose loop, caught by independent Codex-sol review AFTER steps 1-6 were reported passing; fixed, re-verified, other findings triaged
+
+**This corrects work reported as verified above (the "steps 5-6" and
+Phase-2 entries below).** Before starting step 7 (W1/W2), an independent
+Codex-sol review of the Phase 2 implementation came back at
+REQUEST-CHANGES level. The coordinator personally re-read
+`_mtp_sync_and_propose`'s source and confirmed the core finding before
+relaying it — right discipline, matching this project's standing rule
+of verifying an independent review's claims before acting on them.
+
+**The bug (confirmed real, fixed)**: `_mtp_sync_and_propose`'s
+exploratory propose loop passed the intentionally-frozen
+`slot_draft_sync_len` as EVERY exploratory step's `prior_kv_len`, but
+the real physical write position keeps advancing each iteration. For
+K=3 (production), the 1st exploratory step happens to still be correct
+(immediately follows step 0, where frozen and real still coincide) —
+the 2nd is not: its attention metadata claimed a shorter history than
+where its own K/V actually landed, so it silently failed to attend to
+the previous exploratory step's own contribution. Every real K=3
+proposal's 3rd draft token was computed against an incomplete causal
+history. **Why steps 3-4 didn't catch this** (confirmed methodology
+gap): they only checked shape/vocab-range, never per-step numerical
+content — this bug produces the right shape at every step, only the
+content is wrong from the 2nd exploratory step on.
+
+**Fix**: `_mtp_forward` now takes an explicit `prior_kv_len` argument
+instead of reading `slot_draft_sync_len` internally;
+`_mtp_sync_and_propose` tracks its own local `running_prior_kv_len` that
+advances every exploratory iteration, while the persistent field still
+only advances once (after step 0) — decoupling "what this call's
+attention needs" from "what cross-round bookkeeping remembers" fixes
+both correctly.
+
+**Decisive re-verification** (not another shape check), `benchmarks/
+mtp_prior_kv_len_fix_check.py`: (1) white-box invariant
+(`prior_kv_len == start_pos` at every propose-loop call) — zero
+mismatches at K=3 and K=5, the actual decisive proof. (2) black-box
+numerical demonstration, letting old-buggy and fixed semantics
+propagate autoregressively side by side — at K=3 the two sequences
+happened to match exactly for this specific prompt (reported honestly,
+not suppressed: a single missing context token didn't flip this
+position's greedy choice); at K=8 (stress) they matched for 4 tokens
+then diverged completely, concrete quantified proof the bug has real
+consequences once the gap compounds and that the fix eliminates them.
+
+**Other findings from the same review, verified individually (not
+accepted wholesale)**: (1) `reset_slot()` didn't clear
+`slot_draft_sync_len`/`slot_pending_draft_tokens` — confirmed, an
+immediate bug for any reused slot, fixed. (2) GDN snapshot generation
+wasn't slot-bound and wasn't marked consumed after restore — confirmed
+(a cross-slot restore could pass the generation check by coincidence),
+fixed with a slot-id tag + consumed marker. (3)
+`CapturedBatchDecodeGraph.replay()` unconditionally committed, no
+`commit` flag, inconsistent with the eager path's new semantics —
+confirmed (not yet triggering an observed failure since CUDA graph
+integration into MTP accept/reject isn't wired up yet), fixed with a
+matching `commit` parameter. (4) methodology gap (shape-only checks) —
+confirmed, addressed for this specific bug, not retrofitted across
+every existing verification step. (5) capacity
+(`block_size=16×blocks_per_slot=128=2048` tokens/slot vs. W1's
+4096/W2's 32768 need) — confirmed real and NOT yet fixed, the concrete
+next blocker before step 7 can start.
+
+**Regression check**: re-ran the full existing MTP test suite after all
+4 fixes (`mtp_real_draft_check.py` — needed one direct-call-site update
+for the new required argument, caught immediately by the signature
+change; `mtp_multiround_check.py`; `mtp_accept_reject_check.py`;
+`mtp_gdn_rollback_check.py`; `mtp_trace_driven_probe.py`) — all pass,
+identical results to before the fixes, confirming no regressions.
+
 ### Phase 3, multi-round + 4-slot isolation (2026-07-17) — verification gradient steps 5-6 done, mtp_decode design-simplified away, one benign near-tie found and root-caused
 
 Full detail in `notes/direct-model-runner-design.md`'s "steps 5-6"
