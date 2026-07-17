@@ -1004,18 +1004,20 @@ class DirectModelRunner:
             self._precapture_draft_step_graphs()
 
     def _precapture_verify_graphs(self) -> None:
-        # 2026-07-17, Phase 3 round 2: precapture every qo_len in
-        # 1..num_speculative_tokens+1 (not just the verify-only k+1) so the
-        # recompute-forward graph-reuse path (mtp_verify_and_commit_batch's
-        # uniform-committed_len special case, which needs a graph at
-        # whatever committed_len -- 1..k -- the recompute group actually
-        # lands on) never has to lazily capture DURING a real timed round;
-        # that one-time capture cost now happens here, at construction,
-        # matching every other graph's "pay setup cost once" discipline.
+        # 2026-07-18, Phase 2 CUDA-graph reconciliation: only qo_len=k+1 is
+        # ever needed now. The old rationale for precapturing every
+        # qo_len in 1..k+1 (the recompute-forward graph-reuse path, which
+        # needed a graph at whatever committed_len 1..k a ragged recompute
+        # group happened to land on) no longer applies -- Phase 2 removed
+        # the separate recompute forward entirely, so
+        # mtp_verify_and_commit_batch's verify step now ALWAYS replays at
+        # exactly qo_len=k+1, regardless of each slot's own accept/reject
+        # outcome (see that method's docstring). Precapturing the other
+        # qo_len values would just be wasted capture time/GPU memory for
+        # shapes nothing calls anymore.
         max_batch = self.num_slots // 2
         for batch_size in range(1, max_batch + 1):
-            for qo_len in range(1, self.num_speculative_tokens + 2):
-                self._get_verify_graph(batch_size, qo_len)
+            self._get_verify_graph(batch_size, self.num_speculative_tokens + 1)
 
     def _precapture_draft_step_graphs(self) -> None:
         # 2026-07-17, Phase 3 round 2: precapture qo_len=1 (the K-1
@@ -2458,16 +2460,25 @@ class DirectModelRunner:
         select which of last round's K+1 dedicated SSM rows holds the
         valid state to resume from, and updated here after every round.
 
-        Known, deliberate scope limits of this rewrite (see the notes doc
-        for the full reasoning): (1) the verify forward here is EAGER
-        only -- it does not (yet) go through ``CapturedBatchDecodeGraph``
-        (that class is built around the OLD chunked GDN metadata path;
-        reconciling it with the new spec-decode metadata is follow-up
-        work, not done this round) -- ``self.enable_cudagraph`` therefore
-        no longer affects this method's verify step at all (the draft
-        model's OWN step-0/continuation graphs, unrelated to GDN state,
-        are unaffected and still used via ``_mtp_sync_and_propose_batch``).
-        (2) ``mtp_verify_and_commit`` (the singular/looped sibling) is
+        **2026-07-18, Phase 2 CUDA-graph reconciliation**: the verify
+        forward now goes through a CUDA-graph replay
+        (``CapturedBatchDecodeGraph``, via ``self._get_verify_graph``,
+        rebuilt this round to fill its GDN metadata via the same
+        spec-decode mechanism this method uses -- see that class's
+        docstring) whenever ``self.enable_cudagraph`` is on AND this
+        runner has enough spare slot capacity (``num_slots >= 2*len(slots)``).
+        Falls back to the eager ``verify_batch_spec`` path -- correctly,
+        not silently -- whenever the graph isn't available for this
+        call's batch_size (``enable_cudagraph`` off, matching every
+        existing correctness suite; or a caller's active-slot count isn't
+        one this runner precaptured). Since Phase 2 removed the separate
+        recompute forward entirely, there is only ONE verify-shaped
+        forward per round now, always at ``qo_len=k+1`` -- unlike Phase 3's
+        old recompute-forward-graph-reuse special case (which needed a
+        DIFFERENT qo_len per ragged recompute group), this graph lookup is
+        now always the exact same shape every round, for every slot.
+
+        ``mtp_verify_and_commit`` (the singular/looped sibling) is
         intentionally NOT migrated -- it still uses the old chunked +
         snapshot/restore + recompute-forward mechanism unconditionally,
         so ``snapshot_gdn_state``/``restore_gdn_state`` remain in place
@@ -2483,13 +2494,24 @@ class DirectModelRunner:
         kv_lens_before = {s: self.slot_kv_len[s] for s in slots}
         num_accepted_prev = [self.slot_num_accepted_tokens[s] for s in slots]
 
-        verify_logits, verify_hidden = self.verify_batch_spec(
-            slots,
-            drafts,
-            [kv_lens_before[s] for s in slots],
-            num_accepted_tokens_prev=num_accepted_prev,
-            return_hidden=True,
-        )
+        graph = self._get_verify_graph(len(slots), k + 1) if self.enable_cudagraph else None
+        if graph is not None:
+            verify_logits, verify_hidden = graph.replay(
+                slots,
+                drafts,
+                [kv_lens_before[s] for s in slots],
+                commit=False,
+                return_hidden=True,
+                num_accepted_tokens_prev=num_accepted_prev,
+            )
+        else:
+            verify_logits, verify_hidden = self.verify_batch_spec(
+                slots,
+                drafts,
+                [kv_lens_before[s] for s in slots],
+                num_accepted_tokens_prev=num_accepted_prev,
+                return_hidden=True,
+            )
 
         decisions = determine_accept_reject_batch(slots, drafts_by_slot, verify_logits, k)
 
@@ -2563,20 +2585,28 @@ class CapturedBatchDecodeGraph:
        kv_len up to that configured limit, not just the capture-time
        value.
 
-    2026-07-16, MTP extension (qo_len>1): GDN's chunked/"prefill" metadata
-    fields (``chunk_indices``/``chunk_offsets``/``nums_dict``/
-    ``batch_ptr``/``token_chunk_offset_ptr``/``has_initial_state``) depend
-    ONLY on the query-length structure (how many tokens per request), not
-    on which physical slot each request maps to or on kv_len -- so for a
-    FIXED (batch_size, qo_len) graph they are genuinely CONSTANT across
-    every replay (unlike ``kv_page_indices``/``state_indices``, which
-    depend on live kv_len/slot identity and must be refilled every
-    replay). Computed once in ``__init__`` via
-    ``build_gdn_metadata_batch(..., slot_initialized=[True]*batch_size)``
-    and reused as-is -- fixed address by construction of never being
-    recreated, no ``.copy_()`` needed. ``has_initial_state=True`` for
-    every slot is this class's scope: MTP verify only ever happens after
-    a slot's own prior prefill/decode has established real context.
+    2026-07-16, MTP extension (qo_len>1), **superseded 2026-07-18 (Phase 2
+    CUDA-graph reconciliation)**: originally this replicated GDN's
+    chunked/"prefill" metadata (``build_gdn_metadata_batch``'s
+    ``chunk_indices``/``chunk_offsets``/``nums_dict``/``batch_ptr``/
+    ``token_chunk_offset_ptr``/``has_initial_state`` fields), matching
+    what the eager verify path did at the time. The eager path has since
+    moved to the REAL spec-decode GDN mechanism
+    (``build_gdn_metadata_spec_batch`` -- K+1 dedicated SSM rows,
+    acceptance-aware addressing, no snapshot/restore/recompute-forward;
+    see ``mtp_verify_and_commit_batch``'s docstring) for the exact same
+    reason this class exists at all: qo_len>1 here ONLY ever means MTP
+    verify. This class now mirrors that mechanism instead:
+    ``spec_query_start_loc``/``spec_sequence_masks`` are CONSTANT for a
+    fixed (batch_size, qo_len) pair (computed once, same reasoning as
+    ``qo_indptr`` above); ``spec_state_indices_tensor`` (a FIXED
+    per-(slot, column) row mapping by construction -- see
+    ``_ssm_spec_row`` -- but slot IDENTITY varies per replay, since one
+    graph object is reused across calls with different active slot sets
+    at the same batch_size) and ``num_accepted_tokens`` (the real
+    per-round accept/reject outcome, inherently different every replay)
+    are both refilled in ``_fill_buffers`` every replay, exactly like
+    ``kv_page_indices``/``state_indices`` already were.
 
     A replayed CUDA graph is a pre-recorded sequence of GPU kernel
     launches, NOT a re-execution of Python control flow -- ``model
@@ -2635,8 +2665,6 @@ class CapturedBatchDecodeGraph:
     further optimization, not attempted this round.
     """
 
-    TARGET_SPLITS = 16
-
     def __init__(self, runner: "DirectModelRunner", batch_size: int, qo_len: int = 1) -> None:
         if runner.num_slots < 2 * batch_size:
             raise ValueError(
@@ -2653,9 +2681,26 @@ class CapturedBatchDecodeGraph:
         device = runner.device
         block_size = runner.block_size
         blocks_per_slot = runner.blocks_per_slot
-        capacity = blocks_per_slot * block_size  # configured per-slot page-table limit (software, not GPU hardware)
-        self.fixed_kv_split_size = max(1, -(-capacity // self.TARGET_SPLITS))
-        self.fixed_max_num_splits = self.TARGET_SPLITS
+        # 2026-07-18, Phase 2 CUDA-graph reconciliation: this class used to
+        # derive its own split-KV config from a stale local
+        # ``TARGET_SPLITS = 16`` constant (a leftover from an earlier
+        # round, predating the later real-production tuning to 64
+        # splits/request -- see __init__'s split-KV comment on
+        # ``DirectModelRunner``). That staleness was harmless as long as
+        # this graph's verify-step replay was never actually exercised in
+        # production (true through this round's reconciliation); wiring it
+        # into the real ``mtp_verify_and_commit_batch`` path makes it
+        # matter for real -- a genuinely DIFFERENT split-KV count changes
+        # the attention kernel's reduction order, which this project has
+        # already established can flip near-tie accept/reject decisions
+        # (found via a real W1-S run: a 70.3%->76.7% draft-acceptance-rate
+        # shift between the eager and graph-replayed paths, too large to
+        # be ordinary near-tie noise, before this fix). Now uses the SAME
+        # runner-computed, currently-tuned value every eager caller and
+        # ``CapturedMTPDraftStepGraph`` already use, instead of maintaining
+        # a second, independently-stale derivation.
+        self.fixed_kv_split_size = runner.decode_fixed_kv_split_size
+        self.fixed_max_num_splits = runner.decode_fixed_max_num_splits
 
         # Permanently reserved for THIS graph object's own capture()
         # warmup -- the last batch_size logical slots of the runner.
@@ -2687,17 +2732,40 @@ class CapturedBatchDecodeGraph:
         self.static_positions = torch.zeros(n_tokens, dtype=torch.long, device=device)
         self.static_slot_mapping = torch.zeros(n_tokens, dtype=torch.long, device=device)
 
-        # MTP-only (qo_len>1): the chunked/"prefill" GDN fields that
-        # depend only on query-length structure -- computed once, see the
-        # class docstring's "MTP extension" section.
-        self._const_gdn_extra: GDNAttentionMetadata | None = None
+        # 2026-07-18, Phase 2 CUDA-graph reconciliation: for qo_len>1 this
+        # class's ONLY real remaining use is MTP verify, which the eager
+        # path (``verify_batch_spec``) now does via the REAL spec-decode
+        # GDN mechanism, not the old chunked/"prefill" one this class used
+        # to replicate here (``_const_gdn_extra``, removed). Static buffers
+        # mirror ``build_gdn_metadata_spec_batch``'s fields:
+        # ``spec_query_start_loc``/``spec_sequence_masks`` are CONSTANT for
+        # a fixed (batch_size, qo_len) pair (computed once, like
+        # ``static_qo_indptr`` above); ``spec_state_indices_tensor`` (a
+        # FIXED per-(slot, column) row mapping -- see ``_ssm_spec_row``'s
+        # docstring -- but slot IDENTITY varies per replay, since this
+        # class is reused across calls with potentially different active
+        # slot sets at the same batch_size) and ``num_accepted_tokens``
+        # (the real per-round accept/reject outcome, inherently different
+        # every replay) are both per-replay-filled in ``_fill_buffers``.
+        self.num_spec = runner.num_speculative_tokens
+        self.total_physical_slots = runner.num_slots + RESERVED_PHYSICAL_SLOTS
+        self.static_spec_query_start_loc: torch.Tensor | None = None
+        self.static_spec_sequence_masks: torch.Tensor | None = None
+        self.static_spec_state_indices: torch.Tensor | None = None
+        self.static_num_accepted_tokens: torch.Tensor | None = None
         if qo_len > 1:
-            self._const_gdn_extra = build_gdn_metadata_batch(
-                slots=list(range(num_reqs)),
-                device=device,
-                qo_len=qo_len,
-                slot_initialized=[True] * num_reqs,
+            if self.num_spec is None:
+                raise RuntimeError(
+                    "CapturedBatchDecodeGraph with qo_len>1 requires MTP "
+                    "(runner.num_speculative_tokens) to be configured -- "
+                    "this shape only ever means spec-decode verify"
+                )
+            self.static_spec_query_start_loc = (
+                torch.arange(0, num_reqs + 1, dtype=torch.int32, device=device) * qo_len
             )
+            self.static_spec_sequence_masks = torch.ones(num_reqs, dtype=torch.bool, device=device)
+            self.static_spec_state_indices = torch.zeros((num_reqs, qo_len), dtype=torch.int32, device=device)
+            self.static_num_accepted_tokens = torch.zeros(num_reqs, dtype=torch.int32, device=device)
 
         self._graph: torch.cuda.CUDAGraph | None = None
         self._static_logits: torch.Tensor | None = None
@@ -2716,7 +2784,14 @@ class CapturedBatchDecodeGraph:
         # benchmarks/mtp_verify_cudagraph_check.py.
         self.replay_count = 0
 
-    def _fill_buffers(self, slot_ids: list[int], token_ids, kv_lengths: list[int]) -> None:
+    def _fill_buffers(
+        self,
+        slot_ids: list[int],
+        token_ids,
+        kv_lengths: list[int],
+        *,
+        num_accepted_tokens_prev: list[int] | None = None,
+    ) -> None:
         """Write real, per-replay-varying values into the persistent static
         buffers. Computes everything via plain Python arithmetic (CPU-only,
         no GPU allocation) instead of calling
@@ -2726,7 +2801,18 @@ class CapturedBatchDecodeGraph:
         caller doesn't need here), real avoidable overhead on a hot path
         meant to be lean. Each static buffer's ``.copy_()`` source below is
         still a freshly built small tensor (a partial mitigation, not a
-        fully allocation-free design -- see the class docstring)."""
+        fully allocation-free design -- see the class docstring).
+
+        ``num_accepted_tokens_prev`` (2026-07-18, Phase 2 CUDA-graph
+        reconciliation, required when ``self.qo_len > 1``): each slot's
+        real committed length from ITS OWN last verify round (or bootstrap
+        1 right after a real prefill) -- see ``build_gdn_metadata_spec_batch``'s
+        docstring. Used to fill ``static_num_accepted_tokens``;
+        ``static_spec_state_indices`` is filled from ``slot_ids`` alone
+        (``_ssm_spec_row`` is a fixed per-(slot, column) mapping, but slot
+        IDENTITY genuinely varies per replay -- this class is reused
+        across calls with potentially different active slot sets at the
+        same batch_size)."""
         runner = self.runner
         device = runner.device
         qo_len = self.qo_len
@@ -2784,6 +2870,23 @@ class CapturedBatchDecodeGraph:
         self.static_positions.copy_(torch.tensor(positions_list, dtype=torch.long, device=device))
         self.static_slot_mapping.copy_(torch.tensor(slot_mapping_list, dtype=torch.long, device=device))
 
+        if qo_len > 1:
+            if num_accepted_tokens_prev is None:
+                raise ValueError(
+                    "num_accepted_tokens_prev is required when qo_len > 1 "
+                    "(this shape only ever means spec-decode verify)"
+                )
+            spec_indices_list = [
+                [_ssm_spec_row(slot, col, self.total_physical_slots, self.num_spec) for col in range(qo_len)]
+                for slot in slot_ids
+            ]
+            self.static_spec_state_indices.copy_(
+                torch.tensor(spec_indices_list, dtype=torch.int32, device=device)
+            )
+            self.static_num_accepted_tokens.copy_(
+                torch.tensor(num_accepted_tokens_prev, dtype=torch.int32, device=device)
+            )
+
     def _static_metadata_dicts(self) -> tuple[dict, dict]:
         runner = self.runner
         n_tokens = self.batch_size * self.qo_len
@@ -2813,27 +2916,25 @@ class CapturedBatchDecodeGraph:
                 non_spec_state_indices_tensor=self.static_state_indices,
             )
         else:
-            extra = self._const_gdn_extra
-            assert extra is not None
+            # 2026-07-18, Phase 2 CUDA-graph reconciliation: this class's
+            # only real remaining qo_len>1 use is MTP verify, which the
+            # eager path now does via the REAL spec-decode GDN mechanism
+            # (build_gdn_metadata_spec_batch), not the old chunked/
+            # "prefill" one this branch used to replicate (removed along
+            # with self._const_gdn_extra). See __init__'s comment for the
+            # static-buffer rationale.
             gdn_meta = GDNAttentionMetadata(
-                num_prefills=self.batch_size,
-                num_prefill_tokens=n_tokens,
+                num_prefills=0,
+                num_prefill_tokens=0,
                 num_decodes=0,
                 num_decode_tokens=0,
-                num_spec_decodes=0,
-                num_spec_decode_tokens=0,
+                num_spec_decodes=self.batch_size,
+                num_spec_decode_tokens=n_tokens,
                 num_actual_tokens=n_tokens,
-                has_initial_state=extra.has_initial_state,
-                non_spec_query_start_loc=self.static_non_spec_qsl,
-                non_spec_state_indices_tensor=self.static_state_indices,
-                chunk_indices=extra.chunk_indices,
-                chunk_offsets=extra.chunk_offsets,
-                prefill_query_start_loc=self.static_non_spec_qsl,
-                prefill_state_indices=self.static_state_indices,
-                prefill_has_initial_state=extra.prefill_has_initial_state,
-                nums_dict=extra.nums_dict,
-                batch_ptr=extra.batch_ptr,
-                token_chunk_offset_ptr=extra.token_chunk_offset_ptr,
+                spec_query_start_loc=self.static_spec_query_start_loc,
+                spec_state_indices_tensor=self.static_spec_state_indices,
+                spec_sequence_masks=self.static_spec_sequence_masks,
+                num_accepted_tokens=self.static_num_accepted_tokens,
             )
         attn_metadata_dict = {name: attn_meta for name in runner.attn_layer_names}
         attn_metadata_dict.update({name: gdn_meta for name in runner.gdn_layer_names})
@@ -2893,9 +2994,17 @@ class CapturedBatchDecodeGraph:
         warmup_kv_lengths = [runner.slot_kv_len[s] for s in warmup_slots]
         if self.qo_len == 1:
             warmup_token_ids = [0] * self.batch_size
+            warmup_num_accepted_tokens_prev = None
         else:
             warmup_token_ids = [[0] * self.qo_len for _ in range(self.batch_size)]
-        self._fill_buffers(warmup_slots, warmup_token_ids, warmup_kv_lengths)
+            # Bootstrap value (column 0 -- the row runner.prefill() above
+            # just wrote into), matching real usage's own first-ever-verify
+            # convention (see build_gdn_metadata_spec_batch's docstring).
+            warmup_num_accepted_tokens_prev = [1] * self.batch_size
+        self._fill_buffers(
+            warmup_slots, warmup_token_ids, warmup_kv_lengths,
+            num_accepted_tokens_prev=warmup_num_accepted_tokens_prev,
+        )
 
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
@@ -2918,6 +3027,7 @@ class CapturedBatchDecodeGraph:
         *,
         commit: bool = True,
         return_hidden: bool = False,
+        num_accepted_tokens_prev: list[int] | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Replay the captured graph at REAL (slot_ids, token_ids,
         kv_lengths) data -- may (and, per this round's explicit test
@@ -2935,6 +3045,14 @@ class CapturedBatchDecodeGraph:
         next resync step (which needs the target model's hidden states,
         not just its logits) without an extra eager forward call.
 
+        ``num_accepted_tokens_prev`` (2026-07-18, Phase 2 CUDA-graph
+        reconciliation, required when ``self.qo_len > 1``): each slot's
+        real committed length from ITS OWN last verify round (bootstrap 1
+        right after a real prefill) -- forwarded to ``_fill_buffers`` to
+        select which of last round's K+1 dedicated SSM rows holds the
+        valid state to resume from. Mirrors ``verify_batch_spec``'s own
+        parameter of the same name on the eager path.
+
         ``commit`` (2026-07-17 fix, Codex-sol review, confirmed real):
         mirrors ``_forward_batch``'s own ``commit`` parameter -- this
         method used to advance ``self.runner.slot_kv_len`` by
@@ -2944,14 +3062,12 @@ class CapturedBatchDecodeGraph:
         this class has its own separate captured-graph call path that
         never goes through ``_forward_batch``. For ``qo_len==1`` (plain
         decode) this default is harmless (never ambiguous). For
-        ``qo_len>1`` (MTP verify), a caller integrating this graph into
-        the real accept/reject flow (not done yet -- CUDA graph
-        integration is still explicitly the last, unstarted step of the
-        verification gradient) MUST pass ``commit=False`` and apply the
-        same real-committed-length correction ``mtp_verify_and_commit``
-        already does on the eager path, or every verify replay would
-        silently auto-accept the full draft regardless of the real
-        accept/reject outcome.
+        ``qo_len>1`` (MTP verify), the caller (``mtp_verify_and_commit_batch``,
+        2026-07-18) passes ``commit=False`` and applies the real
+        committed-length correction itself (plus updates
+        ``slot_num_accepted_tokens`` for the NEXT round) after determining
+        accept/reject on the returned logits -- exactly like the eager
+        ``verify_batch_spec`` path.
 
         No ``torch.cuda.synchronize()`` here (removed 2026-07-17, a
         correctness-review finding): ``_fill_buffers``'s ``.copy_()`` calls
@@ -2985,7 +3101,7 @@ class CapturedBatchDecodeGraph:
                 )
             if not self.runner.slot_gdn_initialized[slot]:
                 raise RuntimeError(f"slot {slot} has no GDN state yet (needs a prior prefill)")
-        self._fill_buffers(slot_ids, token_ids, kv_lengths)
+        self._fill_buffers(slot_ids, token_ids, kv_lengths, num_accepted_tokens_prev=num_accepted_tokens_prev)
         self._graph.replay()
         self.replay_count += 1
         for slot in slot_ids:

@@ -1849,6 +1849,52 @@ CUDA-graph replay, confirming eliminating the recompute-forward pass
 loss costs. Full derivation, the direct kernel-source re-verification, and
 the complete near-tie measurement are in the plan doc's new section 11.
 
+### CUDA-graph reconciliation for spec-decode verify (2026-07-18) — real +74.06% on top of Phase 2 (78.565→136.750), gap to native down to ~1.057x — both post-Phase-3 targets met
+
+Reconciled `CapturedBatchDecodeGraph` with the new spec-decode GDN
+metadata (`static_spec_state_indices`/`static_num_accepted_tokens`,
+refilled per replay since slot identity varies call to call; constant
+`spec_query_start_loc`/`spec_sequence_masks` computed once) so verify-step
+CUDA-graph replay works again — `mtp_verify_and_commit_batch` now tries
+`_get_verify_graph` first, falling back to eager exactly as Phase 3's
+original design did. Since Phase 2 removed the separate recompute forward
+entirely, verify always replays at exactly `qo_len=k+1` now — no more
+"recompute-forward graph-reuse at a different qo_len" case, so
+`_precapture_verify_graphs` was simplified to match.
+
+**Real bug found and fixed along the way**: a first post-reconciliation
+W1-S run showed `draft_acceptance_rate_pct` shift from 70.29% to 76.67% —
+too large to be near-tie noise. Root cause: `CapturedBatchDecodeGraph` had
+its own stale `TARGET_SPLITS=16` split-KV constant, never exercised in
+production until this round (independent of, and stale relative to,
+`DirectModelRunner`'s real tuned `_DECODE_TARGET_SPLITS_PER_REQ=64` every
+eager caller already uses) — a genuinely different split-KV count changes
+attention's reduction order, which can flip near-tie decisions. Fixed by
+using `runner.decode_fixed_kv_split_size`/`decode_fixed_max_num_splits`
+directly. Re-measured: `draft_acceptance_rate_pct`/`total_committed_tokens`
+returned to bit-for-bit the same values as the eager path (70.292...%,
+4116), confirming the fix.
+
+**Correctness: all 4 suites pass fresh**, including `mtp_verify_cudagraph_check.py`
+(updated this round — `verify_graph_batch4_replayed`/`verify_graph_batch2_replayed`
+restored as real pass/fail gates, now genuinely `true`; the old
+recompute-reuse coverage fields removed entirely, not just demoted, since
+those shapes are no longer even precaptured).
+
+**Performance: real W1-S 3-rep mean 136.750 accepted tok/s** (140.548 /
+141.670 / 128.031) — **+74.06% vs. the 78.565 eager-Phase-2 baseline,
++106.72% vs. the original 66.152 Phase-3 baseline. Gap to native's 144.54
+narrows to ~1.057x** — within 6% of native, and for the first time this
+project cycle BOTH of the plan's own post-Phase-3 targets are met
+(`>=110 accepted tok/s` and "within ~1.3x of native"). Sanity-checked the
+magnitude directly (not just the percentage): `gpu_busy_s_summed_across_slots`
+dropped from 44.47s to 26.58s for the IDENTICAL committed work (4116
+tokens, bit-exact match to the eager path) — a genuine reduction in
+bracketed elapsed GPU-stream time, mechanistically consistent with a
+single `cudaGraphLaunch()` replay eliminating the eager path's thousands
+of individually-dispatched kernels' inter-kernel CPU-dispatch gaps. Full
+derivation in the plan doc's new section 12.
+
 ### Phase 0 — Baseline contract
 
 - Frozen W1 (4K input / 1K output) and W2 (32K / 1K) workloads for

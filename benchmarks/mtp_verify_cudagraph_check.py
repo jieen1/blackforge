@@ -1,36 +1,34 @@
-"""Correctness verification for Phase 3's CUDA-graph wiring into the REAL
+"""Correctness verification for the CUDA-graph wiring into the REAL
 ``mtp_verify_and_commit_batch`` entry point (``runtime/direct_model_runner.py``),
-per ``notes/2026-07-17-post-ragged-round-next-steps.md``'s Phase 3 (both the
-initial round -- verify forward + K-1 draft steps -- and the fast-iteration
-follow-up round -- recompute-forward graph reuse, full precapture, and
-step-0 draft-resync generalization).
+per ``notes/2026-07-17-post-ragged-round-next-steps.md``'s Phase 3 (verify
+forward + K-1 draft steps, then a fast-iteration follow-up round -- full
+precapture and step-0 draft-resync generalization) and its Phase 2
+(native spec-decode GDN path, then this round's CUDA-graph reconciliation
+of that path).
 
-**2026-07-18, Phase 2 update**: ``mtp_verify_and_commit_batch``'s verify
-step itself was rewritten to use the real spec-decode GDN mechanism
-(``verify_batch_spec``/``build_gdn_metadata_spec_batch`` -- K+1 dedicated
-SSM rows, no snapshot/restore/recompute-forward), which is NOT (yet)
-reconciled with ``CapturedBatchDecodeGraph`` (that class is still built
-around the OLD chunked GDN metadata path -- see
-``mtp_verify_and_commit_batch``'s docstring for this explicitly documented
-scope limit). This means the verify/recompute-reuse CUDA-graph coverage
-this test was designed to confirm (``verify_graph_batch4_replayed``,
-``verify_graph_batch2_replayed``, ``recompute_reuse_qo2_replayed``,
-``recompute_reuse_qo1_replayed``) is now EXPECTED to be ``False`` --
-``mtp_verify_and_commit_batch`` never calls ``_get_verify_graph`` at all
-any more, regardless of ``enable_cudagraph``. Confirmed directly (not just
-inferred): a real run shows exactly this -- all four verify-side coverage
-flags False, while the draft-model's OWN step-0/continuation graphs
-(unrelated to GDN state, unaffected by Phase 2) remain correctly True.
-These four fields are demoted from pass/fail gates to informational
-fields (``known_moot_post_phase2``) documenting the CURRENT state; the
-draft-step graph coverage and (most importantly) per-slot CONTENT
-correctness across every scenario this test exercises (organic, mixed
-forced-reject, fully ragged forced-reject, single-slot forced-reject,
-uniform forced-reject at two different committed_lens, and a shrinking
-active-slot-count) remain the real pass/fail bar -- and these still pass.
-Reconciling ``CapturedBatchDecodeGraph`` with the new spec-decode metadata
-(so verify-side graph capture works again) is documented follow-up work,
-not done this round.
+**History, briefly**: Phase 3 (2026-07-17/18) built ``CapturedBatchDecodeGraph``
+around the then-current chunked GDN metadata path, including a
+"recompute-forward graph-reuse" special case (a SEPARATE recompute
+forward, needed on every partial-reject round, could reuse the
+verify-graph cache at whatever qo_len the ragged recompute group's
+committed_len happened to be). Phase 2 (2026-07-18) rewrote
+``mtp_verify_and_commit_batch`` to use the real spec-decode GDN mechanism
+(``build_gdn_metadata_spec_batch`` -- K+1 dedicated SSM rows,
+acceptance-aware addressing) and eliminated the separate recompute
+forward ENTIRELY (every slot's hidden states, regardless of accept/
+reject, are now a ragged slice of the ONE verify forward) -- but that
+rewrite initially fell back to eager dispatch for the verify step itself,
+since ``CapturedBatchDecodeGraph`` was still built for the old mechanism.
+**This round** reconciles the two: ``CapturedBatchDecodeGraph``'s qo_len>1
+branch now fills GDN metadata via the SAME spec-decode mechanism
+(``static_spec_state_indices``/``static_num_accepted_tokens``, refilled
+per replay from real slot ids/accept-reject outcomes -- see that class's
+docstring), so verify-step CUDA-graph replay works again. Since there is
+no more separate recompute forward at all (with or without graphs), the
+old "recompute-forward graph-reuse" special case and its own
+``qo_len in 1..k`` precapture range are GONE too -- verify now only ever
+replays at exactly ``qo_len=k+1``, for every slot, every round,
+regardless of accept/reject outcome.
 
 Unlike ``cudagraph_eager_parity_check.py``/``cudagraph_mtp_regression.py``
 (which drive ``CapturedBatchDecodeGraph`` directly via ``.capture()``/
@@ -56,25 +54,28 @@ Coverage, and which code path each round is designed to exercise:
      accept given this project's ~72% measured per-position acceptance
      rate). Exercises the common-case verify-graph + step-0-graph +
      draft-step-graph path.
-2.   Mixed forced-reject (2 of 4 slots) -- full-accept group's step 0/
-     draft-step graphs coexist with the recompute group's ragged-fallback
-     eager path in the SAME round.
+2.   Mixed forced-reject (2 of 4 slots) -- the SAME verify-graph replay
+     covers both the organically-accepting and forced-reject slots in
+     one call (no more per-outcome branching at all, graph or eager);
+     the draft resync afterward still splits by each slot's own real
+     committed_len.
 3.   Fully ragged forced-reject (every slot rejects at a DIFFERENT
-     position) -- the recompute forward's eager fallback, exercised at
-     its most demanding (no two slots share a committed_len).
-4.   Organic again, immediately after a ragged-recompute round -- confirms
-     the verify graph's static buffers are unaffected by an intervening
-     eager call.
+     position) -- confirms the single verify-graph replay handles a
+     genuinely ragged accept/reject OUTCOME correctly even though the
+     replay's own INPUT shape (qo_len=k+1) never varies.
+4.   Organic again, immediately after a ragged-reject round -- confirms
+     the verify graph's static buffers (especially the new
+     ``static_num_accepted_tokens``, which must correctly reflect the
+     PREVIOUS round's real per-slot outcome) are refilled correctly
+     round to round, not left stale.
 5.   Single-slot forced reject.
-6.   UNIFORM forced-reject, committed_len=2 for all 4 slots -- the
-     recompute-forward graph-REUSE special case (shares the verify-graph
-     cache at (batch_size, qo_len=2) instead of falling back to eager).
-7.   UNIFORM forced-reject, committed_len=1 for all 4 slots -- same reuse
-     path at qo_len=1, which caught a REAL bug during development: the
-     recompute path always builds list-of-lists token_ids, but
-     CapturedBatchDecodeGraph's qo_len==1 branch expects a FLAT list --
-     fixed by flattening before replay (see direct_model_runner.py's
-     mtp_verify_and_commit_batch, "tokens_for_graph" comment).
+6.   UNIFORM forced-reject, committed_len=2 for all 4 slots -- exercises
+     the draft model's OWN step-0 resync graph at qo_len=2
+     (``_get_draft_step_graph(4, 2)``, unrelated to the target-model
+     verify graph, which is unaffected by committed_len since it always
+     replays at qo_len=k+1 regardless).
+7.   UNIFORM forced-reject, committed_len=1 for all 4 slots -- same
+     draft-step-graph coverage at qo_len=1.
 Shrink.  Drop from 4 active slots to 2 (simulating some requests finishing
      early, the real W1-S tail pattern) -- confirms a SECOND (batch_size=2)
      verify graph and draft-step graph get captured/used correctly.
@@ -82,9 +83,9 @@ Shrink.  Drop from 4 active slots to 2 (simulating some requests finishing
 Also confirms, via ``replay_count`` (not just cache-key presence, which
 precapture alone would already satisfy regardless of whether anything
 ever replays that shape):
-- the verify graph is actually replayed at both batch_size=4 and 2;
-- the recompute-forward graph-reuse path is actually replayed at both
-  qo_len=2 and qo_len=1 (rounds 6 and 7 above);
+- the verify graph is actually replayed at both batch_size=4 and 2 --
+  the real pass/fail gate this round restores (was informational-only
+  between the Phase 2 rewrite and this round's reconciliation);
 - the draft-model step-0 graph is actually replayed (the generalization
   that, during development, needed an explicit ``_MAX_DECODE_QO_LEN``
   guard -- mtp_prefill_batch's own step-0 call uses num_new_tokens=
@@ -252,21 +253,23 @@ def _run_once() -> dict:
             anchors[s], drafts[s] = decision["next_anchor"], decision["next_draft_tokens"]
 
     verify_graph_b4 = runner._verify_graphs.get((4, K + 1))
-    # Round 6 forces ALL 4 slots into the recompute group with a UNIFORM
-    # committed_len=2 -- this deterministically drives
-    # _mtp_sync_and_propose_batch's step-0 resync for that group through
-    # _get_draft_step_graph(4, 2) (the qo_len>1 generalization), unlike the
-    # full-accept group's own qo_len=k+1 step-0 shape, which depends on ALL
-    # 4 slots organically fully-accepting in the SAME round simultaneously
-    # (~2% per round given this project's own measured ~72% per-position
-    # acceptance rate) -- too unreliable to gate a deterministic test on.
+    # Round 6 forces ALL 4 slots to reject with a UNIFORM committed_len=2
+    # -- this deterministically drives _mtp_sync_and_propose_batch's
+    # step-0 resync through _get_draft_step_graph(4, 2) (the qo_len>1
+    # generalization), unlike the organic full-accept case's own
+    # qo_len=k+1 step-0 shape, which depends on ALL 4 slots organically
+    # fully-accepting in the SAME round simultaneously (~2% per round
+    # given this project's own measured ~72% per-position acceptance
+    # rate) -- too unreliable to gate a deterministic test on. The
+    # target-model verify graph itself is UNAFFECTED by committed_len
+    # (always replays at qo_len=k+1 regardless -- see module docstring),
+    # so this round exercises only the draft-side graph, not a distinct
+    # verify-side shape.
     draft_step0_qo2_graph = runner._draft_step_graphs.get((4, 2))
-    # (4, 1) is hit by BOTH the K-1 continuation loop (every round, every
-    # group, regardless of step-0's own qo_len) and round 7's step-0
+    # (4, 1) is hit by BOTH the K-1 continuation loop (every round,
+    # regardless of step-0's own qo_len) and round 7's step-0
     # (committed_len=1 uniform) -- guaranteed to be exercised every round.
     draft_cont_graph_b4 = runner._draft_step_graphs.get((4, 1))
-    recompute_reuse_qo2 = runner._verify_graphs.get((4, 2))
-    recompute_reuse_qo1 = runner._verify_graphs.get((4, 1))
 
     # --- Shrinking-batch check: drop to 2 active slots (simulating slots
     # 2/3 finishing early), continue for a few more rounds -- exercises a
@@ -305,34 +308,29 @@ def _run_once() -> dict:
     # (replay_count > 0), i.e. the real round loop actually took this code
     # path at least once, not silently falling back to eager throughout.
     #
-    # 2026-07-18, Phase 2: the four verify-side entries are now demoted to
-    # informational (``known_moot_post_phase2``) -- see module docstring
-    # for why ``mtp_verify_and_commit_batch`` no longer replays a verify
-    # graph at all, regardless of ``enable_cudagraph``. The draft-step
-    # entries are UNCHANGED, still real pass/fail gates (draft-model
-    # graphs are unaffected by Phase 2's GDN-mechanism rewrite).
+    # 2026-07-18, Phase 2 CUDA-graph reconciliation: the two verify-side
+    # entries are REAL pass/fail gates again (they were informational-only
+    # between the Phase 2 GDN-mechanism rewrite and this round's
+    # reconciliation of CapturedBatchDecodeGraph with the new spec-decode
+    # metadata -- see module docstring). The old "recompute-reuse"
+    # entries are REMOVED entirely, not just demoted: Phase 2 eliminated
+    # the separate recompute forward completely, so there is no longer
+    # any (batch_size, qo_len<k+1) verify-graph shape for anything to
+    # reuse, with or without graphs -- _precapture_verify_graphs no
+    # longer even builds those shapes (confirmed by their absence from
+    # verify_graph_cache_keys below).
     coverage = {
         "verify_graph_batch4_replayed": bool(verify_graph_b4 and verify_graph_b4.replay_count > 0),
         "verify_graph_batch2_replayed": bool(verify_graph_b2 and verify_graph_b2.replay_count > 0),
-        "recompute_reuse_qo2_replayed": bool(recompute_reuse_qo2 and recompute_reuse_qo2.replay_count > 0),
-        "recompute_reuse_qo1_replayed": bool(recompute_reuse_qo1 and recompute_reuse_qo1.replay_count > 0),
         "draft_step0_qo2_graph_replayed": bool(draft_step0_qo2_graph and draft_step0_qo2_graph.replay_count > 0),
         "draft_continuation_graph_replayed": bool(draft_cont_graph_b4 and draft_cont_graph_b4.replay_count > 0),
     }
-    known_moot_post_phase2 = (
-        "verify_graph_batch4_replayed",
-        "verify_graph_batch2_replayed",
-        "recompute_reuse_qo2_replayed",
-        "recompute_reuse_qo1_replayed",
-    )
-    draft_step_coverage_ok = all(coverage[k] for k in coverage if k not in known_moot_post_phase2)
 
-    passed = bool(all(per_slot_ok.values()) and draft_step_coverage_ok)
+    passed = bool(all(per_slot_ok.values()) and all(coverage.values()))
     return {
         "passed": passed,
         "per_slot_ok": per_slot_ok,
         "coverage": coverage,
-        "known_moot_post_phase2": list(known_moot_post_phase2),
         "verify_graph_cache_keys": sorted(str(k) for k in runner._verify_graphs.keys()),
         "draft_step_graph_cache_keys": sorted(str(k) for k in runner._draft_step_graphs.keys()),
         "per_slot_rounds": per_slot_rounds,
