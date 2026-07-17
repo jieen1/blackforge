@@ -2955,3 +2955,129 @@ gap is itself the more pressing next question -- investigating that
 vLLM's actual `AutoRegressiveSpeculator` numerics against this runtime's
 own) is a better next step than moving to a more expensive workload
 before understanding a gap already visible at the cheaper one.
+
+## 2026-07-17, expanded-sample follow-up: the ~3.1pp gap was NOT resolved by more samples -- a THIRD, much larger confound was found (generation-depth/repetition inflation), and the shape-controlled comparison shows a real ~12pp gap with an important caveat about trajectory-level sample size
+
+Per the coordinator's explicit ask ("排除纯噪声这个最便宜的解释,把双方的draft次数都做到2000+"), expanded both sides' sample size. The noise hypothesis was NOT confirmed as the explanation -- but the actual finding is more interesting and more important than either "it's noise" or "it's a stable 3.1pp mechanism gap."
+
+### Expanded samples, same shapes as before
+
+- **Native** (unchanged shape: many independent 256-output-token requests,
+  now 40 instead of 16): **76.81%** acceptance rate, 3108 drafts (up from
+  70.38% at 1318 drafts).
+- **This runtime** (unchanged shape: 4 persistent slots, extended from
+  256 to 2000 committed tokens/slot): **82.31%** acceptance rate, 2307
+  drafts (up from 67.25% at 341 drafts).
+
+Both numbers moved UP substantially with more samples, and the
+DIRECTION of the gap flipped (native was higher at the smaller sample;
+this runtime is higher at the larger one). A stable ~3.1pp gap would
+not behave this way -- this was the first concrete sign the true
+picture was more complicated than "real mechanism gap of a few points,"
+not less.
+
+### The real culprit found by looking at this runtime's OWN data: generation-depth/repetition inflation
+
+Because both of this runtime's W1 runs used the SAME seed and the SAME
+4096-token input, their token trajectories are identical up to
+whichever one stopped first (a deterministic greedy decode) -- the
+341-draft run is a strict PREFIX of the 2307-draft run. This makes an
+exact decomposition possible: first 341 drafts -> 67.25% (matches the
+earlier isolated measurement exactly); the REMAINING ~1966 drafts
+(deeper into the same 4 slots' generations) -> **~84.9%**
+(computed: `(5697-688)/(6921-1023)`). A real, quantified, ~18-point
+jump in acceptance rate purely as a function of HOW FAR INTO A LONG,
+UNCONSTRAINED GREEDY GENERATION the measurement is taken -- not noise,
+not a mechanism property, a property of the WORKLOAD SHAPE. The
+likely mechanism: long, temperature-0 (greedy) generation on
+initially-random-token input has nothing to anchor it to real language
+structure, and greedy decoding without any repetition penalty is known
+to degenerate into repetitive/template-like patterns the longer it
+runs -- both the target and (well-functioning) draft model then find
+their own increasingly-repetitive continuation trivially easy to
+predict, driving acceptance rate up mechanically, independent of
+whether the MTP implementation is "good."
+
+**Decisive confirming experiment**: re-ran native with its OWN request
+SHAPE matched to this runtime's test exactly (4 requests, 2000 output
+tokens each, concurrency=4 -- instead of the previous many-short-
+requests shape) via the same isolated-test-server infra. Result:
+**94.46%** acceptance rate (2087 drafts) -- an 18-24 point jump from
+native's own short-request measurements (70.38%/76.81%), at the SAME
+temperature=0/greedy setting and the SAME input distribution. This
+confirms the depth/repetition effect is not specific to this runtime's
+implementation -- it is a property of the (random-token, long,
+unconstrained-greedy) WORKLOAD itself, and it dominates the aggregate
+statistic far more than the temperature or token-distribution confounds
+found earlier in this same investigation.
+
+### The most shape-controlled comparison achieved this round
+
+Same request shape (4 requests, 4096in/2000out, concurrency=4), same
+temperature (0/greedy), same input distribution (vLLM's own
+`RandomDataset` formula), same K=3:
+
+| | Acceptance rate | Mean acceptance length | Drafts |
+|---|---|---|---|
+| Native vLLM (FlashInfer) | **94.46%** | 3.83 | 2087 |
+| This runtime | **82.31%** | 3.47 | 2307 |
+| **Gap** | **12.15pp** | 0.36 | -- |
+
+This is now the LARGEST gap measured across every attempt this round
+(larger than the original unmatched ~20pp resolved down to, and larger
+than the previously-reported 3.1pp) -- but it is also the MOST FAIRLY
+CONTROLLED comparison so far, with three confounds (sampling
+temperature, input token distribution, request/generation shape)
+identified and removed one at a time, each time by reading the relevant
+source directly (vLLM's CLI warning, `RandomDataset`'s actual formula,
+and this runtime's own prefix-decomposition of its two runs) rather
+than assumed.
+
+**An important caveat on this specific 12.15pp number, stated plainly,
+not glossed over**: both sides here are only **4 independent generation
+trajectories** (request count), despite each accumulating 2000+
+draft-level observations. Within ONE long trajectory, consecutive
+rounds' accept/reject outcomes are almost certainly NOT independent --
+once a sequence drifts into a repetitive pattern (per the mechanism
+above), many consecutive rounds will show correlated high acceptance
+together, not independent coin flips. This means the EFFECTIVE sample
+size for estimating "is there a stable difference between the two
+implementations" is closer to 4 (trajectories) than 2000+ (drafts) --
+a single trajectory's particular repetition-onset timing (itself
+plausibly sensitive to the exact random-token seed) could shift the
+aggregate a great deal. The draft-level sample size is large enough to
+make the PER-TRAJECTORY estimate precise; it does not make the
+CROSS-TRAJECTORY comparison equally precise.
+
+### Status and honest recommendation for the next round
+
+The "is 3.1pp just noise" question has been answered directly: **no**,
+but not in the direction of "confirmed as a stable, real gap" either --
+the true picture was dominated by a confound bigger than either
+candidate explanation floated before this round (sampling noise,
+mechanism difference). With that confound now identified and
+controlled for, a real ~12pp gap is visible, but this round's own
+methodology (4 trajectories) cannot yet distinguish "real mechanism
+difference" from "these 4 particular random seeds happened to drift
+into repetitive patterns at different points/rates." Two concrete
+options for whoever picks this up next, not chosen between this round:
+
+1. **More independent trajectories at the SAME (matched) shape**
+   (e.g. 8-16 requests instead of 4, still concurrency=4, still
+   4096in/2000out) -- directly increases the trajectory-level sample
+   size, the actual bottleneck identified above, without introducing
+   any new confound.
+2. **A workload design less prone to the repetition-inflation artifact
+   in the first place** -- e.g. capping measured output length to
+   something closer to a typical real completion (a few hundred
+   tokens, before repetitive degeneration usually sets in for
+   temperature-0 random-token continuations), or using real coherent
+   text input instead of random tokens (at the cost of no longer
+   matching native's own `--dataset-name random` convention exactly,
+   trading one form of comparability for another). Either would need
+   re-deciding what "W1" should mean for an apples-to-apples MTP
+   acceptance-rate gate, since the CLAUDE.md-documented workload
+   definition (4096in/1024out) is itself long enough to plausibly hit
+   this same repetition regime -- worth flagging to the coordinator as
+   a possible revision to the W1/W2 definition's own output-length
+   choice, not just this test's methodology.

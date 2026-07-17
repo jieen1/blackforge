@@ -656,6 +656,67 @@ boundary," and recommended a strictly time-boxed trace-driven
 performance probe (no real drafter) before committing to the full
 faithful integration — adopted, see next section.
 
+### Phase 3, step 7 expanded-sample follow-up (2026-07-17) — noise hypothesis rejected, but a THIRD, much bigger confound found (generation-depth/repetition inflation); shape-controlled comparison shows a real ~12pp gap with an important sample-size caveat
+
+Full detail in `notes/direct-model-runner-design.md`. Per the explicit
+ask to rule out pure sampling noise, expanded both sides toward 2000+
+drafts. **Result: the noise hypothesis is NOT confirmed, but not in the
+direction of "3.1pp is real and stable" either** — both numbers moved
+up substantially and the gap direction flipped (native 70.38%→76.81%;
+this runtime 67.25%→82.31%, now HIGHER than native's same-shape
+number), which a stable few-point gap would not do.
+
+**Root cause found in this runtime's own data**: since both of this
+runtime's runs share the same seed/input, the smaller run is an exact
+prefix of the larger one, allowing a clean decomposition — first 341
+drafts: 67.25% (matches the earlier isolated measurement exactly);
+remaining ~1966 drafts (deeper into the same 4 slots' generations):
+**~84.9%**. A real, quantified ~18-point jump purely as a function of
+how far into a long, unconstrained temperature-0 generation the
+measurement is taken — greedy decoding on initially-random-token input
+with no repetition penalty degenerates into repetitive/template
+patterns the longer it runs, and both target and draft models then
+find their own repetitive continuation trivially predictable,
+mechanically inflating acceptance rate regardless of implementation
+quality.
+
+**Decisively confirmed independent of this runtime**: re-ran native
+with its request SHAPE matched exactly to this runtime's test (4
+requests × 2000 output tokens instead of many short 256-token ones).
+Result: **94.46%** acceptance rate (2087 drafts) — an 18-24 point jump
+from native's own short-request numbers, at the same temperature/
+distribution settings. Confirms the effect is a property of the
+(random-token, long, unconstrained-greedy) workload, not specific to
+either implementation.
+
+**Most shape-controlled comparison achieved this round** (same 4
+requests, 4096in/2000out, c=4, temp=0, same input distribution): native
+**94.46%** (2087 drafts) vs. this runtime **82.31%** (2307 drafts) — a
+**12.15 percentage point gap**, the largest measured this round, but
+also the most fairly controlled (three confounds — sampling
+temperature, input distribution, request/generation shape — identified
+and removed one at a time by reading the relevant source directly each
+time, not assumed).
+
+**Important caveat stated plainly**: both sides are only 4 independent
+generation trajectories despite 2000+ draft-level observations each —
+within one long trajectory, consecutive rounds are almost certainly
+correlated (repetitive patterns cause runs of correlated high
+acceptance), so the EFFECTIVE sample size for comparing the two
+implementations is closer to 4 than 2000+. This round's methodology
+cannot yet distinguish "real mechanism difference" from "these 4
+particular seeds drifted into repetition at different rates."
+
+**Recommended next steps, not chosen between this round**: (1) more
+independent trajectories at the same matched shape (e.g. 8-16 requests)
+to directly grow the actual bottleneck (trajectory count), or (2) a
+workload design less prone to the repetition-inflation artifact (capped
+output length before typical degeneration onset, or real coherent text
+input) — also worth flagging to the coordinator: this may mean the
+project's own W1/W2 definitions (4096in/1024out, 32768in/1024out) are
+themselves long enough to hit this same regime, worth reconsidering as
+a workload-design question, not just a test-methodology one.
+
 ### Phase 3, step 7: real W1 acceptance-rate comparison vs native vLLM (2026-07-17) — two real methodology confounds found and fixed, real ~3.1pp gap remains, does not yet clear the ≤1pp gate
 
 Full detail in `notes/direct-model-runner-design.md`. Built `benchmarks/
