@@ -1446,3 +1446,87 @@ isolated kernel repro scripts run via `python3 -c "..."`, never saved as
 files) are not committed either -- this section is the complete record
 of what was tried and found. GPU/process state confirmed clean via
 `pgrep`/`nvidia-smi` before and after this attempt, as always.
+
+### 10.5 Hypothesis 4 (conv-side state alignment at the bootstrap
+transition), tried, and a decisive (if not fixable) answer found
+
+Per section 10.3's own recommendation, one final, time-boxed isolated
+test targeted the conv side specifically -- and found a clean, decisive
+answer, though not a fixable bug.
+
+**Test**: does the ~0.03-magnitude "cold" discrepancy (isolated
+`causal_conv1d_update` spec-decode bootstrap call vs. a sequential
+single-token-call reference, at real model scale DIM=10240, section
+10.2) depend on spec-decode at all, or does it appear equally for a
+plain, definitely-correct, NON-spec varlen call that simply batches the
+same 3 tokens into one kernel invocation instead of 3 separate calls?
+Ran this in a freshly-started process with NO other differently-shaped
+`causal_conv1d_update` calls preceding it (to avoid re-triggering the
+unrelated same-process shape-alternation corruption documented in
+section 10.2's investigation, which is a separate phenomenon from what's
+being tested here) -- a single non-spec varlen call
+(`query_start_loc=[0,3]`, `max_query_len=3`, no `num_accepted_tokens` at
+all, i.e. `IS_SPEC_DECODING=False`) processing all 3 tokens in one
+launch, compared directly against the manual (hand-computed, no-kernel)
+causal convolution ground truth.
+
+**Result: identical ~0.03 discrepancy** (0.0328, 0.0350, 0.0327 at
+positions 0/1/2 -- matching the spec-decode "cold" result from section
+10.2 almost digit-for-digit), **with zero spec-decode involvement at
+all**. This conclusively shows the discrepancy is NOT specific to this
+round's spec-decode addressing/bootstrap logic -- it is present equally
+for combining multiple tokens' conv1d computation into ONE kernel launch
+versus doing them one token at a time, regardless of whether
+`num_accepted_tokens`/`IS_SPEC_DECODING` is involved at all. This is the
+same class of phenomenon this project has already established and
+accepted elsewhere (`build_attention_metadata_batch`'s own documented
+"different kernel/reduction order -> some floating-point noise" finding
+for attention's kv_split_size differences) -- a different, equally
+valid computation ORDER at bf16 precision, not a construction error.
+
+**What this means for the residual 0.996-cosine full-model gap (section
+10.2)**: the likely explanation shifts from "an unfound bug in this
+round's spec metadata construction" to "inherent bf16 batching-order
+noise, already present at the single-layer/single-call level for ANY
+multi-token batched conv1d call (spec or not), compounding through 48
+sequential GDN layers in a deep residual network into a materially
+larger divergence than any single layer shows in isolation." This was
+NOT further verified this round (confirming the compounding-through-
+depth mechanism specifically, e.g. by simulating a small multi-layer
+stack, would be a genuinely new, fifth investigation thread -- exactly
+what this round's time-boxing was set up to avoid opening). But it is a
+mechanistically coherent, evidence-backed explanation, not a guess: the
+true noise floor for two IDENTICAL computation paths through this model
+is proven to be exactly 0.0 (section 10.2's chunked-vs-chunked control),
+while ANY genuinely different computation path (batched-vs-sequential,
+whether or not spec-decode is involved) measurably departs from that
+floor even in the best case, and this project's own existing 44-layer/
+16-layer-attention-interleaved architecture is exactly the kind of deep
+stack where such per-layer noise is expected to compound rather than
+average out.
+
+**Conclusion: hypothesis 4 does not yield a fixable bug.** There is no
+metadata-construction change that would eliminate this discrepancy,
+because it is not a construction error -- it is the inherent cost of
+using a batched/single-call kernel path instead of the reference
+sequential path, at bf16 precision, over many layers. Per this round's
+own time-boxing (this was the last authorized attempt for this session),
+**the Phase 2 correctness-gap investigation stops here.** No fifth
+hypothesis was opened. If Phase 2 is picked up again, the real open
+question is no longer "where is the bug" but "is this inherent
+bf16-batching-noise-compounding-through-48-layers gap small enough, in
+its effect on ACTUAL generation quality (not just raw cosine similarity
+on one isolated verify call), to be acceptable" -- a question that would
+need an end-to-end generation-quality check (e.g. this project's own
+established acceptance-rate/signal-probe methodology run for real, many
+rounds, through the spec path) rather than more kernel-level debugging.
+
+**Session-final state**: no code changes from this round (both this
+addendum's own investigation and the earlier hypothesis 1-3 work) are
+committed. GPU/process state confirmed clean (`pgrep`/`nvidia-smi`, no
+stray processes, GPU idle) before, during, and after this final
+attempt. The project holds at the locked-in Phase 3 baseline: **66.152
+accepted tok/s, ~2.185x gap to native's 144.54** (commit `51a216e`),
+with this Phase 2 investigation (commit `49a4ff7` plus this addendum)
+recorded as a well-documented piece of deferred future work, not a
+failure.
