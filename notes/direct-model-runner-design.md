@@ -2756,3 +2756,86 @@ round. Capacity expansion (item 3) is NOT done -- confirmed necessary,
 not yet started. Step 7 (W1/W2) remains blocked on item 3, as it was
 before this correction, now for a documented reason rather than an
 unexamined one.
+
+## 2026-07-17, capacity expansion to real W1/W2 scale: empirically measured (not hand-derived), expanded, and the full MTP correctness suite re-verified with zero regressions
+
+### Empirical memory measurement, not a theoretical estimate
+
+Built `benchmarks/capacity_w1w2_check.py` to measure real GPU memory via
+`nvidia-smi` at each stage, rather than trust a hand derivation for a
+question this consequential. Findings:
+
+- **Persistent KV cache scales trivially with context length**: the
+  attention KV cache (17 layers total needing per-position storage --
+  target's 16 full-attention layers + the draft's own 1 -- GDN's
+  conv/ssm state is FIXED SIZE regardless of context length, confirmed
+  by reading `qwen_gdn_linear_attn.py`'s `get_state_shape()`, which
+  depends only on model config, never sequence length) costs ~2048
+  bytes/token/layer at FP8 (confirmed via `SM120GQABackend
+  .get_kv_cache_shape()`'s `(num_blocks, 2, block_size, num_kv_heads,
+  head_size)` shape), i.e. ~34KB/token across all 17 layers -- even at
+  full W2 scale (33792 tokens), that's only ~1.2GB per slot. This was
+  never going to be the constraint.
+- **The real open question was peak transient ACTIVATION memory during
+  a single, non-chunked 32768-token prefill forward pass** (this
+  runtime's `_forward`/`_forward_batch` process the whole prompt in ONE
+  call -- no chunked-prefill mechanism like real vLLM's scheduler has).
+  Measured directly: **~22GB of transient memory for one W2-sized
+  prefill** on top of ~39GB of persistent weights+KV/GDN cache (8 slots
+  configured, target+draft model loaded) -- a real, substantial number,
+  not negligible. (Likely dominated by `compute_logits()` being called
+  on the FULL hidden-states tensor -- `[32768, vocab=248320]` in BF16 is
+  ~16GB by itself -- even though `prefill()`'s own contract only ever
+  needs the LAST position's logits; `mtp_prefill`'s draft-sync step does
+  need the full hidden_states, but not the full logits. Not fixed this
+  round -- a real, identified further optimization for whenever
+  performance work on the prefill path resumes, not a correctness issue,
+  and not needed since the current memory budget already accommodates
+  it without this optimization.)
+- **The decisive question**: does memory GROW per additional slot's
+  prefill (would mean concurrency=4 doesn't actually fit even though one
+  slot does), or does it PLATEAU (PyTorch's caching allocator reuses
+  freed activation memory across sequential prefill calls, since this
+  runtime never batches multiple slots' prefills into one call -- each
+  slot's prefill is its own independent forward call)? Measured directly
+  across 4 sequential W2-sized prefills on slots 0,1,2,3: memory reads
+  **63353 / 63353 / 63353 / 63353 MiB -- perfectly flat, zero growth**,
+  out of 97887 MiB total (~65% utilized, ~36GB headroom). Confirms
+  sequential (not batched) prefill across up to 4 (this project's own
+  8-slot test config, covering both the 4 production slots and the
+  4-slot-isolation test's reference slots) concurrent slots fits
+  comfortably, with real evidence, not an assumption.
+
+**Conclusion**: block_size=16 (unchanged) with `blocks_per_slot=2560`
+(40960 tokens/slot, ~21% margin over W2's 33792-token need) works for
+BOTH W1 and W2 with the SAME configuration -- no need for the
+coordinator's contingency of splitting into separate W1/W2 capacity
+configs or reducing concurrency; memory was never the real constraint
+once measured directly, and the sequential-prefill-per-slot design this
+runtime already has (never batches prefills across slots) is exactly
+why the transient activation cost doesn't compound across concurrent
+slots.
+
+### Full MTP correctness suite re-verified at the new capacity, zero regressions
+
+Per the coordinator's explicit instruction not to assume "bigger
+capacity, same logic" is automatically safe -- `blocks_per_slot` feeds
+directly into `_physical_slot`/`_slot_mapping`/`build_attention_metadata`/
+`build_attention_metadata_batch`'s address arithmetic, all worth
+re-checking at a value 20x larger than before. Updated all 5 MTP test
+scripts' `blocks_per_slot` from 128 to 2560 and re-ran every one:
+`mtp_prior_kv_len_fix_check.py` (K>1 propose fix -- invariant checks and
+both numerical demonstrations reproduce identically), `mtp_accept_reject_check.py`,
+`mtp_gdn_rollback_check.py`, `mtp_real_draft_check.py` (steps 1-4),
+`mtp_multiround_check.py` (steps 5-6, including the same 7/8-exact-match
+near-tie finding reproducing identically). **All pass, byte-for-byte
+identical results to the smaller-capacity runs** -- confirming the
+address-calculation logic generalizes correctly to the much larger
+`blocks_per_slot` value with no hidden assumptions tied to the old small
+size.
+
+### Status
+
+Capacity (coordinator's item 3) is now done and re-verified -- the last
+blocker before step 7. Moving to the real W1/W2 acceptance-rate
+comparison against native vLLM next.

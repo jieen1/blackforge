@@ -656,6 +656,43 @@ boundary," and recommended a strictly time-boxed trace-driven
 performance probe (no real drafter) before committing to the full
 faithful integration — adopted, see next section.
 
+### Phase 3, capacity expansion to real W1/W2 scale (2026-07-17) — empirically measured, expanded, full MTP suite re-verified with zero regressions
+
+Full detail in `notes/direct-model-runner-design.md`. Built `benchmarks/
+capacity_w1w2_check.py` to measure real GPU memory via `nvidia-smi`
+rather than trust a hand derivation. Findings: persistent KV cache
+scales trivially with context (~34KB/token across all 17
+position-dependent attention layers; GDN state is fixed-size regardless
+of context length) — never the real constraint. The real open question
+was peak transient ACTIVATION memory during one non-chunked 32768-token
+prefill: measured at **~22GB** on top of ~39GB persistent (weights + 8
+slots' KV/GDN cache). Decisive check: does memory GROW per additional
+slot's sequential prefill (would mean concurrency=4 doesn't actually
+fit) or PLATEAU (this runtime never batches prefills across slots, so
+each one's transient memory should be freed before the next starts)?
+Measured across 4 sequential W2-sized prefills: **63353 MiB flat across
+all 4, zero growth**, out of 97887 MiB total (~36GB headroom). **Conclusion**:
+`block_size=16` (unchanged) + `blocks_per_slot=2560` (40960 tokens/slot,
+~21% margin over W2's 33792 need) works for BOTH W1 and W2 with the
+SAME config — no need to split configs or reduce concurrency, contrary
+to the coordinator's stated contingency; memory was never the real
+constraint once measured directly.
+
+**Full MTP correctness suite re-verified at the new capacity** (per the
+coordinator's explicit instruction not to assume bigger capacity is
+automatically safe — `blocks_per_slot` feeds directly into this
+runtime's address arithmetic): updated all 5 MTP test scripts'
+`blocks_per_slot` from 128 to 2560 and re-ran every one —
+`mtp_prior_kv_len_fix_check.py`, `mtp_accept_reject_check.py`,
+`mtp_gdn_rollback_check.py`, `mtp_real_draft_check.py`,
+`mtp_multiround_check.py`. **All pass, byte-for-byte identical results
+to the smaller-capacity runs** (same near-tie finding reproduces
+identically), confirming the address logic generalizes correctly at
+20x the previous `blocks_per_slot` value.
+
+Capacity (the coordinator's item 3) is now done. Moving to the real
+W1/W2 acceptance-rate comparison against native vLLM next.
+
 ### Phase 3, MAJOR CORRECTION (2026-07-17) — real structural bug in the propose loop, caught by independent Codex-sol review AFTER steps 1-6 were reported passing; fixed, re-verified, other findings triaged
 
 **This corrects work reported as verified above (the "steps 5-6" and
