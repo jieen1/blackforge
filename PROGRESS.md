@@ -1767,6 +1767,35 @@ fully released on process exit, but is unexplained and worth a dedicated
 look before any long-running use of this configuration (plan doc section
 9.7).
 
+### Phase 2 implementation attempt (2026-07-18) — real progress on SSM addressing, a genuine unresolved residual bug on the conv side, not landed, nothing committed
+
+Attempted the real Phase 2 implementation (native spec-decode GDN path)
+with this project's full standing rigor throughout. The K+1-row SSM
+state addressing scheme was derived from reading the actual kernels
+(`fused_sigmoid_gating_delta_rule_update_kernel`, `causal_conv1d_update`)
+and verified correct in isolation (matches a zero-noise-controlled
+reference to bf16 precision). Found and corrected two real methodology
+issues along the way, one via the coordinator's own independent
+re-verification (a non-representative isolated-test buffer construction,
+and a draft-fabrication test helper that didn't reflect real MTP flow --
+also surfaced a genuinely interesting, independently-useful finding:
+`gdn_attn.py`'s real builder reclassifies non-spec decodes as prefills
+whenever spec-decodes coexist, meaning `causal_conv1d_update`'s non-spec
+branch is likely near-dead-code once MTP is active in production). After
+fixing both, a real, unexplained residual gap remains: a clean single
+verify call at full model scale (48 GDN layers) gives hidden-state cosine
+similarity ~0.996 against the already-verified chunked path, while the
+correct control (two independent chunked calls) gives exact 0.0 -- so
+this is real, not noise. Checked and ruled out GQA head-count/`dt_bias`/
+`A_log` indexing as the cause (time-boxed, one focused attempt per the
+coordinator's own instruction). Likely lives on the conv side
+specifically (isolated conv1d test shows ~0.03 diff vs SSM's ~0.001-0.004
+at the same scale) -- not further investigated this round. **Nothing
+committed**: `runtime/direct_model_runner.py` was reverted to `51a216e`
+exactly, no broken/incomplete code left in the working tree. Full
+writeup, including the precise next-step recommendation for whoever
+picks this up, in the plan doc's new section 10.
+
 ### Phase 0 — Baseline contract
 
 - Frozen W1 (4K input / 1K output) and W2 (32K / 1K) workloads for

@@ -1226,3 +1226,223 @@ acceptance-aware GDN state commit) is scoped, precise, and real, but is a
 3-5 day architecturally-different-class change the coordinator explicitly
 chose not to start this round. Whether to invest that time is a decision
 for whoever picks this line up next.
+
+---
+
+## 10. Phase 2 implementation attempt (2026-07-18) -- real progress, a genuine residual bug found, not landed this round
+
+Attempted the actual implementation of Phase 2 (native spec-decode GDN
+path) per section 9.2 item 13's own scoping, using this project's
+standing full-rigor discipline throughout (not fast-iteration mode --
+this was explicitly the "do it properly" instruction given the
+silent-corruption failure mode). Real progress was made: the hardest
+architectural piece (the K+1-row SSM state addressing scheme) is derived
+from the real kernels and verified correct in isolation. But a genuine,
+smaller correctness gap was found in the full-model integration that was
+NOT root-caused despite extensive, disciplined debugging, and this round
+stops here rather than force something unverified into production. No
+code from this attempt is committed -- the working tree was reverted to
+the last real commit (`51a216e`) after writing this section, so the
+state is exactly as it was before this attempt started plus this
+documentation.
+
+### 10.1 What was built and verified correct
+
+1. **SSM/recurrent state allocation**: `allocate_fixed_slot_kv_caches`
+   was extended to give the SSM state tensor `total_physical_slots *
+   (1 + num_spec)` rows instead of `total_physical_slots` -- K+1
+   dedicated physical rows per logical slot (K = num_speculative_tokens).
+   Purely additive/backward-compatible: `num_spec` is derived from
+   `vllm_config.speculative_config` (0 when absent, matching every
+   non-MTP test exactly as before). Conv state's row count is
+   UNCHANGED -- its per-row size already grows automatically via
+   `layer.get_state_shape()` (which is passed `self.num_spec` at
+   MODEL-CONSTRUCTION time, from the same speculative_config), confirmed
+   directly (`conv_shape=(6, 10240)` for K=3, width=4, i.e.
+   `width-1+num_spec` in the state_len dimension) -- this was verified
+   BEFORE relying on it, not assumed. Re-ran `mtp_gdn_rollback_check.py`
+   and `mtp_batch_verify_check.py` immediately after this change (per
+   the "verify as soon as something plausibly works, don't wait" rule)
+   -- both still passed unchanged, confirming the allocation change is
+   safe.
+2. **`_ssm_spec_row(logical_slot, col, total_physical_slots, num_spec)`**:
+   the addressing scheme, derived from reading the actual kernels (not
+   the metadata dataclass's own comments, which turned out to be
+   imprecise) --
+   `fla/ops/fused_sigmoid_gating.py`'s `fused_sigmoid_gating_delta_rule_update_kernel`
+   and `mamba/ops/causal_conv1d.py`'s `causal_conv1d_update`. Key
+   derivation: `causal_conv1d_update`'s spec branch hardcodes
+   `conv_state_indices=spec_state_indices_tensor[:, 0]` (real vLLM model
+   code, not something this project's metadata controls) -- since
+   conv_state's row count is unchanged, column 0's VALUE must be a valid
+   conv-state row, forcing column 0 == `_physical_slot(slot)` (the SAME
+   row this slot's plain/prefill addressing already uses -- this also
+   matches real vLLM's own convention,
+   `non_spec_state_indices_tensor = block_table_tensor[:, 0]` in
+   `gdn_attn.py:219`, where column 0 is shared between spec and non-spec
+   addressing too). Columns 1..num_spec have no such constraint and
+   address NEW rows appended after the original `total_physical_slots`.
+   **Verified correct via a from-scratch isolated unit test of
+   `fused_sigmoid_gating_delta_rule_update` directly** (hand-built tiny
+   q/k/v tensors, no model involved): a single spec-decode call
+   processing 3 tokens with `num_accepted_tokens=1` (bootstrap) matches
+   a reference of 3 sequential real single-token decode calls to within
+   ~0.001-0.004 (bf16-precision-level noise, confirmed against a TRUE
+   zero-noise control -- two identical sequential-decode runs gave EXACT
+   0.0). This is the correct, working mechanism -- the "commit is
+   acceptance-aware, no rollback needed" idea is real and does work as
+   the plan intended.
+3. **`build_gdn_metadata_spec_batch`**: real spec-decode
+   `GDNAttentionMetadata` construction, simplified for this project's
+   narrower scope (MTP verify is ALWAYS pure-spec, never mixed with
+   prefill/plain-decode in the same call, unlike real vLLM's general
+   builder) -- confirmed by reading `qwen_gdn_linear_attn.py`'s
+   `_forward_core` directly that `spec_token_indx`/`non_spec_token_indx`
+   are never read in this scope (the `num_prefills==0 and
+   num_decodes==0` branch uses the whole batch as the spec batch
+   directly, no gather/merge needed).
+4. **`verify_batch_spec_gdn`**: an isolated, NOT-wired-in analogue of
+   `verify_batch` that routes through the new spec metadata instead of
+   the chunked path -- built specifically so the new mechanism could be
+   validated against the existing, already-verified chunked path on
+   identical input before touching any real control flow (per this
+   round's explicit "verify early" instruction), never touching
+   `mtp_verify_and_commit_batch` or removing `snapshot_gdn_state`/
+   `restore_gdn_state`/the recompute branch (step 4 of the coordinator's
+   own implementation spec was never reached).
+
+### 10.2 The residual bug: a real, small, still-unexplained gap in full-model integration
+
+A dedicated parity script
+(`benchmarks/phase2_spec_gdn_parity_check.py`, not committed -- see
+10.4) compared the new spec path against the existing chunked path on
+identical input through the REAL 48-layer model. Initial results showed
+large divergence (cosine similarity ~0.83-0.97, logits max diff several
+units) -- investigated extensively, in three phases:
+
+**First hypothesis (wrong methodology, real lesson): buffer construction
+artifacts in the isolated test.** An earlier version of the isolated
+conv1d test used `.transpose(-1,-2).contiguous()` to build the conv
+state tensor -- the coordinator (independently verifying before
+accepting a "vLLM has a bug" claim, this project's own standing
+practice) found that real vLLM's own test
+(`tests/kernels/mamba/test_causal_conv1d.py`'s
+`test_causal_conv1d_update_with_batch_gather`, lines 244-247)
+constructs conv_state via `torch.randn(rows, width-1,
+dim).transpose(1,2)` -- a genuine NON-contiguous transposed view, no
+`.contiguous()` -- matching `is_conv_state_dim_first()==False` (the
+default "SD" layout, confirmed in `mamba_utils.py:27-43`). Redoing the
+isolated test with a true transposed view (matching real layout exactly)
+did NOT by itself fix the severe corruption found at that point --- but
+this was still a real, worth-keeping methodology lesson (buffer
+construction in an isolated kernel test needs to match the real model's
+exact tensor construction, not just its logical shape).
+
+**Second hypothesis (real test-construction bug, found via the
+coordinator's push to re-verify): the isolated test's own
+draft-fabrication helper didn't reflect real MTP flow.** The original
+isolated model-level test used `_establish_draft` (borrowed from
+`cudagraph_mtp_regression.py`'s own helper), which calls the TARGET
+model's own plain qo_len=1 decode path (`_forward_batch`) repeatedly to
+fabricate a draft sequence. This is a real methodology shortcut this
+project's OTHER tests also use, but it does NOT reflect how a real MTP
+round works: real drafts come from the SEPARATE draft model
+(`self.mtp_model`), which registers no GDN layers at all -- the target
+model, in real MTP flow, NEVER does a plain qo_len=1 decode between
+prefill and verify. Using `_establish_draft` meant the isolated test was
+alternating between `causal_conv1d_update`'s non-spec branch (via the
+fabricated-draft calls) and its spec branch (the real verify call) on
+the SAME conv_state buffer -- a call pattern that plausibly never
+happens in real MTP flow. This was compounded by a genuinely interesting
+independent finding while re-reading `gdn_attn.py`'s real builder: **it
+reclassifies non-spec decodes as prefills whenever spec-decodes coexist
+in the same batch** (`if num_decodes > 0 and num_spec_decodes > 0:
+num_prefills += num_decodes; num_decodes = 0`, `gdn_attn.py:247-251`) --
+meaning `causal_conv1d_update`'s non-spec/decode branch (the one at
+`qwen_gdn_linear_attn.py:1378`) may be close to dead code in any real
+production session where MTP is active for a request's entire
+lifetime, since conflicting non-spec decodes get rerouted to the
+chunked/prefill path instead. This is worth keeping as a real,
+independently-useful finding regardless of Phase 2's outcome: it's
+evidence AGAINST a broad "vLLM's spec-decode GDN kernel is fundamentally
+broken" claim, and IN FAVOR of "an artificial call-alternation pattern
+in eager, non-CUDA-graph testing can trigger something real production's
+own calling discipline avoids."
+
+Removing the target-model-plain-decode-based draft fabrication (using a
+fixed, arbitrary draft token sequence instead, with no plain-decode call
+to the target model at all before the spec verify call) did NOT make the
+severe corruption reproduce again in that exact form -- but it also did
+NOT make the two paths match. **This is the honest, real residual
+finding**: a clean, single "cold" verify call (prefill, then ONE chunked
+verify vs ONE spec verify, both on identical input, no alternation, no
+artificial draft fabrication) at full model scale (48 GDN layers) gives
+hidden-state cosine similarity ~0.996 (max diff ~2.4) -- while the
+correct control (two independent chunked-path verify calls, no spec
+involved at all) gives EXACT 0.0 diff, bit-for-bit identical, at the
+same scale. So the true noise floor at 48 layers is zero, and a
+0.996-cosine gap is real, not acceptable kernel-algorithm noise.
+
+**Third hypothesis (checked, ruled out, time-boxed): GQA head-count /
+`dt_bias`/`A_log` indexing.** The real model's GDN layer has
+`num_k_heads=16`, `num_v_heads=48` (a 1:3 expansion ratio, `A_log`/
+`dt_bias` shaped `(48,)`) -- a genuine GQA-style asymmetry my earlier
+toy isolated test (`H=HV=2`) didn't exercise. Checked whether this could
+explain the gap: it doesn't, on inspection -- head decomposition
+(`i_h = i_hv // (HV//H)`) is entirely internal to the kernel, derived
+from q/k/v/A_log tensor shapes the MODEL constructs (unaffected by this
+project's metadata, which only carries per-REQUEST information:
+`cu_seqlens`/`ssm_state_indices`/`num_accepted_tokens`, never per-head).
+Re-ran the isolated SSM kernel test with a proper zero-noise control
+this time: true-control diff is exactly 0.0, and the "spec cold vs
+reference" diff is ~0.001-0.004 (position-wise) and ~0.004 (final
+state) -- genuine bf16-level noise, not a real bug at the SSM/recurrent
+level. The residual gap is therefore NOT explained by GQA heads or
+`dt_bias`/`A_log` indexing -- it most likely lives on the CONV side
+specifically (the isolated conv1d "cold" test showed ~0.03 max diff at
+real DIM=10240 scale, noticeably larger than the SSM side's ~0.001-0.004
+and larger than pure bf16 noise would suggest for a comparable
+computation), compounding across 48 layers into the observed
+0.996-cosine full-model gap. This was not further investigated --
+continuing would mean opening a fourth, different hypothesis
+(conv-specific state alignment/windowing at the bootstrap transition,
+distinct from GQA/heads), which is the explicit signal (per this round's
+own time-boxing instruction) to stop rather than continue.
+
+### 10.3 What the next attempt should try first
+
+If someone picks this line up again, the highest-value next step is
+almost certainly **the conv side specifically**, not the SSM side (which
+is verified working): investigate whether `causal_conv1d_update`'s
+"effective `state_len = width - 1 + (seqlen - 1)`" computation (a
+PER-CALL value depending on `max_query_len`, confirmed by reading the
+wrapper in `causal_conv1d.py:1181-1185`) has some alignment/windowing
+subtlety specific to the bootstrap transition (reading a buffer whose
+first `width-1` positions were written by the CHUNKED kernel's own
+narrower, `state_len=width-1`-only convention, then read via the spec
+kernel's wider, call-dependent `state_len` with `conv_state_token_offset
+= num_accepted_tokens - 1`) that isn't captured by comparing only the
+FINAL output/state values the way this round's tests did. A targeted
+next test: dump/compare the conv1d OUTPUT (not just final state) for
+ALL 4 verify positions against a hand-computed manual causal convolution
+(the same technique this round used successfully to distinguish "real
+bug" from "test artifact" for the isolated kernel tests) but built
+directly into the FULL MODEL test via a hook/monkeypatch on the conv1d
+call, rather than a separate from-scratch isolated kernel test -- this
+round's isolated tests kept being one level removed from the actual
+full-model computation, which is plausibly why a small conv-specific
+discrepancy went uncaught until the full-model comparison.
+
+### 10.4 Housekeeping
+
+No code from this attempt is committed. `runtime/direct_model_runner.py`
+was reverted to its state at commit `51a216e` (discarding the additive-
+but-incomplete `_ssm_spec_row`/`build_gdn_metadata_spec_batch`/
+`verify_batch_spec_gdn`/SSM-allocation-expansion changes described
+above) immediately after this section was written, so nothing broken or
+half-working is left in the working tree. The exploratory test files
+(`benchmarks/phase2_spec_gdn_parity_check.py` and various one-off
+isolated kernel repro scripts run via `python3 -c "..."`, never saved as
+files) are not committed either -- this section is the complete record
+of what was tried and found. GPU/process state confirmed clean via
+`pgrep`/`nvidia-smi` before and after this attempt, as always.
