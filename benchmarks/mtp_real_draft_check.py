@@ -241,7 +241,8 @@ def _run_once() -> dict:
             "kv_len_after": kv_after_commit,
             "kv_len_matches_committed_len": kv_after_commit == kv_before + decision["num_accepted"] + 1,
             "gdn_state_changed_from_prefill": gdn_changed,
-            "last_hidden_shape": list(decision["last_hidden"].shape),
+            "next_anchor": decision["next_anchor"],
+            "next_draft_tokens": decision["next_draft_tokens"],
             "content_correctness_check": content_check,
         }
 

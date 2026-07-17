@@ -656,6 +656,73 @@ boundary," and recommended a strictly time-boxed trace-driven
 performance probe (no real drafter) before committing to the full
 faithful integration — adopted, see next section.
 
+### Phase 3, multi-round + 4-slot isolation (2026-07-17) — verification gradient steps 5-6 done, mtp_decode design-simplified away, one benign near-tie found and root-caused
+
+Full detail in `notes/direct-model-runner-design.md`'s "steps 5-6"
+section. Before writing either test, reasoning through what a real
+multi-round loop needs eliminated the previously-planned, not-yet-built
+`mtp_decode()` coordinator entirely: `mtp_verify_and_commit` already
+computes everything needed (the newly-committed real tokens + the
+target's own hidden states for them) to ALSO resync the draft's KV and
+propose the NEXT round's K tokens in the same call, by generalizing the
+EXISTING `_mtp_sync_and_propose` (previously only called from
+`mtp_prefill` over "the whole prompt") to "this round's newly committed
+range" instead. `mtp_verify_and_commit` now returns `next_anchor`/
+`next_draft_tokens` directly; a multi-round loop is just feeding these
+back in as the next call's `anchor`/`draft_tokens` -- no separate decode
+coordinator, matching real vLLM's own design (propose immediately after
+commit) more closely than the earlier plan.
+
+**Step 5 (multi-round, concurrency=1)**, `benchmarks/mtp_multiround_check.py`:
+8 real rounds on one slot (organic accept/reject from the draft's own
+proposals, plus a forced-decoy reject every 3rd round), with an
+independent reference slot replaying the same real committed tokens
+every round and comparing next-token predictions -- round-by-round, not
+just a final check. Bookkeeping invariant (`slot_draft_sync_len ==
+slot_kv_len`) held 8/8 rounds every run. Content match was 7/8 exact;
+the 1 mismatch was root-caused (not dismissed) by dumping actual logit
+values: two candidate tokens were in a genuine exact tie in one kernel
+path (`25.375` both) vs. a clear lead for one of them in another kernel
+path (`24.25` vs `24.0`), both far above the 3rd-place candidate --
+confirming a real, inherent near-tie in the model's own distribution
+(the same "different kernel dispatch path, small floating-point
+difference" phenomenon already documented in step 4), not state
+corruption. Added a logit-margin-aware tolerance to the test
+(`NEAR_TIE_LOGIT_MARGIN=2.0`, distinct real candidates are typically
+8-13+ units apart here) -- **8/8 rounds pass with this tolerance,
+bit-identical and stable across 2 independent full runs** (same round
+index, same tokens, both times -- deterministic, not noise).
+
+**Step 6 (4-slot concurrent isolation)**, same script: 4 different
+prompts (France/Japan/Germany/Italy capitals, an eyeballable
+signal-probe layer per the coordinator's explicit request for both
+methods), 4 MTP slots + 4 independent reference slots, interleaved
+round-robin (not 4 sequential independent runs) so a cross-slot
+addressing bug would have to manifest under real interleaving. Result:
+no two slots' committed sequences were ever identical (contamination
+sanity check), and all 4 slots pass the numerical-twin check 100%
+cleanly (zero mismatches, even at strict exact-match) across both runs.
+Slot 0 (France, same prompt as step 5) reproduces the IDENTICAL
+near-tie behavior whether run in isolation or interleaved with 3 other
+slots -- itself evidence against cross-slot contamination, which would
+plausibly behave differently depending on interleaving order, not
+reproduce identically both ways.
+
+**Scope note stated honestly**: step 6 interleaves independent
+SINGLE-slot calls across 4 slots, not one batched call spanning all 4 at
+once (would need generalizing the MTP coordinator methods to accept
+slot lists, matching how the target-only `_forward_batch`/`verify_batch`
+already do -- not done this round, a real gap for a genuinely concurrent
+production loop).
+
+**Not attempted this round**: step 7 (real W1/W2 ≤1pp acceptance-rate
+gate against native vLLM -- needs a real vLLM MTP server and comparable
+workload, substantially larger, better scoped as its own round) and
+step 8 (CUDA graph integration, explicitly last in the gradient). Not
+blocked on anything technical -- a scope/pacing call given how much real
+GPU time this round already used (4 full model-load test runs + 2
+targeted diagnostic runs).
+
 ### Phase 3, real MTP draft model + centralized state machine (2026-07-17) — Phase 2 / sol's "Option A", verification gradient steps 1-4 done, real bug found and fixed
 
 Full detail in `notes/direct-model-runner-design.md`'s "Phase 2" section.

@@ -1089,14 +1089,16 @@ class DirectModelRunner:
         return {"anchor": anchor, "draft_tokens": draft_tokens}
 
     def mtp_verify_and_commit(self, slot: int, anchor: int, draft_tokens: list[int]) -> dict:
-        """Unified MTP cycle funnel point for verify+commit: submits
-        ``[anchor] + draft_tokens`` through the real, already-verified
-        ``verify_batch`` (``commit=False`` -- see its docstring), applies
-        greedy ``determine_accept_reject``, and on any non-full-accept
-        outcome repairs GDN state (``restore_gdn_state`` + a real
-        recompute forward for exactly the committed length) and corrects
-        ``slot_kv_len``. The draft model's own KV needs no repair either
-        way -- see ``_mtp_forward``'s docstring.
+        """Unified MTP cycle funnel point for verify+commit+resync+propose
+        -- the ONE method a real multi-round loop calls repeatedly (no
+        separate "decode" coordinator needed; see the design note below on
+        why). Submits ``[anchor] + draft_tokens`` through the real,
+        already-verified ``verify_batch`` (``commit=False`` -- see its
+        docstring), applies greedy ``determine_accept_reject``, and on any
+        non-full-accept outcome repairs GDN state (``restore_gdn_state`` +
+        a real recompute forward for exactly the committed length) and
+        corrects ``slot_kv_len``. The draft model's own KV needs no repair
+        either way -- see ``_mtp_forward``'s docstring.
 
         Recompute input alignment (2026-07-17, fixed after a real bug was
         caught by direct KV-content reasoning, not just shape/bookkeeping
@@ -1110,21 +1112,42 @@ class DirectModelRunner:
         ``decision["committed"]`` is ``[accepted_draft_0, ..., accepted_
         draft_{n-1}, recovery]`` -- the recovery/bonus token is, symmetrically,
         NOT yet written into KV either (it becomes the next round's own
-        anchor-equivalent). So the recompute's real input tokens are
-        ``[anchor] + committed[:-1]`` (anchor followed by the ACCEPTED
-        drafts only, dropping the not-yet-written recovery token) --
-        NOT ``committed`` itself, which would silently write the WRONG
-        token content into the KV cache while still looking correct on
-        every shape/length/bookkeeping check (this is exactly why the
-        verification gradient calls for real numerical/content checks,
-        not just invariant checks).
+        anchor-equivalent). So the real input tokens for positions
+        ``kv_len_before..+committed_len-1`` are ``real_new_tokens =
+        [anchor] + committed[:-1]`` (anchor + accepted drafts, dropping the
+        not-yet-written recovery token) -- NOT ``committed`` itself, which
+        would silently write the WRONG token content into the KV cache
+        while still looking correct on every shape/length/bookkeeping
+        check (exactly why the verification gradient calls for real
+        numerical/content checks, not just invariant checks).
 
-        Returns the accept/reject decision plus ``last_hidden`` (target
-        hidden state at the LAST of these recomputed/verified real
-        positions -- i.e. the last ACCEPTED draft's position, or anchor's
-        own position if num_accepted==0 -- NOT the recovery token's
-        position, which has no hidden state yet until a future step
-        consumes it as input)."""
+        Draft catch-up + next-round propose, folded into ONE call
+        (2026-07-17 multi-round design): after committing, the draft's own
+        KV is behind by exactly ``real_new_tokens`` (it was last synced at
+        the END of the PREVIOUS round -- ``mtp_prefill``/this same method
+        -- so ``slot_draft_sync_len`` always equals ``slot_kv_len`` from
+        BEFORE this round's commit). Syncing the draft over
+        ``real_new_tokens`` (shifted by one, ending in the recovery/bonus
+        token as the final candidate -- exactly ``_mtp_sync_and_propose``'s
+        existing step-0 pattern, just generalized from
+        ``mtp_prefill``'s "whole prompt" range to "this round's newly
+        committed range") both catches the draft's KV up to
+        ``slot_kv_len`` again (restoring the invariant) AND, at that same
+        call's LAST position (processing the recovery/bonus token as a
+        candidate against the target's hidden state up through the last
+        real position), produces the FIRST draft token for the NEXT
+        round -- for free, no extra forward call. ``_mtp_sync_and_propose``
+        then runs the usual K-1 further autoregressive steps on top. This
+        mirrors real vLLM's own design (propose() runs immediately after
+        postprocess_sampled(), not as a separate deferred step) more
+        closely than an earlier draft of this method (which returned an
+        unused ``last_hidden`` and left resync/propose to a separate,
+        never-built ``mtp_decode``).
+
+        Returns the accept/reject decision plus ``next_anchor`` (the
+        recovery/bonus token -- feed this as ``anchor`` to the NEXT
+        ``mtp_verify_and_commit`` call) and ``next_draft_tokens`` (K fresh
+        proposed tokens for that next call)."""
         k = len(draft_tokens)
         draft = [anchor] + draft_tokens
         kv_len_before = self.slot_kv_len[slot]
@@ -1134,29 +1157,37 @@ class DirectModelRunner:
         )
         decision = determine_accept_reject(draft, verify_logits)
         committed_len = decision["num_accepted"] + 1
+        # Real input tokens for positions kv_len_before..+committed_len-1:
+        # anchor followed by the accepted drafts (NOT the recovery token --
+        # see the docstring above). Valid for EITHER branch below.
+        real_new_tokens = [anchor] + decision["committed"][:-1]
 
         if decision["num_accepted"] == k:
             self.slot_kv_len[slot] = kv_len_before + k + 1
-            last_hidden = verify_hidden[-1:]
+            real_new_hidden = verify_hidden
         else:
             self.restore_gdn_state(slot, snapshot)
             self.slot_kv_len[slot] = kv_len_before
-            # Real input tokens for positions kv_len_before..+committed_len-1:
-            # anchor followed by the accepted drafts (NOT the recovery token
-            # -- see the docstring above).
-            recompute_tokens = [anchor] + decision["committed"][:-1]
-            _, recompute_hidden = self._forward_batch(
+            _, real_new_hidden = self._forward_batch(
                 [slot],
-                [recompute_tokens] if committed_len > 1 else recompute_tokens,
+                [real_new_tokens] if committed_len > 1 else real_new_tokens,
                 [kv_len_before],
                 qo_len=committed_len,
                 commit=True,
                 return_hidden=True,
             )
-            last_hidden = recompute_hidden[-1:]
 
-        self.slot_pending_draft_tokens[slot] = None
-        return {**decision, "last_hidden": last_hidden}
+        next_anchor = decision["committed"][-1]
+        next_draft_tokens = self._mtp_sync_and_propose(
+            slot,
+            real_new_tokens[1:] + [next_anchor],
+            real_new_hidden,
+            start_pos=self.slot_draft_sync_len[slot],
+            num_new_tokens=committed_len,
+            k=k,
+        )
+        self.slot_pending_draft_tokens[slot] = next_draft_tokens
+        return {**decision, "next_anchor": next_anchor, "next_draft_tokens": next_draft_tokens}
 
 
 class CapturedBatchDecodeGraph:
