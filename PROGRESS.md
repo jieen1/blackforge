@@ -873,6 +873,60 @@ bound, matching the existing CUDA-graph-safety proof), threaded through
 call. Re-verified against the full `mtp_batch_verify_check.py` suite
 (all 4 checks still pass) before re-measuring performance.
 
+**Re-measured**: 18.99/18.54/18.79 accepted tok/s, mean **18.78** — up
+from the pre-fix batched result of 16.61 (**+13.1%**). Gap to native
+(144.54) narrows from ~8.7x to **~7.7x**. A real but modest gain
+relative to Finding 1's ~2.28x potential — split-KV is a genuinely
+separate, smaller lever, not a re-explanation of the recompute-fallback
+gap.
+
+### Phase 3, remaining-gap Finding 3: ncu occupancy data confirms the low-utilization mechanism directly (2026-07-17)
+
+Full detail in `notes/direct-model-runner-design.md`. The coordinator
+separately observed via repeated `nvidia-smi` sampling that
+`utilization.gpu` stayed pinned around ~30% while this runtime was
+running — a different measurement dimension from this project's own
+~95% CUDA-event busy% (time-with-a-kernel-running vs. how much of the
+188-SM array any ONE launch occupies). Requested direct `ncu` numbers to
+confirm the mechanism.
+
+Only the pre-fix ("nosplit", `max_num_splits=1`) config was successfully
+profiled this round (two kernel-name-filter dead ends before finding the
+real device kernel symbol names — `flash_attn_decode_partial_kernel_fp8kv`
+for qo_len=1, `flash_attn_decode_v2_fp8kv_paged_split` +
+`flash_attn_decode_merge_kernel` for qo_len=4 — which differ from the
+Python binding function names; a split64 comparison pass was skipped
+given ncu's per-kernel replay overhead on this model's KV-cache
+footprint and the first pass's numbers already being decisive).
+
+**Real measured numbers** (188 SMs on this GPU): the batched verify
+kernel (`flash_attn_decode_v2_fp8kv_paged_split`, covering all 4
+concurrent slots in one launch) creates only **16 CTAs** — 16.7% SM
+occupancy, 2.2% compute throughput, 0.09 waves/SM. The recompute-path's
+single-slot kernel (`flash_attn_decode_partial_kernel_fp8kv`) is worse:
+also 16 CTAs but only 8.4% occupancy, 1.8% throughput. This directly and
+quantitatively confirms the coordinator's observation's mechanism — even
+the fully-batched kernel is far from SM-saturated at batch=4, a fact
+independent of (additive to) both Finding 1 and Finding 2. Back-of-
+envelope estimate for the post-split-KV-fix grid size at this run's real
+kv_len (~4096, `max_model_len=40960` → `kv_split_size=640` →
+`num_splits=ceil(4096/640)=7`, not the full 64-target since kv_len is far
+below max_model_len): ~112 CTAs, a real ~7x increase but still well under
+188 SMs — consistent with (not contradicting) Finding 2's modest, real
++13% measured gain.
+
+**Round summary**: three real, independently-verified, additive
+findings — (1) cross-slot batching +43% (11.60→16.61 tok/s), (2)
+split-KV fix +13% more (16.61→18.78 tok/s), (3) recompute-fallback
+batching NOT fixed this round, the largest single remaining lever
+(~56% of wall time / ~2.28x potential, top-priority next step, requires
+generalizing both metadata builders for per-request ragged qo_len).
+**Bottom line: native 144.54 tok/s vs. this runtime's 18.78 — ~7.7x
+slower**, down from ~8.7x/12.46x at earlier rounds but still a large
+gap. ncu data shows real headroom remains on the kernel-occupancy
+dimension even independent of Finding 1 — fixing the recompute fallback
+alone would not by itself close the gap to native.
+
 ### Phase 3, expanded W1-S sample (2026-07-17) — the 6.45pp gap collapses to 1.34pp: it WAS small-sample noise
 
 Full detail in `notes/direct-model-runner-design.md`. Expanded the

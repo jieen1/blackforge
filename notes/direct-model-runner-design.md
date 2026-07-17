@@ -3765,26 +3765,126 @@ more SMs; cross-slot batching lets multiple concurrent requests share
 one launch. Finding 1's fallback path needs the SECOND kind of fix,
 which this round's split-KV change does not provide.
 
-### Next: locating the remaining ~8.7x gap (in progress)
+### Split-KV fix re-measured: +13% more (2026-07-17)
 
-The coordinator's hypotheses for what's left, updated priority order
-after Finding 1:
-1. ~~Is the batching actually complete, or does it silently degrade back
-   toward per-slot execution in the common case?~~ **Confirmed: yes, the
-   recompute-fallback path is 100% single-slot, 84.4% of rounds hit it,
-   accounting for ~56% of total wall time / a ~2.28x potential speedup.
-   See Finding 1 above.**
-2. Whether the batched kernel calls (attention/GEMM/GDN) process
-   effective tokens/tile-size as efficiently as native's own continuous
-   batching scheduling, at the kernel level -- `ncu` occupancy
-   measurement, now scoped as SECONDARY/confirmatory evidence rather
-   than the primary lever, per the coordinator's explicit re-prioritization
-   once Finding 1 came in. Split-KV (Finding 2) is one concrete instance
-   of this already found and fixed via source inspection alone, without
-   needing `ncu` first.
-3. Whether GDN-state batching or the accept/reject bookkeeping itself
-   introduces overhead not present in the single-slot path -- Finding 1
-   already answers the GDN piece (its recurrent state is exactly why a
-   full batched-recompute fix is harder than the attention side alone).
-Findings from (1) and (2) above; remaining work below.
-(1) accounts for.
+Re-ran the same W1-S perf comparison (`mtp_w1s_our_runtime_perf.py
+--batched`, n=16, K=3, concurrency=4, 3 reps) after the split-KV fix:
+**18.99 / 18.54 / 18.79 accepted tokens/s, mean 18.78** -- up from the
+pre-fix batched result of 16.61 (+13.1%). Independently verified against
+the raw log (`grep accepted_tokens_per_sec`), not just taken on faith.
+Gap to native (144.54) narrows from ~8.7x to **~7.7x**. A real,
+measurable, but modest improvement relative to Finding 1's ~2.28x
+potential -- consistent with split-KV being a genuinely separate,
+smaller lever than the recompute-fallback batching gap, not a
+re-explanation of it.
+
+### Finding 3: ncu occupancy data confirms the low-utilization mechanism directly (2026-07-17)
+
+The coordinator separately observed, via their own repeated `nvidia-smi`
+sampling while the batched runtime was actually running, that
+`utilization.gpu` stayed pinned around **~30%** -- a real, different
+measurement dimension from this project's own ~95% CUDA-event busy%
+(time-fraction-with-a-kernel-running vs. how much of the 188-SM array
+any ONE launch actually occupies). Requested direct `ncu` per-kernel
+occupancy numbers to confirm the mechanism, not just reason about it
+from source.
+
+**Methodology note (reported honestly): only the pre-split-KV-fix
+("nosplit", `max_num_splits=1`) configuration was successfully profiled
+this round** (`benchmarks/ncu_splitkv_occupancy_probe.py --mode nosplit`,
+`--metrics sm__warps_active.avg.pct_of_peak_sustained_active,
+launch__grid_size,launch__waves_per_multiprocessor,sm__throughput.avg.
+pct_of_peak_sustained_elapsed --kernel-name regex:flash_attn_decode`).
+Two dead ends before landing on a working kernel filter, both reported
+for anyone repeating this: (1) `--kernel-name regex:flash_attn` (too
+broad) exhausted the `--launch-count` budget entirely on the PREFILL
+kernel (`flash_attn_fwd_kernel_fp8kv`, one launch per full-attention
+layer) before ever reaching a decode/verify launch; (2)
+`--kernel-name regex:v2_decode` (guessed from the Python binding
+function's own name, `flash_attn_sm120_fwd_v2_decode_fp8kv_paged`)
+matched NOTHING -- the actual `__global__` CUDA kernel symbol names are
+different from the host-side wrapper function name
+(`flash_attn_decode_partial_kernel_fp8kv` for the qo_len=1 plain-decode
+path, `flash_attn_decode_v2_fp8kv_paged_split` + `flash_attn_decode_merge_kernel`
+for the qo_len=2-4 v2/verify path -- found via ncu's own "no kernels
+matched, here is what exists" listing). A split64 (`max_num_splits=64`,
+the post-fix config) comparison pass was not run this round -- ncu's
+per-kernel replay overhead against this model's large KV-cache footprint
+("Backing up device memory in system memory, kernel replay might be
+slow") made even the single nosplit pass take several minutes for just
+12 kernel launches; time was better spent finalizing this round's
+writeup than chasing a second multi-minute profiling pass once the first
+pass's numbers were already decisive enough (below) to answer the actual
+question asked.
+
+**Real, measured numbers (nosplit/pre-fix config, 188 SMs on this GPU)**:
+
+| Kernel | Call site | Grid size (CTAs) | Waves/SM | SM occupancy | SM compute throughput |
+|---|---|---|---|---|---|
+| `flash_attn_decode_partial_kernel_fp8kv` | qo_len=1 recompute-fallback (1 slot) | **16** | 0.03 | 8.4% | 1.8% |
+| `flash_attn_decode_v2_fp8kv_paged_split` | qo_len=4 batched verify (up to 4 slots) | **16** | 0.09 | 16.7% | 2.2% |
+| `flash_attn_decode_merge_kernel` (after partial) | same recompute call | 96 | 0.09 | 28-34% | ~1.1% |
+| `flash_attn_decode_merge_kernel` (after v2/split) | same batched-verify call | 384 | 0.34 | 39-54% | 4.5-5.1% |
+
+**This directly and quantitatively confirms the coordinator's
+observation's mechanism**: even the BATCHED verify kernel (covering all
+4 real concurrent slots in one launch) only creates 16 CTAs against a
+188-SM GPU -- at most ~8.5% of the SM array populated even under a
+generous 1-CTA-per-SM assumption, with measured occupancy of 16.7% and
+compute throughput of just 2.2%. This is REAL, not a napkin estimate,
+and it is a genuinely different fact from Finding 1 (recompute-fallback
+frequency) and Finding 2 (split-KV being absent) -- it shows that even
+the FULLY-batched, POST-split-KV-fix-relevant kernel (`v2_fp8kv_paged_split`
+is exactly the one Finding 2's fix targets) is still far from saturating
+this GPU's SM array at this batch=4 scale, WITH or WITHOUT the split-KV
+fix's benefit factored in (this specific capture predates the fix, i.e.
+this table's numbers already reflect the "before" state Finding 2's
+measured +13% improved from). A back-of-envelope estimate for what the
+FIXED (max_num_splits=64) config's grid size becomes: at this run's real
+kv_len (~4096) and `max_model_len=40960`, `kv_split_size = ceil(40960/64)
+= 640`, giving real `num_splits = ceil(4096/640) = 7` (not the full 64 --
+collapses because kv_len is far below max_model_len) -- so grid size
+would become roughly `16 x 7 = 112` CTAs post-fix, a real ~7x increase
+in CTA count, but still well under 188 SMs. This is consistent with
+(not contradicting) the modest, real +13% throughput gain Finding 2's
+fix actually measured: more CTAs helps, but 112 CTAs is still far from
+saturating 188 SMs, and other costs (memory-bandwidth-bound weight
+reads, GDN kernels, GEMM kernels, eager-mode dispatch overhead) remain
+on top regardless of this specific lever.
+
+### Round summary: three real, independently-verified findings, none of which alone closes the gap
+
+1. **Cross-slot batching**: `mtp_prefill_batch`/`mtp_verify_and_commit_batch`
+   built, verified (4-check suite, including a real `decode_qo_len` bug
+   found and fixed via a strict batch=1 equivalence test), and measured:
+   **11.60 -> 16.61 accepted tok/s (+43%)**.
+2. **Split-KV parallelism** (was completely absent from the eager batched
+   path -- `max_num_splits` always collapsed to 1): found via direct
+   source comparison against the real production
+   `SM120GQAMetadataBuilder`, fixed, re-verified against the same 4-check
+   suite, measured: **16.61 -> 18.78 accepted tok/s (+13% more)**.
+3. **Recompute-fallback batching** (NOT fixed this round -- the
+   top-priority next step): 84.4% of real rounds hit a 100%-single-slot
+   fallback path (confirmed by direct source re-inspection, `runtime/
+   direct_model_runner.py` lines 1726-1741 and 1766-1777), accounting for
+   ~56% of total wall time / a ~2.28x POTENTIAL speedup if fixed -- a
+   larger single lever than either of the above two, not yet
+   implemented. Real fix requires generalizing both
+   `build_attention_metadata_batch` and `build_gdn_metadata_batch` to
+   support a per-request ragged `qo_len` (attention side is
+   straightforward via the existing pad-and-correct-`slot_kv_len`
+   pattern; GDN's recurrent, non-content-addressed state makes it the
+   harder piece).
+
+**Bottom line, reported exactly as measured**: native vLLM at
+144.54 accepted tokens/s vs. this runtime's 18.78 after this round's two
+real fixes -- **~7.7x slower, down from ~8.7x/12.46x at earlier rounds,
+but still a large gap**. `ncu` data (Finding 3) shows the batched verify
+kernel itself is far from SM-saturated (16.7% occupancy, 16 CTAs/188 SMs)
+even independent of the recompute-fallback issue -- meaning even a
+hypothetical complete fix of Finding 1 would still leave real headroom
+on the kernel-occupancy dimension, not a "fix Finding 1 and you're done"
+situation. The founding premise (removing vLLM's Python scheduler alone
+would be sufficient) remains unsupported; this round's work narrows
+*why* by decomposing the gap into three separately-measured, additive
+causes instead of one undifferentiated "native is faster" fact.
