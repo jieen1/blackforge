@@ -743,6 +743,136 @@ plausible secondary lever once cross-slot batching exists, but this
 round's evidence (high GPU-busy% already without it) suggests it isn't
 the primary one.
 
+### Phase 3, cross-slot batched MTP coordinator (2026-07-17) — real +43% throughput, still ~8.7x slower than native
+
+Full detail in `notes/direct-model-runner-design.md`. Built the
+generalization proposed above: `_mtp_forward_batch`/
+`_mtp_sync_and_propose_batch`/`mtp_prefill_batch`/
+`mtp_verify_and_commit_batch` — the draft model's own forward is
+genuinely batched too, not just the target model. Mixed-stage handling
+(the coordinator's specific concern): the VERIFY step always batches
+across every active slot; post-verify, FULL-ACCEPT slots get one shared
+batched draft-sync+propose call, NEEDS-RECOMPUTE slots (variable
+committed_len) fall back to the existing single-slot path per affected
+slot.
+
+**A real bug caught by this round's own verification gradient** (batch=1
+strict-equivalence check, before ever reaching the coordinator):
+`build_attention_metadata_batch` (pre-existing code, never before
+exercised with a genuine multi-token prefill) unconditionally set
+`decode_qo_len = qo_len`, wrongly routing a chunked-prefill forward
+through the decode/verify-shaped kernel path — confirmed against the
+real `SM120GQAMetadataBuilder.build()`'s own non-unconditional formula.
+Fixed with an `is_decode` parameter threaded through
+`build_attention_metadata_batch`/`_forward_batch`/`_mtp_forward_batch`
+(default `True`, preserving `decode_batch`/`verify_batch` byte-for-byte;
+only `mtp_prefill_batch` passes `False`). A second, separate bug in this
+round's own new code (`_mtp_forward_batch` accepted but never forwarded
+`is_decode`) was caught by the same test.
+
+**Verification** (`benchmarks/mtp_batch_verify_check.py`, 4 checks, all
+pass): (0) strict batch=1 equivalence — the check that caught the bug
+above, kept as a permanent regression guard; (1) numerical-twin at real
+batch=4 using per-round independent-reference-replay (not independent-
+trajectory comparison — an earlier version of this check used the
+latter and produced a misleading "diverged" result that was actually
+just one greedy near-exact tie, already a documented tolerated
+phenomenon in this codebase, cascading through later rounds); (2)
+signal-probe, 4 distinct prompts, no cross-contamination; (3) forced
+mixed-stage — 2 slots forced to reject, 2 organically full-accept, in
+the SAME batched call — all 6 rounds pass.
+
+**Performance re-measurement** (same W1-S shape: 4096in/256out, K=3,
+c=4, n=16, 3 reps):
+
+| Metric | Native | Single-slot | Batched |
+|---|---|---|---|
+| Accepted tokens/s | 144.54 | 11.60 | **16.61** |
+| ms/accepted token | 6.93 | 86.19 | 60.21 |
+| GPU-busy% (this runtime) | — | 95.86% | 95.4-95.5% |
+
+**Batching gave a real +43% throughput improvement — but the gap to
+native remains ~8.7x, not closed.** GPU-busy% stayed just as high (~95%)
+after batching as before it — reconfirming that launch-gap/idle-Python-
+dispatch time is not the bottleneck either before or after batching;
+whatever eats the remaining ~8.7x lives inside GPU-busy time itself
+(kernel-level efficiency), not between kernel launches. (Batched TTFT
+looks far worse than single-slot's — 693ms → ~2900ms — but this is
+mostly a measurement-definition difference: batched TTFT correctly
+charges every slot in a batch for the FULL batch's shared prefill
+cost, while the single-slot script only charged each slot for its own
+individual call, understating true wait time for later slots in that
+round-robin loop. Not a like-for-like comparison, reported for
+completeness not as a regression.)
+
+### Phase 3, remaining-gap Finding 1: recompute fallback is 100% single-slot, 84.4% of rounds hit it, ~56% of wall time (2026-07-17)
+
+Full detail in `notes/direct-model-runner-design.md`. Measured directly
+(`benchmarks/mtp_batch_recompute_cost_diag.py`, 372 real rounds, same
+W1-S shape): **84.4% of rounds have at least 1 of the 4 concurrent slots
+needing the single-slot recompute fallback** — a fully-batched round
+(every slot full-accept) is the RARE case (15.6%), not the common one,
+directly contradicting the "batch the common case, fall back for the
+uncommon case" assumption the batched coordinator was built on. Mean
+round time scales with recompute-slot count: 292.8ms (0 recompute) →
+524.5ms (1) → 745.9ms (2) → 938.4ms (3) → 1148.4ms (4). If every round
+ran at the fully-batched rate, the whole 372-round run would take 108.9s
+instead of the observed 248.87s — **the recompute fallback alone
+accounts for ~56% of total wall time, a ~2.28x potential speedup if fixed.**
+
+**Root cause, confirmed by direct source re-inspection** (a cheap check
+that didn't need `ncu`, per the coordinator's explicit suggestion to
+check this before profiling): `mtp_verify_and_commit_batch`'s
+recompute-fallback branch is a Python `for` loop calling
+`_forward_batch([s], ...)` + `_mtp_sync_and_propose(s, ...)` ONCE PER
+AFFECTED SLOT — genuinely zero cross-slot batching, degenerating back to
+up to 4 separate single-request kernel-launch sets per recompute slot
+per round (1 target forward + up to 3 draft-model forward calls at
+K=3). At 2-3 recompute slots per round (the actual common case), a
+single round issues 8-12 tiny single-request launches. This is a
+concrete, source-confirmed explanation for a large share of the
+persistently low `nvidia-smi utilization.gpu` (~30%) the coordinator's
+own repeated sampling caught — a DIFFERENT dimension from the ~95%
+CUDA-event busy% this project has measured throughout (busy% = "is a
+kernel running right now"; occupancy/utilization = "how much of the
+188-SM array does any ONE launch use" — a tiny single-request launch can
+be 100% busy while lighting up only a handful of SMs). Both metrics are
+real and both are reported; they are not in tension.
+
+**Why not fixed this round**: a real batched-recompute path needs both
+`build_attention_metadata_batch` and `build_gdn_metadata_batch`
+generalized to accept a PER-REQUEST (ragged) new-token count instead of
+today's single shared scalar `qo_len`. The attention side is
+straightforward (content/position-addressed, same safe pad-and-correct-
+`slot_kv_len`-afterward pattern `verify_batch`'s own `commit=False`
+already uses); GDN is harder — its recurrent state is NOT
+content/position-addressed, so padding tokens would corrupt a slot's
+real state with fake extra updates. Real, bounded engineering task, not
+a quick patch — flagged as the top-priority next step, not attempted
+this round.
+
+### Phase 3, remaining-gap Finding 2: split-KV parallelism was completely absent from the eager batched path — fixed (2026-07-17)
+
+A second, separate, source-confirmed gap (additive with Finding 1, not
+an alternative explanation): `build_attention_metadata_batch`'s default
+branch (used by every eager batched/MTP call until this fix) derived
+`kv_split_size` from the request's own live kv_len, forcing
+`max_num_splits == 1` — zero split-KV parallelism for the real attention
+kernel (`flash_attn_sm120_fwd_v2_decode_fp8kv_paged`). Real production
+`SM120GQAMetadataBuilder.build()` never does this — it always derives a
+FIXED `kv_split_size` from `max_model_len`, targeting 64 splits/request.
+Confirmed both sides of the W1-S native comparison use the SAME
+underlying kernel (`launch_test_server.py` defaults to
+`--attention-backend CUSTOM`) — so this is a same-kernel,
+different-launch-config gap, not a different-kernel confound. Fixed:
+`DirectModelRunner.__init__` now computes
+`decode_fixed_kv_split_size`/`decode_fixed_max_num_splits` once (using
+this runner's own real per-slot capacity ceiling as the safe upper
+bound, matching the existing CUDA-graph-safety proof), threaded through
+`_forward_batch`/`_mtp_forward_batch`/`verify_batch`/the recompute-fallback
+call. Re-verified against the full `mtp_batch_verify_check.py` suite
+(all 4 checks still pass) before re-measuring performance.
+
 ### Phase 3, expanded W1-S sample (2026-07-17) — the 6.45pp gap collapses to 1.34pp: it WAS small-sample noise
 
 Full detail in `notes/direct-model-runner-design.md`. Expanded the

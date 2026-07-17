@@ -3528,3 +3528,263 @@ last, unstarted step of the verification gradient) is a plausible
 SECONDARY lever once cross-slot batching exists, but this round's
 evidence (high GPU-busy% already, without CUDA graphs) suggests it is
 not the primary one.
+
+### Phase 3, cross-slot batched MTP coordinator (2026-07-17) — real +43% throughput, still ~8.7x slower than native
+
+Built the generalization proposed above: `_mtp_forward_batch` (draft
+model, multi-slot, mirrors `_forward_batch`'s generalization of
+`_forward`), `_mtp_sync_and_propose_batch` (tracks one
+`running_prior_kv_len` PER SLOT, the direct batched analogue of the
+2026-07-17 single-slot `prior_kv_len` fix), `mtp_prefill_batch`, and
+`mtp_verify_and_commit_batch` in `runtime/direct_model_runner.py`. The
+draft model's own forward is genuinely batched too, not just the target
+model -- `_mtp_sync_and_propose_batch`'s autoregressive loop calls
+`_mtp_forward_batch` once per step across every listed slot.
+
+**Mixed-stage handling** (the coordinator's specific concern):
+`mtp_verify_and_commit_batch` always batches the VERIFY step across
+every active slot (safe unconditionally -- every slot submits the same
+K+1-token draft). After seeing each slot's real accept/reject outcome,
+it splits into two groups: FULL-ACCEPT slots (uniform `committed_len =
+k+1`) get ONE shared batched draft catch-up+propose call
+(`_mtp_sync_and_propose_batch`); NEEDS-RECOMPUTE slots (variable
+`committed_len` per slot) fall back to the existing, already-verified
+single-slot recompute path, called once per affected slot -- literally
+the same calls `mtp_verify_and_commit` itself already made, not new
+code. GDN snapshot/restore already indexes by physical slot, so
+restoring one slot's state cannot disturb another's even though both
+share the same underlying batched tensor.
+
+**A real bug this round's own new code caught** (not from the coordinator
+this time -- caught by this round's own verification gradient before
+ever reaching the coordinator): the FIRST time `mtp_prefill_batch` ran
+(any batch size, including 1), its output diverged from the long-verified
+single-slot `mtp_prefill`. Root cause, found by direct source comparison
+after ruling out kernel-numerics (a batch=1 call through the new code
+path should be bit-identical to the old single-slot path, and testing
+that directly was the decisive step): `build_attention_metadata_batch`
+(pre-existing code from an earlier round, never before exercised with a
+genuine multi-token PREFILL) unconditionally set
+`decode_qo_len = qo_len`, while the single-slot `build_attention_metadata`
+correctly sets `decode_qo_len = num_new_tokens if is_decode else 0`. This
+falsely routed a genuine chunked-prefill forward through the
+decode/verify-shaped kernel dispatch. Confirmed against the real,
+authoritative `SM120GQAMetadataBuilder.build()`
+(`vllm/v1/attention/backends/sm120_gqa.py`), whose own formula is never
+unconditional either (`decode_qo_len = cm.max_query_len if
+(is_uniform_qo_len and cm.max_query_len <= _MAX_DECODE_QO_LEN) else 0`).
+Fixed by adding an `is_decode` parameter to `build_attention_metadata_batch`
+(default `True`, preserving `decode_batch`/`verify_batch`'s existing
+behavior byte-for-byte) and threading it through `_forward_batch`/
+`_mtp_forward_batch`; `mtp_prefill_batch` is the one caller that passes
+`is_decode=False`. A SEPARATE bug in this round's own new code was caught
+by the same test: `_mtp_forward_batch` accepted an `is_decode` parameter
+but never actually forwarded it to `build_attention_metadata_batch` --
+fixed alongside the formula gap.
+
+**Verification** (`benchmarks/mtp_batch_verify_check.py`): four checks,
+all passing after the fix --
+0. Strict batch=1 equivalence (the check that caught the bug above,
+   kept as a permanent regression guard: no near-tie tolerance, since a
+   real batch=1 call should be numerically identical to the single-slot
+   path).
+1. Numerical-twin at real batch=4, using the established per-round
+   INDEPENDENT-REFERENCE-REPLAY methodology (`mtp_multiround_check.py`'s
+   own pattern, with its `NEAR_TIE_LOGIT_MARGIN` tolerance) rather than
+   comparing two independent multi-round trajectories directly -- an
+   earlier version of this check used the latter and produced a
+   misleading "diverged after round 2" result that was actually just a
+   single greedy near-exact tie (token 271 vs. 198, both at logit 25.375
+   in the reference run -- literally the same tie this codebase already
+   documented as a real, tolerated, kernel-path-numerics phenomenon)
+   cascading through several more autoregressive rounds. Corrected by
+   feeding each round's REAL committed tokens into an independent
+   single-slot reference forward every round, decoupling each round's
+   check from any prior round's tie-break.
+2. Signal-probe (4 distinct country prompts through the batched path,
+   4 concurrent slots) -- no cross-contamination.
+3. Forced mixed-stage: in ONE `mtp_verify_and_commit_batch` call spanning
+   4 slots, 2 forced to reject (decoy draft token) while 2 organically
+   full-accept, in the SAME round -- all 6 rounds pass.
+
+**Performance re-measurement** (same W1-S shape: 4096in/256out, K=3,
+concurrency=4, n=16 frozen fixture, 3 repetitions,
+`mtp_w1s_our_runtime_perf.py --batched`):
+
+| Metric | Native | Single-slot (round-robin) | Batched (this round) |
+|---|---|---|---|
+| Accepted tokens/s | 144.54 | 11.60 | **16.61** (mean of 16.55/16.53/16.75) |
+| ms/accepted token | 6.93 | 86.19 | 60.21 |
+| GPU-busy% (this runtime's own calls) | -- | 95.86% | 95.4-95.5% |
+| Draft acceptance rate | -- | -- | 67.92% (identical across all 3 reps -- deterministic greedy) |
+
+**Batching produced a real, measurable +43% throughput improvement
+(11.60 -> 16.61 tok/s) -- but the gap to native remains large: ~8.7x
+slower, not closed.** Reported exactly as measured; this is a real
+improvement, not "batched it and it's still just as slow," but it is
+also not remotely enough to validate the founding premise. GPU-busy%
+stayed just as high (~95%) as the single-slot version -- confirming
+AGAIN that launch-gap/Python-dispatch idle time is not the bottleneck
+either before or after batching; whatever eats the remaining ~8.7x lives
+inside the GPU-busy time itself (kernel-level efficiency), not in
+between kernel launches.
+
+**TTFT methodology note (not a real regression, but reported
+honestly)**: batched TTFT (mean ~2909-2968ms across the 3 reps) looks
+far worse than the single-slot version's 693.2ms. This is largely a
+MEASUREMENT-DEFINITION difference, not a new architectural cost: the
+single-slot script measured each slot's own individual `mtp_prefill`
+call duration as that slot's TTFT (understating true wall-clock-to-
+first-token for later slots in the round-robin loop, which also had to
+wait through earlier slots' prefill calls but weren't charged for it);
+the batched script correctly measures the true shared wall-clock time
+until ANY slot in the batch gets its first token, which is inherently
+the FULL batch's combined prefill cost (real batching means every slot
+in a batch waits for the whole batch, a genuine property of fused
+kernel launches, not an artifact). The two numbers are not measuring
+the same thing and should not be directly compared without this caveat.
+
+### Finding 1: recompute-fallback frequency and cost (2026-07-17) — the single biggest identified lever so far
+
+Measured directly (not assumed) via `benchmarks/mtp_batch_recompute_cost_diag.py`:
+for every real round of the W1-S run (372 rounds total, n=16, concurrency=4,
+K=3), counted how many of the round's active slots needed the single-slot
+recompute fallback, and recorded that round's wall-clock time.
+
+| Recompute slots this round | # rounds | % of rounds | mean ms/round |
+|---|---|---|---|
+| 0 (fully batched) | 58 | 15.6% | 292.8 |
+| 1 | 105 | 28.2% | 524.5 |
+| 2 | 121 | 32.5% | 745.9 |
+| 3 | 69 | 18.5% | 938.4 |
+| 4 (all slots recompute) | 19 | 5.1% | 1148.4 |
+
+**84.4% of rounds hit the recompute fallback for at least one slot.** At
+this shape's real ~68% per-position draft acceptance rate, a fully-batched
+round (every one of 4 concurrent slots independently accepting all K=3
+draft tokens) is the RARE case, not the common one -- directly
+contradicting the assumption this round's own batched-coordinator design
+was built on ("batch the common case [full-accept], fall back for the
+uncommon case [recompute]" -- see the coordinator design section above).
+
+**Quantified cost**: total wall time for the 372 rounds was 248.87s. If
+every round ran at the fully-batched rate (292.8ms), the same 372 rounds
+would take 372 x 0.2928s = 108.9s. **The recompute-fallback path alone
+accounts for (248.87-108.9)/248.87 = 56% of total wall-clock time; fixing
+it alone could plausibly yield a ~2.28x speedup** (248.87/108.9), independent
+of any kernel-level occupancy tuning. This was flagged by the coordinator
+as likely the single biggest lever identified so far, bigger than kernel
+occupancy alone -- confirmed by directly re-reading `mtp_verify_and_commit_batch`'s
+own recompute-fallback source (see below), a cheap check that didn't
+require `ncu`/`nsys` to do.
+
+**Root cause, confirmed by direct source re-inspection (not assumed):**
+the recompute-fallback branch is a Python `for` loop calling
+`self._forward_batch([s], ...)` (target model) and
+`self._mtp_sync_and_propose(s, ...)` (draft model, itself looping
+`_mtp_forward` once per draft-sync step) ONCE PER AFFECTED SLOT --
+i.e. it degenerates back to EXACTLY the single-request-per-kernel-launch
+pattern that started this whole investigation (the original 12.46x gap),
+for every slot that needs recompute. With K=3 this is up to 1
+(target-model forward) + up to 3 (draft-model forward: 1 sync step + 2
+autoregressive steps) = up to 4 separate single-request kernel-launch
+sets PER RECOMPUTE SLOT PER ROUND. At 2-3 recompute slots per round
+(the actual common case per the table above), a single round can issue
+8-12 separate tiny single-request launch sets -- this is a very
+plausible, concrete, and now source-confirmed explanation for a large
+share of the persistent low `nvidia-smi utilization.gpu` (~30%) the
+coordinator's own repeated sampling caught, DIFFERENT FROM (not
+contradicting) the ~95% CUDA-event-measured busy% this project has
+reported at every stage: busy% asks "is a kernel running right now, vs.
+idle Python-dispatch time" (still true -- kernels never sit idle between
+launches); occupancy/utilization asks "how much of the 188-SM array does
+any ONE kernel launch actually use" -- a tiny single-request kernel
+launch can be at 100% "busy" the whole time it runs while still only
+lighting up a handful of SMs. Both are real, both matter, and this
+recompute-fallback finding is likely the dominant reason the SECOND
+metric stays low even after cross-slot batching and the split-KV fix
+(below) were applied.
+
+**Why this was designed this way, and what a real fix requires** (not
+attempted this round -- reported honestly, not rushed): the recompute
+group's real per-slot `committed_len` varies (partial reject can happen
+at any of the K positions), and `build_attention_metadata_batch`'s CSR
+construction, while it already supports a per-slot-varying `prior_kv_lens`
+list, requires a single SCALAR `qo_len` shared by the whole batch --
+there is no existing support for a per-request-varying new-token count
+in one batched call. `build_gdn_metadata_batch`'s qo_len>1 branch has the
+identical scalar-qo_len constraint. A real fix means generalizing BOTH
+builders to accept a per-request qo_len list (ragged CSR construction --
+conceptually straightforward for attention, since attention is
+content/position-addressed and padding a shorter request's real content
+to a common length is already this project's own established safe
+pattern, exactly matching `verify_batch`'s own `commit=False` +
+caller-corrects-`slot_kv_len`-afterward convention); GDN is the harder
+piece -- its recurrent state is NOT content/position-addressed, so
+feeding it padding tokens as part of a batched forward would corrupt the
+per-slot recurrent state with fake extra tokens' worth of update, unlike
+attention's KV cache where unread padded positions are simply harmless.
+This is a real, bounded, but non-trivial engineering task (two metadata
+builders need ragged-qo_len support, plus new correctness tests covering
+exactly this heterogeneous-committed-length scenario) -- not completed
+this round; flagged as the top-priority next step.
+
+### Finding 2: split-KV parallelism was completely absent from the eager batched path (2026-07-17)
+
+Separately (and additively, not as an alternative explanation), a
+second, real, source-confirmed gap: `build_attention_metadata_batch`'s
+DEFAULT branch (used by every eager batched/MTP call before this fix,
+`fixed_kv_split_size=None`) derives `kv_split_size` from the request's
+OWN live kv_len, which forces `max_num_splits == 1` -- literally zero
+split-KV parallelism for the actual attention kernel
+(`flash_attn_sm120_fwd_v2_decode_fp8kv_paged`, confirmed hit by this
+runtime's own log at this shape). The REAL, production
+`SM120GQAMetadataBuilder.build()` (`vllm/v1/attention/backends/
+sm120_gqa.py`) never does this: it always derives a FIXED `kv_split_size`
+from a build-time bound (`max_model_len`) targeting
+`_DECODE_TARGET_SPLITS_PER_REQ = 64` splits/request, a value that
+project's own sweep (kv_len 2000-131072) found best. Confirmed both
+sides of the W1-S comparison use the SAME underlying kernel
+(`launch_test_server.py` defaults to `--attention-backend CUSTOM`,
+this project's own SM120GQABackend, unless `--baseline-flashinfer` is
+passed) -- so this is a same-kernel, different-launch-configuration gap,
+not a different-kernel confound. Fixed by computing
+`self.decode_fixed_kv_split_size`/`self.decode_fixed_max_num_splits`
+once in `DirectModelRunner.__init__` (matching native's formula, using
+this runner's own real per-slot capacity ceiling `blocks_per_slot *
+block_size` as the safe upper bound -- the same L the existing
+CUDA-graph-safety proof already establishes as valid for every real
+kv_len this runner will ever see) and threading it through
+`_forward_batch`/`_mtp_forward_batch`/`verify_batch`/the recompute-fallback
+call. Re-verified against the full `mtp_batch_verify_check.py` suite
+(all 4 checks still pass) before re-measuring performance. This affects
+EVERY decode/verify-shaped batched call, including inside the
+recompute-fallback path (Finding 1) -- the two fixes are complementary,
+not overlapping: split-KV lets a single request's own kernel launch use
+more SMs; cross-slot batching lets multiple concurrent requests share
+one launch. Finding 1's fallback path needs the SECOND kind of fix,
+which this round's split-KV change does not provide.
+
+### Next: locating the remaining ~8.7x gap (in progress)
+
+The coordinator's hypotheses for what's left, updated priority order
+after Finding 1:
+1. ~~Is the batching actually complete, or does it silently degrade back
+   toward per-slot execution in the common case?~~ **Confirmed: yes, the
+   recompute-fallback path is 100% single-slot, 84.4% of rounds hit it,
+   accounting for ~56% of total wall time / a ~2.28x potential speedup.
+   See Finding 1 above.**
+2. Whether the batched kernel calls (attention/GEMM/GDN) process
+   effective tokens/tile-size as efficiently as native's own continuous
+   batching scheduling, at the kernel level -- `ncu` occupancy
+   measurement, now scoped as SECONDARY/confirmatory evidence rather
+   than the primary lever, per the coordinator's explicit re-prioritization
+   once Finding 1 came in. Split-KV (Finding 2) is one concrete instance
+   of this already found and fixed via source inspection alone, without
+   needing `ncu` first.
+3. Whether GDN-state batching or the accept/reject bookkeeping itself
+   introduces overhead not present in the single-slot path -- Finding 1
+   already answers the GDN piece (its recurrent state is exactly why a
+   full batched-recompute fix is harder than the attention side alone).
+Findings from (1) and (2) above; remaining work below.
+(1) accounts for.

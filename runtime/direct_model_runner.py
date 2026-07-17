@@ -233,6 +233,7 @@ def build_attention_metadata_batch(
     blocks_per_slot: int,
     device: torch.device,
     qo_len: int = 1,
+    is_decode: bool = True,
     fixed_kv_split_size: int | None = None,
     fixed_max_num_splits: int | None = None,
 ) -> SM120GQAMetadata:
@@ -267,6 +268,35 @@ def build_attention_metadata_batch(
     already-verified single-request path (2026-07-16 slot-0-reservation
     fix, Stage C/D 20/20) -- the two are cross-checked instead via the
     batch=1 equivalence test in ``benchmarks/batch_decode_regression.py``.
+
+    ``is_decode`` (2026-07-17 addition, default ``True`` preserving
+    ``decode_batch``/``verify_batch``'s existing behavior exactly): gates
+    ``decode_qo_len``/``is_pure_decode`` exactly like
+    ``build_attention_metadata``'s own ``is_decode`` parameter already
+    does (``decode_qo_len = qo_len if is_decode else 0``,
+    ``is_pure_decode = is_decode and qo_len == 1``) -- a real, pre-existing
+    gap this function had before this fix: it used to set
+    ``decode_qo_len = qo_len`` UNCONDITIONALLY, correct for every call site
+    that existed before 2026-07-17 (``decode_batch``'s qo_len=1 decode and
+    ``verify_batch``'s qo_len=k+1 MTP verify -- both genuinely
+    decode/verify-shaped), but wrong for a genuine chunked/prefix PREFILL
+    forward (e.g. ``mtp_prefill_batch``'s target-model call, or
+    ``_mtp_sync_and_propose_batch``'s draft-model step-0 sync call when
+    ``num_new_tokens > 1``): telling the kernel ``decode_qo_len=N`` for an
+    N-token PREFILL falsely routes it through the decode/verify-shaped
+    kernel path (confirmed against the real, authoritative
+    ``SM120GQAMetadataBuilder.build()`` in ``vllm/v1/attention/backends/
+    sm120_gqa.py``, whose own formula is
+    ``decode_qo_len = cm.max_query_len if (is_uniform_qo_len and
+    cm.max_query_len <= _MAX_DECODE_QO_LEN) else 0`` -- i.e. it is NEVER
+    unconditional either). Caught via a real numerical-twin divergence
+    (``benchmarks/mtp_batch_divergence_diag.py``): a batch=1 call through
+    the new ``mtp_prefill_batch``/``_mtp_forward_batch`` path diverged
+    from the long-verified single-slot ``mtp_prefill``/``_mtp_forward``
+    path even at batch size 1, which is what proved this was a genuine
+    formula gap and not a batch-size-dependent kernel numerics difference
+    (the other candidate explanation this project's own established
+    near-tie precedent would have made plausible).
 
     ``fixed_kv_split_size``/``fixed_max_num_splits`` (both None by
     default, preserving the existing per-call-derived behavior for the
@@ -354,10 +384,10 @@ def build_attention_metadata_batch(
         kv_page_indices=kv_page_indices,
         kv_last_page_len=kv_last_page_len,
         page_size=page_size,
-        is_pure_decode=(qo_len == 1),
+        is_pure_decode=(is_decode and qo_len == 1),
         kv_split_size=kv_split_size,
         max_num_splits=max_num_splits,
-        decode_qo_len=qo_len,
+        decode_qo_len=(qo_len if is_decode else 0),
     )
 
 
@@ -592,6 +622,43 @@ class DirectModelRunner:
         self.slot_pending_draft_tokens: list[list[int] | None] = [None] * num_slots
         self.slot_gdn_snapshot_gen = [0] * num_slots
 
+        # Split-KV parallelism for decode/verify-shaped batched kernel calls
+        # (2026-07-17, found via direct source comparison after the
+        # coordinator's own nvidia-smi monitoring caught persistently low
+        # ~30% GPU utilization in the batched MTP path despite ~95%
+        # CUDA-event-measured busy time -- a DIFFERENT dimension from
+        # "is a kernel running right now" (busy%) than "how much of the
+        # 188-SM array does any ONE kernel call actually occupy"
+        # (occupancy), and it is this second dimension that was starved).
+        # `build_attention_metadata_batch`'s DEFAULT (this eager path's
+        # only caller, until now) derives `kv_split_size` from the
+        # request's OWN live kv_len, which forces `max_num_splits == 1`
+        # (literally zero split-KV parallelism) unconditionally -- the
+        # real, production `SM120GQAMetadataBuilder.build()`
+        # (`vllm/v1/attention/backends/sm120_gqa.py`) NEVER does this: it
+        # always derives a FIXED `kv_split_size` from a build-time bound
+        # (there, `max_model_len`; here, this runner's own real per-slot
+        # capacity ceiling `blocks_per_slot * block_size`, the same L the
+        # CUDA-graph-safety proof in `build_attention_metadata_batch`'s
+        # docstring already establishes as a valid upper bound for every
+        # real kv_len this runner will ever see) targeting
+        # `_DECODE_TARGET_SPLITS_PER_REQ = 64` splits/request -- a value
+        # that project's own sweep (kv_len 2000-131072) found best; this
+        # project's OWN (not-yet-wired-into-production) `CapturedBatchDecodeGraph`
+        # class used a stale `TARGET_SPLITS = 16` from an earlier round,
+        # predating that later tuning -- 64 is used here to match the
+        # CURRENT best-known value, not the stale one. Confirmed the SAME
+        # underlying kernel is used on both sides of the W1-S native
+        # comparison (`launch_test_server.py` defaults to
+        # `--attention-backend CUSTOM`, this project's own SM120GQABackend
+        # unless `--baseline-flashinfer` is passed) -- so this is a
+        # same-kernel, different-launch-configuration gap, not a
+        # different-kernel confound.
+        _DECODE_TARGET_SPLITS_PER_REQ = 64
+        capacity = self.blocks_per_slot * self.block_size
+        self.decode_fixed_kv_split_size = max(1, -(-capacity // _DECODE_TARGET_SPLITS_PER_REQ))
+        self.decode_fixed_max_num_splits = _DECODE_TARGET_SPLITS_PER_REQ
+
         self._warmup()
 
     def _warmup(self) -> None:
@@ -751,6 +818,9 @@ class DirectModelRunner:
         qo_len: int = 1,
         commit: bool = True,
         return_hidden: bool = False,
+        is_decode: bool = True,
+        fixed_kv_split_size: int | None = None,
+        fixed_max_num_splits: int | None = None,
     ) -> torch.Tensor:
         """Real batched decode/verify: ONE batched attention/GDN metadata
         object and ONE ``model.forward()`` call covering every listed slot
@@ -789,6 +859,30 @@ class DirectModelRunner:
         snapshot/restore + recompute-forward repair on a non-full-accept
         outcome, exactly as already verified by
         ``benchmarks/mtp_gdn_rollback_check.py``.
+
+        ``is_decode`` (2026-07-17 addition, default ``True`` preserving
+        ``decode_batch``/``verify_batch``'s existing behavior byte-for-byte):
+        forwarded to ``build_attention_metadata_batch``'s own ``is_decode``
+        parameter -- see that function's docstring for the real gap this
+        closes (``decode_qo_len`` must be 0 for a genuine chunked/prefix
+        PREFILL call, not ``qo_len`` unconditionally). Only
+        ``mtp_prefill_batch`` passes ``is_decode=False`` explicitly, for its
+        genuine target-model prefill forward.
+
+        ``fixed_kv_split_size``/``fixed_max_num_splits`` (both ``None`` by
+        default, forwarded as-is to ``build_attention_metadata_batch``):
+        without these, that function's default branch derives
+        ``kv_split_size`` from this call's own live kv_len, which forces
+        ``max_num_splits == 1`` -- literally zero split-KV parallelism.
+        Real MTP callers now pass ``self.decode_fixed_kv_split_size``/
+        ``self.decode_fixed_max_num_splits`` (computed once in
+        ``__init__``, matching native's production
+        ``SM120GQAMetadataBuilder``'s own fixed-from-build-time-bound
+        derivation) so the SAME decode/verify kernel gets real split-KV
+        parallelism here too -- see ``__init__``'s comment for the full
+        story (2026-07-17, found after the coordinator's own nvidia-smi
+        monitoring caught persistently low GPU utilization in the batched
+        MTP path despite high CUDA-event-measured busy time).
         """
         num_reqs = len(slot_ids)
         if qo_len == 1:
@@ -813,7 +907,22 @@ class DirectModelRunner:
                     f"slot {slot}: caller-provided kv_length {kv_len} != "
                     f"tracked {self.slot_kv_len[slot]}"
                 )
-            if not self.slot_gdn_initialized[slot]:
+            # kv_len == 0 legitimately means "this slot's very first forward"
+            # (matches ``prefill()``'s own "fresh slot" definition) -- 2026-07-17
+            # relaxation for ``mtp_prefill_batch``, the first real caller that
+            # needs a batched forward covering NEVER-forwarded slots.
+            # ``build_gdn_metadata_batch``'s qo_len>1 branch already accepts a
+            # per-slot ``slot_initialized`` list (passed below) and handles
+            # ``False`` correctly (has_initial_state=False is exactly what a
+            # fresh slot's chunked GDN forward needs) -- this guard was stricter
+            # than the underlying kernel actually requires, a leftover of
+            # ``_forward_batch`` previously only ever being called on
+            # already-prefilled slots (``decode_batch``/``verify_batch``). Any
+            # OTHER "not yet initialized" case (kv_len != 0) still raises,
+            # unchanged -- that combination can only mean a caller skipped a
+            # real prefill while lying about kv_len, exactly what this check
+            # exists to catch.
+            if not self.slot_gdn_initialized[slot] and kv_len != 0:
                 raise RuntimeError(f"slot {slot} has no GDN state yet (needs a prior prefill)")
 
         attn_meta = build_attention_metadata_batch(
@@ -823,6 +932,9 @@ class DirectModelRunner:
             blocks_per_slot=self.blocks_per_slot,
             device=self.device,
             qo_len=qo_len,
+            is_decode=is_decode,
+            fixed_kv_split_size=fixed_kv_split_size,
+            fixed_max_num_splits=fixed_max_num_splits,
         )
         gdn_meta = build_gdn_metadata_batch(
             slots=slot_ids,
@@ -888,10 +1000,20 @@ class DirectModelRunner:
         a verify call's real committed length is never known until
         accept/reject runs on these logits, so ``slot_kv_len`` is
         deliberately NOT advanced here (2026-07-17 fix; see
-        ``_forward_batch``'s docstring)."""
+        ``_forward_batch``'s docstring). Passes this runner's own fixed
+        split-KV config (2026-07-17) so the decode/verify kernel gets real
+        split-KV parallelism instead of collapsing to ``max_num_splits=1``
+        -- see ``_forward_batch``'s docstring."""
         qo_len = len(draft_token_ids[0]) if draft_token_ids else 0
         return self._forward_batch(
-            slot_ids, draft_token_ids, kv_lengths, qo_len=qo_len, commit=False, return_hidden=return_hidden
+            slot_ids,
+            draft_token_ids,
+            kv_lengths,
+            qo_len=qo_len,
+            commit=False,
+            return_hidden=return_hidden,
+            fixed_kv_split_size=self.decode_fixed_kv_split_size,
+            fixed_max_num_splits=self.decode_fixed_max_num_splits,
         )
 
     def reset_slot(self, slot: int) -> None:
@@ -1290,6 +1412,371 @@ class DirectModelRunner:
         )
         self.slot_pending_draft_tokens[slot] = next_draft_tokens
         return {**decision, "next_anchor": next_anchor, "next_draft_tokens": next_draft_tokens}
+
+    # ------------------------------------------------------------------
+    # True cross-slot batched MTP (2026-07-17 round): one shared forward
+    # pass -- draft model included, not just the target -- across every
+    # listed slot, instead of a Python loop calling the single-slot
+    # methods above once per slot. Mirrors how ``_forward_batch``/
+    # ``decode_batch``/``verify_batch`` already batch the plain
+    # (non-MTP-aware) target-only path; these are the MTP analogues.
+    # ------------------------------------------------------------------
+
+    def _mtp_forward_batch(
+        self,
+        slots: list[int],
+        token_ids,
+        hidden_states_in: torch.Tensor,
+        prior_kv_lens: list[int],
+        start_pos_list: list[int],
+        *,
+        qo_len: int,
+        is_decode: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Batched analogue of ``_mtp_forward`` for the draft model
+        (``Qwen3_5MTP``) -- ONE batched attention-metadata object (scoped to
+        ``self.mtp_attn_layer_names``, no GDN metadata since the draft model
+        registers no GDN layers -- see ``__init__``'s ``mtp_attn_layer_names``
+        derivation) and ONE ``mtp_model.forward()`` call covering every
+        listed slot. Requires the SAME ``qo_len`` (new-token count) for
+        every slot this call, exactly like ``build_attention_metadata_batch``
+        (the underlying metadata builder) already requires.
+
+        ``prior_kv_lens``/``start_pos_list`` are explicit per-slot lists,
+        kept as TWO separate parameters (not collapsed into one) to mirror
+        ``_mtp_forward``'s own explicit-argument design (its 2026-07-17 bug
+        fix -- see that method's docstring): at every real call site in this
+        file the two values coincide, but they mean different things
+        (attention-metadata history length vs. physical write/embedding
+        position) and collapsing them would silently re-introduce the same
+        class of bug that fix addressed, just in the batched path instead
+        of the single-slot one.
+
+        ``token_ids`` is a flat list (one token id per slot, in ``slots``
+        order) when ``qo_len == 1``, or a list of per-slot token-id lists
+        (each of length ``qo_len``) otherwise -- same convention
+        ``_forward_batch`` uses. Returns logits/hidden_states shaped
+        ``[len(slots) * qo_len, ...]`` in request-then-position order.
+        """
+        if self.mtp_model is None:
+            raise RuntimeError(
+                "no MTP draft model loaded -- build_vllm_config(speculative_config=...) first"
+            )
+        num_reqs = len(slots)
+        if not (len(prior_kv_lens) == num_reqs and len(start_pos_list) == num_reqs):
+            raise ValueError("slots/prior_kv_lens/start_pos_list must have equal length")
+        if qo_len == 1:
+            if len(token_ids) != num_reqs:
+                raise ValueError("token_ids must have one entry per slot when qo_len == 1")
+            flat_token_ids = token_ids
+        else:
+            if not (len(token_ids) == num_reqs and all(len(t) == qo_len for t in token_ids)):
+                raise ValueError("every slot's token_ids must have exactly qo_len entries")
+            flat_token_ids = [tok for slot_tokens in token_ids for tok in slot_tokens]
+
+        attn_meta = build_attention_metadata_batch(
+            slots=slots,
+            prior_kv_lens=prior_kv_lens,
+            block_size=self.block_size,
+            blocks_per_slot=self.blocks_per_slot,
+            device=self.device,
+            qo_len=qo_len,
+            is_decode=is_decode,
+            # 2026-07-17: always pass this runner's fixed split-KV config
+            # (see __init__'s comment) -- harmless when is_decode=False
+            # (decode_qo_len ends up 0 either way, so the decode-kernel
+            # dispatch never reads kv_split_size/max_num_splits for that
+            # call), and gives the draft model's own decode/verify-shaped
+            # calls real split-KV parallelism instead of collapsing to
+            # max_num_splits=1.
+            fixed_kv_split_size=self.decode_fixed_kv_split_size,
+            fixed_max_num_splits=self.decode_fixed_max_num_splits,
+        )
+        attn_metadata_dict = {name: attn_meta for name in self.mtp_attn_layer_names}
+        # Reuses ``_slot_mapping_batch`` (built for the target model's own
+        # batched path) unchanged: its ``kv_lengths`` parameter is used only
+        # as "each request's own write-start position", i.e. exactly what
+        # ``start_pos_list`` means here -- the formula is identical to
+        # concatenating per-slot ``_slot_mapping(slot, start_pos, qo_len)``
+        # calls, verified by inspection (both compute
+        # ``_physical_slot(slot) * blocks_per_slot + pos // block_size``
+        # over the same ``start_pos + j`` positions).
+        slot_mapping = self._slot_mapping_batch(slots, start_pos_list, qo_len=qo_len)
+        slot_mapping_dict = {name: slot_mapping for name in self.mtp_attn_layer_names}
+
+        input_ids = torch.tensor(flat_token_ids, dtype=torch.long, device=self.device)
+        positions = torch.tensor(
+            [start_pos + j for start_pos in start_pos_list for j in range(qo_len)],
+            dtype=torch.long,
+            device=self.device,
+        )
+        with set_forward_context(
+            attn_metadata_dict, self.vllm_config, slot_mapping=slot_mapping_dict
+        ):
+            hidden_states_out = self.mtp_model.forward(input_ids, positions, hidden_states_in)
+        torch.cuda.synchronize()
+        logits = self.mtp_model.compute_logits(hidden_states_out)
+        torch.cuda.synchronize()
+        return logits, hidden_states_out
+
+    def _mtp_sync_and_propose_batch(
+        self,
+        slots: list[int],
+        shifted_input_ids_per_slot: list[list[int]],
+        target_hidden_states: torch.Tensor,
+        start_pos_list: list[int],
+        num_new_tokens: int,
+        k: int,
+    ) -> dict[int, list[int]]:
+        """Batched analogue of ``_mtp_sync_and_propose``: one batched step-0
+        sync call (uniform ``num_new_tokens`` across every listed slot --
+        the caller guarantees this; see ``mtp_prefill_batch``'s uniform-
+        prompt-length requirement and ``mtp_verify_and_commit_batch``'s
+        full-accept-only slot grouping for the two real call sites), followed
+        by ``k-1`` batched autoregressive steps (each contributing exactly 1
+        new token per slot -- always uniform, regardless of ``num_new_tokens``).
+
+        Tracks ONE ``running_prior_kv_len`` PER SLOT (a list, not a scalar)
+        -- the direct batched generalization of the single-slot 2026-07-17
+        fix documented on ``_mtp_forward``: each slot's own draft-sync
+        length can differ even though every slot shares this call's
+        ``num_new_tokens``/``k``, so a single shared counter would silently
+        reintroduce the exact bug that fix addressed. Returns a dict keyed
+        by slot id (not a positional list) so callers can freely pass a
+        SUBSET of the runner's active slots (e.g. only the full-accept
+        group from ``mtp_verify_and_commit_batch``) without index confusion.
+        """
+        num_reqs = len(slots)
+        if not (len(shifted_input_ids_per_slot) == num_reqs and len(start_pos_list) == num_reqs):
+            raise ValueError("slots/shifted_input_ids_per_slot/start_pos_list must have equal length")
+        if not all(len(t) == num_new_tokens for t in shifted_input_ids_per_slot):
+            raise ValueError("every slot's shifted_input_ids must have exactly num_new_tokens entries")
+
+        prior_kv_lens_step0 = [self.slot_draft_sync_len[s] for s in slots]
+        step0_logits, step0_hidden = self._mtp_forward_batch(
+            slots,
+            shifted_input_ids_per_slot,
+            target_hidden_states,
+            prior_kv_lens_step0,
+            start_pos_list,
+            qo_len=num_new_tokens,
+            is_decode=(num_new_tokens == 1),
+        )
+        for s in slots:
+            self.slot_draft_sync_len[s] += num_new_tokens
+
+        draft_tokens: dict[int, list[int]] = {s: [] for s in slots}
+        last_hidden_rows = []
+        prev_tokens = []
+        for i in range(num_reqs):
+            last_idx = i * num_new_tokens + num_new_tokens - 1
+            tok = int(step0_logits[last_idx].argmax(dim=-1).item())
+            draft_tokens[slots[i]].append(tok)
+            prev_tokens.append(tok)
+            last_hidden_rows.append(step0_hidden[last_idx : last_idx + 1])
+        prev_hidden = torch.cat(last_hidden_rows, dim=0)
+
+        next_pos_list = [sp + num_new_tokens for sp in start_pos_list]
+        running_prior_kv_len = list(prior_kv_lens_step0[i] + num_new_tokens for i in range(num_reqs))
+        for _ in range(1, k):
+            step_logits, step_hidden = self._mtp_forward_batch(
+                slots,
+                prev_tokens,
+                prev_hidden,
+                running_prior_kv_len,
+                next_pos_list,
+                qo_len=1,
+                is_decode=True,
+            )
+            new_prev_tokens = []
+            new_hidden_rows = []
+            for i in range(num_reqs):
+                tok = int(step_logits[i].argmax(dim=-1).item())
+                draft_tokens[slots[i]].append(tok)
+                new_prev_tokens.append(tok)
+                new_hidden_rows.append(step_hidden[i : i + 1])
+            prev_tokens = new_prev_tokens
+            prev_hidden = torch.cat(new_hidden_rows, dim=0)
+            for i in range(num_reqs):
+                next_pos_list[i] += 1
+                running_prior_kv_len[i] += 1
+        return draft_tokens
+
+    def mtp_prefill_batch(self, slots: list[int], prompts_per_slot: list[list[int]]) -> dict[int, dict]:
+        """Batched analogue of ``mtp_prefill``: ONE real target prefill
+        forward (``_forward_batch``, now able to accept never-forwarded
+        slots -- see its 2026-07-17 GDN-init-guard relaxation) covering
+        every listed slot, followed by ONE batched draft-sync+propose
+        funnel (``_mtp_sync_and_propose_batch``). Requires every listed
+        slot's prompt to have the SAME length (the uniform-``qo_len``
+        constraint ``build_attention_metadata_batch`` documents) -- true
+        for this project's W1-S/W2-S frozen fixtures (every prompt is
+        exactly the configured ``input_len``), so this is a documented
+        scope boundary, not a limitation for the intended benchmark use."""
+        if self.mtp_model is None or self.num_speculative_tokens is None:
+            raise RuntimeError("no MTP draft model loaded")
+        num_reqs = len(slots)
+        if len(prompts_per_slot) != num_reqs:
+            raise ValueError("slots and prompts_per_slot must have equal length")
+        prompt_len = len(prompts_per_slot[0])
+        if not all(len(p) == prompt_len for p in prompts_per_slot):
+            raise ValueError("mtp_prefill_batch requires every slot's prompt to have equal length")
+        for s in slots:
+            if self.slot_kv_len[s] != 0 or self.slot_draft_sync_len[s] != 0:
+                raise RuntimeError(f"slot {s} is not fresh")
+
+        target_logits, target_hidden = self._forward_batch(
+            slots,
+            prompts_per_slot if prompt_len > 1 else [p[0] for p in prompts_per_slot],
+            [0] * num_reqs,
+            qo_len=prompt_len,
+            commit=True,
+            return_hidden=True,
+            is_decode=False,
+        )
+        anchors: dict[int, int] = {}
+        shifted_per_slot = []
+        for i, s in enumerate(slots):
+            row = target_logits[i * prompt_len + prompt_len - 1]
+            anchor = int(row.argmax(dim=-1).item())
+            anchors[s] = anchor
+            shifted_per_slot.append(prompts_per_slot[i][1:] + [anchor])
+
+        draft_tokens_by_slot = self._mtp_sync_and_propose_batch(
+            slots,
+            shifted_per_slot,
+            target_hidden,
+            [0] * num_reqs,
+            num_new_tokens=prompt_len,
+            k=self.num_speculative_tokens,
+        )
+        for s in slots:
+            self.slot_pending_draft_tokens[s] = draft_tokens_by_slot[s]
+        return {s: {"anchor": anchors[s], "draft_tokens": draft_tokens_by_slot[s]} for s in slots}
+
+    def mtp_verify_and_commit_batch(
+        self,
+        slots: list[int],
+        anchors: dict[int, int],
+        draft_tokens: dict[int, list[int]],
+    ) -> dict[int, dict]:
+        """Batched analogue of ``mtp_verify_and_commit``. ALWAYS batches the
+        verify step across every listed slot in ONE real batched forward
+        (``verify_batch``) -- unconditionally safe, since every slot submits
+        the SAME K+1-token draft (``num_speculative_tokens`` is a global
+        engine config, matching ``verify_batch``'s own uniform-``qo_len``
+        contract).
+
+        After seeing each slot's real accept/reject outcome, this explicitly
+        does NOT assume every slot stays at the same MTP-cycle stage
+        (2026-07-17, per the coordinator's specific instruction): it splits
+        the batch into two groups and handles each correctly --
+
+        - FULL-ACCEPT slots (``num_accepted == k``): every slot in this
+          group has the SAME ``committed_len == k + 1``, so their draft
+          catch-up+propose step is ALSO safely batchable
+          (``_mtp_sync_and_propose_batch``).
+        - NEEDS-RECOMPUTE slots (partial reject -- and the rejection
+          position, hence ``committed_len``, can differ PER SLOT even
+          within the same round): rather than building variable-length
+          batch padding/masking machinery for this uncommon case, falls
+          back to the EXISTING, already-verified single-slot recompute
+          path (``_forward_batch([slot], ...)`` + ``_mtp_sync_and_propose
+          (slot, ...)``, called once per affected slot -- byte-for-byte
+          the same calls ``mtp_verify_and_commit`` itself makes, not new
+          code), so this uncommon path carries no additional correctness
+          risk beyond what is already verified.
+
+        GDN state independence across the two groups is preserved because
+        ``snapshot_gdn_state``/``restore_gdn_state`` already index by
+        physical slot (see their docstrings) -- restoring a recompute
+        slot's GDN state cannot disturb a full-accept slot's, even though
+        both slots' states live in the same underlying batched tensor and
+        were just updated by the SAME shared ``verify_batch`` forward call.
+
+        Returns a dict keyed by slot id, each value shaped exactly like
+        ``mtp_verify_and_commit``'s own return dict (plus ``next_anchor``/
+        ``next_draft_tokens``)."""
+        num_reqs = len(slots)
+        k = len(draft_tokens[slots[0]])
+        drafts = [[anchors[s]] + draft_tokens[s] for s in slots]
+        kv_lens_before = {s: self.slot_kv_len[s] for s in slots}
+        snapshots = {s: self.snapshot_gdn_state(s) for s in slots}
+
+        verify_logits, verify_hidden = self.verify_batch(
+            slots, drafts, [kv_lens_before[s] for s in slots], return_hidden=True
+        )
+
+        decisions = {}
+        for i, s in enumerate(slots):
+            row_logits = verify_logits[i * (k + 1) : (i + 1) * (k + 1)]
+            decisions[s] = determine_accept_reject(drafts[i], row_logits)
+
+        real_new_tokens = {s: [anchors[s]] + decisions[s]["committed"][:-1] for s in slots}
+        full_accept_slots = [s for s in slots if decisions[s]["num_accepted"] == k]
+        recompute_slots = [s for s in slots if decisions[s]["num_accepted"] != k]
+        real_new_hidden: dict[int, torch.Tensor] = {}
+
+        if full_accept_slots:
+            for s in full_accept_slots:
+                self.slot_kv_len[s] = kv_lens_before[s] + k + 1
+                i = slots.index(s)
+                real_new_hidden[s] = verify_hidden[i * (k + 1) : (i + 1) * (k + 1)]
+
+        for s in recompute_slots:
+            self.restore_gdn_state(s, snapshots[s])
+            self.slot_kv_len[s] = kv_lens_before[s]
+            committed_len = decisions[s]["num_accepted"] + 1
+            tokens = real_new_tokens[s]
+            _, hidden = self._forward_batch(
+                [s],
+                [tokens] if committed_len > 1 else tokens,
+                [kv_lens_before[s]],
+                qo_len=committed_len,
+                commit=True,
+                return_hidden=True,
+                fixed_kv_split_size=self.decode_fixed_kv_split_size,
+                fixed_max_num_splits=self.decode_fixed_max_num_splits,
+            )
+            real_new_hidden[s] = hidden
+
+        next_anchors = {s: decisions[s]["committed"][-1] for s in slots}
+        result: dict[int, dict] = {}
+
+        if full_accept_slots:
+            shifted = [real_new_tokens[s][1:] + [next_anchors[s]] for s in full_accept_slots]
+            hidden_concat = torch.cat([real_new_hidden[s] for s in full_accept_slots], dim=0)
+            start_pos_list = [self.slot_draft_sync_len[s] for s in full_accept_slots]
+            next_drafts_batch = self._mtp_sync_and_propose_batch(
+                full_accept_slots,
+                shifted,
+                hidden_concat,
+                start_pos_list,
+                num_new_tokens=k + 1,
+                k=k,
+            )
+            for s in full_accept_slots:
+                self.slot_pending_draft_tokens[s] = next_drafts_batch[s]
+                result[s] = {
+                    **decisions[s],
+                    "next_anchor": next_anchors[s],
+                    "next_draft_tokens": next_drafts_batch[s],
+                }
+
+        for s in recompute_slots:
+            committed_len = decisions[s]["num_accepted"] + 1
+            next_drafts = self._mtp_sync_and_propose(
+                s,
+                real_new_tokens[s][1:] + [next_anchors[s]],
+                real_new_hidden[s],
+                start_pos=self.slot_draft_sync_len[s],
+                num_new_tokens=committed_len,
+                k=k,
+            )
+            self.slot_pending_draft_tokens[s] = next_drafts
+            result[s] = {**decisions[s], "next_anchor": next_anchors[s], "next_draft_tokens": next_drafts}
+
+        return result
 
 
 class CapturedBatchDecodeGraph:

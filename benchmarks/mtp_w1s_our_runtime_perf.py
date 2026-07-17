@@ -12,19 +12,31 @@ synthetic-trace probe used, now applied to the REAL, already-verified
 MTP state machine on REAL data instead of a synthetic trace) so GPU-busy
 time can be compared directly against wall-clock time.
 
-This runtime processes slots ONE AT A TIME in round-robin (never batches
-multiple slots into one kernel launch -- see the design doc's step-6
-scope note) -- so "GPU busy% here" measures how much of THIS runtime's
-own wall-clock time is real GPU work vs. Python-dispatch/launch overhead
-for its ACTUAL current architecture, not a best-case synthetic scenario.
-Eager mode only (no CUDA graph capture) -- explicitly the point of
-comparison the coordinator asked for: does removing Python/vLLM
-scheduling overhead show an advantage even without the graph-capture
-optimization this project has not yet integrated into the real MTP
-accept/reject flow.
+By default this runtime processes slots ONE AT A TIME in round-robin
+(never batches multiple slots into one kernel launch) -- so "GPU busy%
+here" measures how much of THIS runtime's own wall-clock time is real GPU
+work vs. Python-dispatch/launch overhead for that architecture, not a
+best-case synthetic scenario. Eager mode only (no CUDA graph capture) --
+explicitly the point of comparison the coordinator asked for: does
+removing Python/vLLM scheduling overhead show an advantage even without
+the graph-capture optimization this project has not yet integrated into
+the real MTP accept/reject flow.
+
+``--batched`` (2026-07-17, cross-slot batching round): switches to the
+NEW ``mtp_prefill_batch``/``mtp_verify_and_commit_batch`` coordinator
+(``_run_batch_batched`` below) -- ONE shared kernel launch per round
+covering every concurrent slot (draft model included, not just target),
+instead of ``concurrency`` separate sequential single-slot calls. This is
+the direct re-measurement of whether real batching (as opposed to merely
+removing vLLM's own scheduling layer) closes the ~12.46x gap the
+single-slot round-robin path showed against native. Correctness of the
+batched coordinator itself is verified separately in
+``benchmarks/mtp_batch_verify_check.py`` -- this script only measures
+performance, it does not re-verify correctness.
 
 Usage:
     python -m benchmarks.mtp_w1s_our_runtime_perf --max-tokens 256 --concurrency 4 --fixture n128 --num-requests 16
+    python -m benchmarks.mtp_w1s_our_runtime_perf --max-tokens 256 --concurrency 4 --fixture n128 --num-requests 16 --batched
 """
 
 from __future__ import annotations
@@ -116,7 +128,101 @@ def _run_batch(torch, runner, prompts_batch: list[list[int]], target_output_len:
     return {"per_slot": per_slot, "ttft_s": ttft_s, "itl_samples": itl_samples}
 
 
-def _run_measurement(torch, runner, prompts: list[list[int]], max_tokens: int, concurrency: int, rep: int) -> dict:
+def _run_batch_batched(torch, runner, prompts_batch: list[list[int]], target_output_len: int) -> dict:
+    """2026-07-17 cross-slot-batched analogue of ``_run_batch``: ONE
+    ``mtp_prefill_batch`` call covering every slot in this request batch,
+    then a loop of ONE ``mtp_verify_and_commit_batch`` call per round
+    (shrinking the active-slot list as individual slots reach their own
+    ``target_output_len`` -- the SAME "mixed-stage" handling
+    ``mtp_verify_and_commit_batch`` itself supports internally, just at
+    the coarser "finished vs. still-generating" granularity here). GPU-busy/
+    wall time is bracketed at the BATCH-CALL level, not per-slot (a real
+    batched call is one shared kernel launch -- there is no per-slot
+    sub-interval to attribute it to individually, unlike the round-robin
+    path's naturally-serial single-slot calls)."""
+    num = len(prompts_batch)
+    slots = list(range(num))
+    for s in slots:
+        if runner.slot_kv_len[s] != 0:
+            runner.reset_slot(s)
+
+    committed_len = {s: 0 for s in slots}
+    per_slot = {s: {"num_drafts": 0, "num_draft_tokens": 0, "num_accepted_tokens": 0} for s in slots}
+    ttft_s = {}
+    itl_samples: list[float] = []
+    total_gpu_busy_s = 0.0
+    total_wall_s = 0.0
+
+    start_evt = torch.cuda.Event(enable_timing=True)
+    end_evt = torch.cuda.Event(enable_timing=True)
+    t0 = time.perf_counter()
+    start_evt.record()
+    prefill_result = runner.mtp_prefill_batch(slots, prompts_batch)
+    end_evt.record()
+    torch.cuda.synchronize()
+    t1 = time.perf_counter()
+    prefill_wall_s = t1 - t0
+    total_gpu_busy_s += start_evt.elapsed_time(end_evt) / 1000.0
+    total_wall_s += prefill_wall_s
+    for s in slots:
+        # Every slot in this batch gets its first token at the SAME real
+        # moment (one shared kernel launch) -- this identical-TTFT-across-
+        # the-batch result is an expected, correct property of real
+        # batching, not a measurement artifact.
+        ttft_s[s] = prefill_wall_s
+
+    anchors = {s: prefill_result[s]["anchor"] for s in slots}
+    drafts = {s: prefill_result[s]["draft_tokens"] for s in slots}
+
+    active = list(slots)
+    while active:
+        start_evt = torch.cuda.Event(enable_timing=True)
+        end_evt = torch.cuda.Event(enable_timing=True)
+        t0 = time.perf_counter()
+        start_evt.record()
+        decisions = runner.mtp_verify_and_commit_batch(
+            active, {s: anchors[s] for s in active}, {s: drafts[s] for s in active}
+        )
+        end_evt.record()
+        torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        round_wall_s = t1 - t0
+        total_gpu_busy_s += start_evt.elapsed_time(end_evt) / 1000.0
+        total_wall_s += round_wall_s
+
+        newly_finished = []
+        for s in active:
+            decision = decisions[s]
+            n_acc = decision["num_accepted"]
+            tokens_this_round = n_acc + 1
+            per_slot[s]["num_drafts"] += 1
+            per_slot[s]["num_draft_tokens"] += K
+            per_slot[s]["num_accepted_tokens"] += n_acc
+            committed_len[s] += tokens_this_round
+            # Per-stream ITL attribution: this round's shared wall-clock
+            # divided by THIS slot's own committed-token count -- matches
+            # how a real multi-tenant server's client-observed ITL would
+            # be measured (from the stream's perspective), regardless of
+            # the shared batched kernel launch underneath.
+            itl_samples.append(round_wall_s / tokens_this_round)
+            anchors[s], drafts[s] = decision["next_anchor"], decision["next_draft_tokens"]
+            if committed_len[s] >= target_output_len:
+                newly_finished.append(s)
+        for s in newly_finished:
+            active.remove(s)
+
+    return {
+        "per_slot": per_slot,
+        "ttft_s": ttft_s,
+        "itl_samples": itl_samples,
+        "batch_gpu_busy_s": total_gpu_busy_s,
+        "batch_wall_s": total_wall_s,
+    }
+
+
+def _run_measurement(
+    torch, runner, prompts: list[list[int]], max_tokens: int, concurrency: int, rep: int, batched: bool = False
+) -> dict:
     """ONE repetition of the full W1-S request set against an
     ALREADY-LOADED runner (no reload between reps -- reps are for
     repeated-measurement variance, not independent process launches;
@@ -133,13 +239,24 @@ def _run_measurement(torch, runner, prompts: list[list[int]], max_tokens: int, c
     num_batches = (len(prompts) + concurrency - 1) // concurrency
     for batch_idx, batch_start in enumerate(range(0, len(prompts), concurrency)):
         batch = prompts[batch_start : batch_start + concurrency]
-        out = _run_batch(torch, runner, batch, max_tokens)
+        out = _run_batch_batched(torch, runner, batch, max_tokens) if batched else _run_batch(torch, runner, batch, max_tokens)
         for s, stats in out["per_slot"].items():
             total_drafts += stats["num_drafts"]
             total_draft_tokens += stats["num_draft_tokens"]
             total_accepted += stats["num_accepted_tokens"]
-            total_gpu_busy_s += stats["gpu_busy_s"]
-            total_wall_s += stats["wall_s"]
+            if not batched:
+                # Single-slot path: each slot's own bracketed calls are
+                # genuinely additive (real, disjoint, serially-issued GPU
+                # work) -- summing per-slot is correct here.
+                total_gpu_busy_s += stats["gpu_busy_s"]
+                total_wall_s += stats["wall_s"]
+        if batched:
+            # Batched path: gpu_busy_s/wall_s are BATCH-LEVEL quantities
+            # (one shared kernel launch per round covering every active
+            # slot) -- summing them per-slot would double/quadruple-count
+            # the same interval, so pull the batch-level totals directly.
+            total_gpu_busy_s += out["batch_gpu_busy_s"]
+            total_wall_s += out["batch_wall_s"]
         all_ttfts.extend(out["ttft_s"].values())
         all_itls.extend(out["itl_samples"])
         elapsed = time.perf_counter() - t_start
@@ -177,7 +294,14 @@ def _run_measurement(torch, runner, prompts: list[list[int]], max_tokens: int, c
     }
 
 
-def _run_once(max_tokens: int, concurrency: int, fixture_key: str, num_requests: int | None, repeats: int) -> dict:
+def _run_once(
+    max_tokens: int,
+    concurrency: int,
+    fixture_key: str,
+    num_requests: int | None,
+    repeats: int,
+    batched: bool = False,
+) -> dict:
     import torch
 
     sys.path.insert(0, SM120_VLLM_INTEGRATION)
@@ -203,7 +327,10 @@ def _run_once(max_tokens: int, concurrency: int, fixture_key: str, num_requests:
     runner = DirectModelRunner(vllm_config, num_slots=concurrency, block_size=16, blocks_per_slot=2560)
     thermal_after_load = _gpu_thermal()
 
-    reps = [_run_measurement(torch, runner, prompts, max_tokens, concurrency, r + 1) for r in range(repeats)]
+    reps = [
+        _run_measurement(torch, runner, prompts, max_tokens, concurrency, r + 1, batched=batched)
+        for r in range(repeats)
+    ]
 
     return {
         "passed": True,
@@ -211,6 +338,7 @@ def _run_once(max_tokens: int, concurrency: int, fixture_key: str, num_requests:
         "max_tokens": max_tokens,
         "concurrency": concurrency,
         "k": K,
+        "batched": batched,
         "repeats": repeats,
         "reps": reps,
         "thermal_before_load": thermal_before_load,
@@ -227,9 +355,19 @@ def main() -> int:
     parser.add_argument("--fixture", choices=["n16", "n128"], default="n16")
     parser.add_argument("--num-requests", type=int, default=None)
     parser.add_argument("--repeats", type=int, default=1)
+    parser.add_argument(
+        "--batched",
+        action="store_true",
+        help="use the 2026-07-17 cross-slot batched MTP coordinator "
+        "(mtp_prefill_batch/mtp_verify_and_commit_batch, ONE shared kernel "
+        "launch per round across all concurrent slots) instead of the "
+        "original single-slot round-robin path.",
+    )
     args = parser.parse_args()
 
-    result = _run_once(args.max_tokens, args.concurrency, args.fixture, args.num_requests, args.repeats)
+    result = _run_once(
+        args.max_tokens, args.concurrency, args.fixture, args.num_requests, args.repeats, batched=args.batched
+    )
 
     import json
 
