@@ -3292,3 +3292,228 @@ new file `benchmarks/mtp_chunked_prefill_check.py` (the dedicated
 correctness test, committed per this project's standing convention of
 keeping tests that found and characterized real effects). `PROGRESS.md`
 updated with a pointer to this section.
+
+---
+
+## 20. Re-measuring 16K/c=4 with §19's chunked prefill: real, meaningful
+improvement, but does not close the gap (executed 2026-07-18)
+
+**Verdict: chunking + `--cudagraph` together (never previously combined)
+takes 16K/c=4 from 58.638 to 67.232 accepted tok/s (+14.7%), narrowing the
+gap to native (121.960, unchanged) from 2.080x to 1.814x slower. Real and
+worth keeping as the new best-known-configuration number for this cell,
+but this is a partial win, not a crossover** -- unlike the 64K/c=4 cell
+(§19.6), 16K/c=4 does not flip to "ours faster." Chunking's own
+correctness was already verified at exactly this shape+chunk_size in
+§19.3; this round adds the one untested combination (chunking WITH
+`--cudagraph`) and confirms by direct code reading, not just observation,
+that it introduces no new correctness risk (§20.3). The 4K/c=4 headline is
+confirmed unaffected, exactly as guaranteed by construction (§20.4).
+
+### 20.1 Methodology
+
+Task: re-measure the already-known 16K/c=4 residual gap (§14: 58.638
+accepted tok/s vs. native's 121.960, 2.080x slower, achieved via
+`--cudagraph` alone) now that chunked prefill (§19) exists, using the
+same value §19 actually built and measured with:
+`_DEFAULT_PREFILL_CHUNK_SIZE = 8192` (matches native's own
+`--max-num-batched-tokens` convention; at `prompt_len=16384` this is 2
+chunks, the exact configuration §19.3's own correctness check already
+exercised as "this round's production value").
+
+`benchmarks/mtp_w1s_our_runtime_perf.py` already has a `--chunk-size` CLI
+flag from §19 (default `None`, requires `--batched`) -- no script changes
+were needed. Ran the EXACT same command §14.5 used to establish the
+58.638 baseline, with `--chunk-size 8192` as the only addition (single
+rep, matching this cell's own established convention -- §13.6/§14.5 both
+used single rep here too, since one rep already takes ~30s wall +
+~90-100s model load and TTFT/throughput at this shape have shown low
+rep-to-rep variance in prior sections' data):
+
+```
+python -m benchmarks.mtp_w1s_our_runtime_perf --batched --cudagraph \
+    --chunk-size 8192 --fixture ctx16k --concurrency 4 \
+    --num-requests 8 --max-tokens 256
+```
+
+`CUDA_HOME`/`PATH` pinned to the 13.3 toolkit throughout. GPU/process
+idleness verified via `nvidia-smi`/`pgrep` immediately before every run in
+this section (0% util, ~1974-1979 MiB baseline, no stray processes each
+time) -- never assumed from memory. Ran strictly one GPU-heavy process at
+a time.
+
+### 20.2 Result
+
+| | unchunked + `--cudagraph` (§14.5, established baseline) | chunked (`chunk_size=8192`) + `--cudagraph` (this section) | delta |
+|---|---:|---:|---:|
+| accepted tok/s (ours) | 58.638 | **67.232** | **+14.66%** |
+| native tok/s (unchanged) | 121.960 | 121.960 | -- |
+| **gap (native/ours)** | **2.080x slower** | **1.814x slower** | narrows |
+| TTFT mean | 12.458s | **10.990s** | -10.8% |
+| `gpu_busy_pct` | 90.76% | 99.83% | |
+| `draft_acceptance_rate_pct` | 71.94% | 75.489% | see §20.3 note |
+| GPU memory (nvidia-smi, post-rep sample) | 64050/97887 MiB (65.4%, this was a genuine peak) | 53125/97887 MiB (54.3%, single post-rep sample, NOT a continuous-peak trace -- see caveat below) | lower, consistent with §19.6's memory-bounding finding |
+
+Full raw output (`total_committed_tokens=2060`, `num_accepted_tokens=1429`,
+`num_drafts=631`, `wall_s_e2e=30.640s`) kept in the session scratchpad.
+
+**Reading the result**: chunking recovers roughly the same *shape* of win
+§14.5 found for adding `--cudagraph` to the unchunked path (a real,
+double-digit-percent throughput gain from a pure configuration change,
+zero code touched) -- but a materially smaller one (+14.7% here vs. that
+round's +26.4%), and the two do NOT compound to close the gap: 16K/c=4
+remains **1.814x slower than native**, comfortably outside this project's
+1.3x flag threshold. This is consistent with §14.6's own diagnosis that
+the residual gap here is dominated by genuine near-linear-scaling compute
+in the single-shot-per-chunk forward pass (attention + FFN over real
+tokens), not a fixable inefficiency -- chunking changes memory locality
+and allocator pressure (plausibly explaining the TTFT drop: recall §13.2's
+finding that the SAME-sized second `compute_logits` allocation took 14x
+longer than the first purely from near-OOM allocator pressure; chunking's
+smaller per-call working set very plausibly reduces this same class of
+overhead) but does not reduce the total FLOPs a 16384-token causal
+prefill forward must do, so it was never expected to close a
+compute-bound gap the way it closed a *memory-capacity*-bound gap at 64K.
+
+**GDN acceptance-rate note (`draft_acceptance_rate_pct` 71.94% ->
+75.489%)**: expected, not a red flag. §19.3 already found and root-caused
+this exact effect (GDN `conv_state`/`ssm_state`'s extra bf16 round-trip at
+each external chunk boundary), characterized it as producing occasional
+benign near-tie accept/reject flips, and confirmed it never changes a
+greedy decision outside the already-established near-tie noise floor.
+This run's different acceptance rate is that same, already-characterized,
+already-accepted phenomenon showing up again at a new
+configuration -- not a new finding.
+
+### 20.3 Correctness confidence: no new joint test built, but verified sufficient by code reading + regression battery
+
+Per this task's own instruction, a full from-scratch correctness re-test
+was not required, but "passed: true" needed scrutiny before being trusted.
+**It should not be trusted at face value**: reading
+`benchmarks/mtp_w1s_our_runtime_perf.py`'s own `_run_once` (`:412-413`)
+shows `"passed": True` is an UNCONDITIONAL hardcoded literal in the
+returned dict -- not derived from any check on the generated tokens,
+acceptance behavior, or anything else. The script's own module docstring
+already says as much: "this script only measures performance, it does not
+re-verify correctness." In this script, `"passed": true` means only "the
+process ran to completion without an uncaught exception" -- a weak
+liveness signal, not a correctness one. Real correctness confidence for
+this section rests on the three points below, not on that field.
+
+1. **§19.3's dedicated test already covers this exact shape+chunk_size**:
+   `mtp_chunked_prefill_check.py` prefills the SAME 16384-token prompt with
+   `chunk_size=8192` (2 chunks, explicitly documented there as "this
+   round's production value") and found exact anchor/draft token matches
+   against both the non-chunked path and an independent singular-mechanism
+   reference (margin=0.0), plus a clean 20-round multi-round continuation
+   check and a second natural-language-prompt check. That test's own
+   runner, however, is constructed with `enable_cudagraph=False`
+   (confirmed directly: `grep`-ing `mtp_chunked_prefill_check.py` for
+   `DirectModelRunner(` shows `enable_cudagraph=False` at `:401`) -- so it
+   does not, by itself, cover this section's specific new combination.
+2. **The one genuinely new combination (chunking WITH `--cudagraph`) was
+   checked by direct code reading, not assumed**: `mtp_prefill_batch`'s
+   chunked loop (`runtime/direct_model_runner.py:2784` onward) never
+   references `self.enable_cudagraph` anywhere -- chunking's own control
+   flow is unconditional on that flag. Separately, the CUDA-graph
+   draft-step branch's own eligibility gate (`:2530-2532`) requires
+   `self.enable_cudagraph and ... and num_new_tokens_list[0] <=
+   _MAX_DECODE_QO_LEN` (`=16`) -- and every chunk in this section's run
+   has `qo_len=8192`, five hundred times over that bound, so the graph
+   branch is PROVABLY unreachable for any chunk, exactly mirroring §14.5's
+   already-established finding that prefill (chunked or not) is always
+   eager. This means: (a) chunked-prefill's own correctness, established
+   in §19.3 with `enable_cudagraph=False`, is unaffected by subsequently
+   turning `--cudagraph` on, because the prefill code path taken is
+   IDENTICAL either way; and (b) the CUDA-graph decode/verify round loop's
+   own correctness (independently, extensively verified elsewhere,
+   including `mtp_verify_cudagraph_check.py`'s explicit
+   graph-vs-eager-content-equality check) is unaffected by how prefill
+   produced the state it consumes -- the round loop only reads
+   `slot_kv_len`/`slot_pending_draft_tokens`/GDN state, it does not care
+   whether chunked or single-shot prefill wrote them. The two mechanisms
+   are architecturally disjoint call paths, not a new interaction --
+   confirmed from source, not inferred from the benchmark's own
+   `"passed": true`.
+3. **Full 4-suite regression battery re-run fresh, all 4 PASS**, GPU
+   verified idle before/after, one process at a time:
+
+   | Suite | Result |
+   |---|---|
+   | `mtp_gdn_rollback_check.py --repeat 3` | **3/3 PASS** |
+   | `mtp_batch_verify_check.py` | **PASS** (top-level `passed: true`) |
+   | `mtp_ragged_recompute_verify_check.py` | **PASS** (top-level `passed: true`) |
+   | `mtp_verify_cudagraph_check.py` | **PASS** (top-level `passed: true`) |
+
+   None of these four suites pass `chunk_size` to their own
+   `DirectModelRunner` construction (same as §19.4 already found), so this
+   is confirmatory of general runtime health, not a targeted joint test --
+   consistent with point 2's architectural-orthogonality argument being
+   the load-bearing evidence, not this battery.
+
+**Net assessment**: correctness confidence here is HIGH but rests on
+*compositional* reasoning (two independently-verified mechanisms proven
+to occupy disjoint code paths) rather than one dedicated joint test. If a
+fully airtight guarantee is ever wanted, the cheap follow-up is extending
+`mtp_chunked_prefill_check.py` to also construct its runner with
+`enable_cudagraph=True` and re-run its existing checks -- not attempted
+this round, correctly out of scope for a measurement task.
+
+### 20.4 4K/c=4: confirmed no-op when chunk_size exceeds prompt_len, by construction AND by measurement
+
+Read `mtp_prefill_batch`'s own branch condition first
+(`runtime/direct_model_runner.py:2744`): `if chunk_size is None or
+prompt_len <= chunk_size:` takes "the prior implementation... byte-for-byte"
+(the method's own docstring, `:2745-2749`). At the 4K/c=4 shape
+(`prompt_len=4096`), passing `--chunk-size 8192` (`8192 > 4096`) hits this
+EXACT branch -- not merely an equivalent result, the literal same code
+object executes. This guarantees zero effect by construction, before any
+measurement.
+
+Confirmed empirically anyway (cheap insurance, single rep):
+
+```
+python -m benchmarks.mtp_w1s_our_runtime_perf --batched --cudagraph \
+    --chunk-size 8192 --fixture n16 --concurrency 4 --max-tokens 256
+```
+
+Result: **165.364 accepted tok/s** (vs. the most recent established
+baseline **165.730**, §19.5 -- noise-level, not a regression),
+`total_committed_tokens=4116` and `draft_acceptance_rate_pct=
+70.29204431017119%` **bit-identical to every prior measurement in this
+project's history** -- confirming, as guaranteed, that leaving
+`--chunk-size 8192` on at a shape below the chunk size is a true no-op,
+both structurally and empirically.
+
+### 20.5 Bottom line
+
+- **16K/c=4 chunked+cudagraph: 67.232 accepted tok/s, gap to native
+  narrows from 2.080x to 1.814x slower** (+14.66% throughput from adding
+  chunking on top of the already-established `--cudagraph` baseline).
+- **This is a real, meaningful improvement, but not a crossover.** Unlike
+  64K/c=4 (§19.6, where chunking flipped the gap to "ours 1.29x faster"),
+  16K/c=4 stays solidly slower than native and outside the 1.3x flag. The
+  residual gap remains what §14.6 already diagnosed: genuine near-linear
+  compute cost in the prefill forward pass, which chunking does not
+  reduce (it only bounds peak memory/working-set size, which helps
+  allocator pressure and TTFT but not total FLOPs).
+- **Correctness**: no new joint (chunk_size + cudagraph) dedicated test was
+  built, but the combination is verified safe by (a) §19.3's existing
+  exact-match test already covering this exact shape+chunk_size
+  (cudagraph off), (b) direct code reading proving chunked prefill and
+  CUDA-graph decode/verify occupy disjoint, non-interacting code paths at
+  every production chunk size, and (c) a fresh, clean 4-suite regression
+  battery. The benchmark's own `"passed": true` field is NOT a correctness
+  signal for this script -- it is a hardcoded literal -- and should not be
+  cited as one going forward.
+- **4K/c=4 headline: confirmed unaffected**, both by direct code reading
+  (the chunked branch is provably unreachable when `chunk_size >=
+  prompt_len`) and by a fresh measurement matching the established
+  baseline and bit-identical acceptance/commit counts.
+- **No production code changed this round** -- this was purely a
+  measurement task using the `--chunk-size` flag §19 already built.
+
+**Files**: no production files modified. Ad hoc benchmark JSON outputs and
+the regression-battery log kept in the session scratchpad (measurement
+artifacts, not project source). `PROGRESS.md` updated with a pointer to
+this section.

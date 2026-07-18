@@ -4,6 +4,39 @@ Updated: 2026-07-19
 
 ## Completed
 
+### 16K/c=4 re-measured with chunked prefill: real +14.7% gain, gap narrows 2.080x -> 1.814x, but does NOT close (2026-07-19)
+
+Follow-up to the chunked-batched-prefill entry directly below: re-measured
+the already-known 16K/c=4 residual gap (58.638 accepted tok/s vs. native's
+121.960, 2.080x slower, established with `--cudagraph` alone) now that
+chunked prefill exists, adding `--chunk-size 8192`
+(`_DEFAULT_PREFILL_CHUNK_SIZE`, 2 chunks at this shape) on top of the same
+`--cudagraph` baseline -- the one combination not yet measured. **Result:
+67.232 accepted tok/s, gap narrows to 1.814x slower** (+14.66% throughput,
+TTFT -10.8%) -- a real, meaningful improvement, but **not a crossover**
+the way chunking produced at 64K/c=4: 16K/c=4 stays well outside this
+project's 1.3x flag. Consistent with §14.6's diagnosis that this cell's
+residual gap is genuine near-linear-scaling compute cost in the prefill
+forward pass, which chunking bounds peak memory/working-set for but does
+not reduce in total FLOPs.
+
+Correctness: no new joint (chunk_size + cudagraph) test was built, but the
+combination is verified safe by (a) §19.3's existing exact-match test
+already covering this exact shape+chunk_size with cudagraph off, (b)
+direct code reading proving chunked prefill (`mtp_prefill_batch`'s chunked
+loop never references `self.enable_cudagraph`) and CUDA-graph decode/verify
+(whose graph-eligibility gate requires `qo_len <= 16`, never true for any
+8192-token chunk) occupy disjoint, non-interacting code paths, and (c) a
+fresh 4-suite regression battery, all PASS. **Flagged explicitly**: this
+benchmark script's own `"passed": true` field is a hardcoded literal, not a
+real correctness check (confirmed by reading `_run_once`'s source) -- do
+not cite it as a correctness signal. 4K/c=4 headline confirmed unaffected
+(both by code reading -- the chunked branch is provably unreachable when
+`chunk_size >= prompt_len` -- and by a fresh matching measurement,
+bit-identical acceptance/commit counts). No production code changed --
+pure measurement, using the `--chunk-size` flag §19 already built. Full
+writeup: `notes/2026-07-18-session-review-and-next-steps.md` section 20.
+
 ### Chunked batched prefill: built, verified, and c=4/64K -- previously categorically blocked -- now real and 1.29x FASTER than native (2026-07-19)
 
 Closes the two structurally-missing pieces §18.6 of `notes/2026-07-18-
