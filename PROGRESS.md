@@ -4,6 +4,48 @@ Updated: 2026-07-18
 
 ## Completed
 
+### Phase D1 second follow-up, residual ~2.63x 16K/c=4 gap root-caused (2026-07-18) — no code bug, an asymmetric benchmark config (missing `--cudagraph`)
+
+The prior D1-followup entry below narrowed 16K/c=4 from 4.85x to 2.63x
+slower than native but left that residual gap unexplained. This round
+checked five candidate mechanisms with real `nsys` profiling (methodology:
+notes/2026-07-18-session-review-and-next-steps.md section 14.1) rather than
+guessing. Four are refuted or shown non-dominant: prefill's own forward
+pass scales only ~17-18% worse than linear (not a quadratic blowup) for a
+4x token-count increase; the already-built, already-correctness-tested
+"v2" prefill kernel was tried and is empirically ~4-16% *slower* (not
+faster) at this runtime's real batched/paged/concurrency=4 shape,
+contradicting its own validation claim (measured at a different shape);
+the decode/verify round-loop is nearly flat across kv_len (1.06x for a 4x
+kv_len increase, since the fixed-from-capacity split-KV sizing gives
+longer-context slots proportionally more real parallelism); native's own
+scheduler is confirmed (via vLLM source) to use the identical non-async
+`Scheduler` this runtime does, so there's no scheduling-overlap advantage
+on native's side either.
+
+The one REAL, substantial factor: **the 16K/c=4 number was never measured
+WITH `--cudagraph`**, unlike the 4K/c=4 "parity" headline, which always
+uses it. Re-running the exact same benchmark with `--cudagraph` added (a
+pure configuration change, zero code touched) gives **58.638 accepted
+tok/s** (up from 46.394, +26.4%), narrowing the gap to native (121.960,
+unchanged) from **2.629x to 2.080x**. TTFT is unaffected (12.458s vs
+12.5s, as expected -- prefill is confirmed eager at every context length,
+never graph-captured). GPU memory peak 64050/97887 MiB (65.4%, no near-OOM
+concern). **No file under `runtime/` was modified** -- this was a
+benchmark-configuration correction, not a code fix; both cudagraph support
+and the v2 kernel already existed and worked. Full regression suite (4/4
+PASS, including `mtp_verify_cudagraph_check.py` with all 4 coverage flags
+true) confirms current HEAD is unaffected; 4K/c=4 headline is unaffected by
+construction (no code changed). The residual ~2.08x gap is a genuine,
+directly-profiled, near-linear-scaling compute cost in the single-shot
+prefill forward pass, not further fixable by either available attention
+kernel -- real prefill chunking (matching native's `max_num_batched_tokens`)
+is the only remaining lever, correctly left as a scoped recommendation for
+future work (structurally bigger/riskier, not attempted). Two new
+diagnostics committed: `benchmarks/d1_prefill_shape_nsys_diag.py`,
+`benchmarks/d1_decode_round_kvlen_diag.py`. Full writeup: notes/2026-07-18-
+session-review-and-next-steps.md section 14.
+
 ### Phase D1 follow-up, 16K/c=4 root-caused and fixed (2026-07-18) — wasted full-position vocab-head projection, not lack of chunking
 
 The prior D1 sweep entry below flagged 16K/c=4 as 4.85x slower than native

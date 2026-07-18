@@ -1500,3 +1500,315 @@ was scoped to the CONFIRMED, dominant, safely-opt-in-fixable root cause;
 the residual gap is real but smaller (2.63x, not 4.85x) and its own root
 cause is not yet confirmed by direct profiling -- recommended as the next
 D1 follow-up if pursued, not forced here.
+
+---
+
+## 14. D1 second follow-up: the residual ~2.63x gap, root-caused (executed 2026-07-18)
+
+**Verdict: no single bug. Five candidate mechanisms were checked with real
+profiling evidence, not assumption; four are refuted or shown negligible,
+and one -- an asymmetric benchmark configuration (16K/c=4 was never measured
+WITH `--cudagraph`, unlike the 4K/c=4 "parity" headline, which always uses
+it) -- is real and, once corrected, recovers a substantial fraction of the
+gap: 16K/c=4 goes from 46.394 to 58.638 accepted tok/s (+26.4%), narrowing
+the gap to native (121.960, unchanged) from 2.629x to 2.080x. The remaining
+~2.08x is a genuine, profiled, near-linear-scaling compute cost (prefill's
+own forward pass), not a further bug -- see 14.6 for why this is not chased
+further this round.**
+
+### 14.1 Methodology
+
+Reused this project's own Phase-0 nsys gap-ledger convention (notes/2026-
+07-17-post-ragged-round-next-steps.md section 7): `nsys profile -c
+cudaProfilerApi --capture-range-end=stop --trace=cuda,nvtx,osrt`, `nsys
+export --type sqlite`, then direct SQL against `CUPTI_ACTIVITY_KIND_KERNEL`/
+`_MEMCPY` and `NVTX_EVENTS` (not GUI eyeballing). `CUDA_HOME`/`PATH` pinned
+to the 13.3 toolkit throughout; GPU/process idleness verified via
+`nvidia-smi`/`pgrep`/`ps` immediately before every run, never assumed.
+
+Two new diagnostics (both committed, following this project's convention of
+keeping diagnostics that found real, quantified findings):
+
+- `benchmarks/d1_prefill_shape_nsys_diag.py`: calls the real, unmodified
+  `mtp_prefill_batch` at BOTH ctx16k (slots 0-3) and ctx4k (slots 4-7) in
+  ONE process/ONE model load (avoids a second ~90s cold-start reload),
+  each call under its own top-level NVTX range plus per-call sub-ranges
+  (`target_model.forward`/`compute_logits`, `draft_model.forward`/
+  `compute_logits`, same monkey-patch technique
+  `mtp_prefill_batch_memory_diag.py` established) -- lets the kernel-family
+  ledger be sliced per shape without editing `direct_model_runner.py`.
+- `benchmarks/d1_decode_round_kvlen_diag.py`: after prefilling both slot
+  groups, runs N real `mtp_verify_and_commit_batch` rounds (organic,
+  feeding each round's real anchor/draft output into the next, exactly
+  like `mtp_w1s_our_runtime_perf.py`'s own `_run_batch_batched`) on each
+  group independently, timing every round, to isolate whether the
+  decode/verify round-loop itself scales with kv_len.
+
+All runs used the real production shape: concurrency=4, `unsloth/Qwen3.6-
+27B-NVFP4`, `kv_cache_dtype=fp8_e4m3`, `SM120_GQA_USE_V2_DECODE_KERNEL=1`
+(this project's own established convention for a same-kernel comparison).
+
+### 14.2 Hypothesis 1 (compute scaling worse than linear): mostly refuted for the forward pass as a whole, confirmed but non-dominant for attention specifically
+
+Direct nsys measurement of the real `mtp_prefill_batch` call, same process,
+same model load:
+
+| | ctx16k (qo_len=16384) | ctx4k (qo_len=4096) | ratio | token-count ratio |
+|---|---:|---:|---:|---:|
+| `target_model.forward` wall | 12.094s | 2.566s | **4.71x** | 4.0x |
+| `mtp_prefill_batch` total wall | 12.627s | 2.695s | **4.69x** | 4.0x |
+
+Only ~17-18% worse than perfectly-linear scaling for a 4x token-count
+increase -- NOT a dramatic quadratic blowup. Kernel-family breakdown
+(`CUPTI_ACTIVITY_KIND_KERNEL`, classified by kernel name) of the SAME two
+calls:
+
+| kernel family | ctx16k ms (% of wall) | ctx4k ms (% of wall) | ratio |
+|---|---:|---:|---:|
+| GEMM/FFN (`device_kernel`) | 5787.2 (45.8%) | 1370.8 (50.9%) | 4.22x |
+| **attention** (`flash_attn_fwd_kernel_fp8kv`, 16-17 launches) | **2009.0 (15.9%)** | **136.9 (5.1%)** | **14.68x** |
+| GDN/FLA | 842.9 (6.7%) | 205.9 (7.6%) | 4.09x |
+| elementwise/norm/misc | 2835.7 (22.5%) | 694.8 (25.8%) | 4.08x |
+| memcpy | 144.7 (1.1%) | 32.9 (1.2%) | 4.40x |
+| no-kernel/no-memcpy gap | 313.8 (2.5%) | 86.3 (3.2%) | 3.64x |
+
+The prefill NVTX range is **96.4% kernel-active** at ctx16k (96.4%
+at ctx4k too) -- confirms prefill itself is essentially 100% real
+GPU-bound compute at BOTH shapes, not host-dispatch-bound (unlike the OLD
+decode/verify-round ledger in section 7, which found ~90% of round wall
+time was host-side gap). This directly refutes hypothesis 4 (host-side
+metadata-building Python loops scaling badly) for the prefill call: the
+gap fraction barely changes between shapes (2.5% vs 3.2%) and is tiny in
+absolute terms either way.
+
+The attention kernel's own time DOES scale close to quadratically (14.68x
+for a 4x token-count increase, consistent with causal self-attention's
+inherent O(L^2) FLOPs -- expected, and equally unavoidable for native,
+since chunking a causal prefix-attention computation does not change its
+total FLOP count, already established in section 13.3). Its RELATIVE
+weight in the whole forward pass triples (5.1% -> 15.9%), but GEMM/FFN
+(which scales near-linearly, as expected since FFN cost is per-token) still
+dominates at both shapes -- so attention's disproportionate growth is real
+but is not, by itself, the dominant driver of the forward pass's overall
+(near-linear) scaling behavior.
+
+### 14.3 Hypothesis 3 (attention kernel dispatch): the already-built "v2" prefill kernel was tried and empirically REFUTED as a fix for this shape
+
+Source reading first: `SM120GQAImpl.forward()` (`vllm/v1/attention/backends/
+sm120_gqa.py`, confirmed identical to this project's own reference copy at
+`sm120-flash-attention/vllm_integration/sm120_gqa_snapshot/sm120_gqa.py`)
+routes `is_decode=False` calls (i.e., every real `mtp_prefill_batch`
+target-model forward, regardless of prompt length -- `decode_qo_len` is
+ALWAYS 0 when `is_decode=False`) to `flash_attn_sm120_fp8_kv_paged` (the
+"general" kernel) UNLESS `SM120_GQA_USE_V2_PREFILL_KERNEL=1`, which this
+project's runtime never sets (confirmed: `grep`-ing every benchmark script
+for `SM120_GQA_USE_V2_PREFILL_KERNEL` returns zero hits, unlike
+`SM120_GQA_USE_V2_DECODE_KERNEL=1`, set in ~30 scripts). The module
+comment claims the v2 kernel (`flash_attn_sm120_fwd_prefill_v2_fp8kv_paged`)
+is "verified 11.7-15.1% faster than native FlashInfer at the dense/
+fixed-shape vertical slice" -- a real, plausible-looking lever.
+
+**Correctness pre-check** (required before considering enabling it): ran
+all 3 of that kernel's existing standalone correctness scripts
+(`kernel/tests/test_prefill_v2_correctness.py`,
+`test_prefill_v2_causal_probe.py`, `test_prefill_v2_paged.py`) fresh on
+this machine -- **38/38 cases PASS** (cosine >0.999 vs. F.sdpa throughout),
+including the exact production shape (QH=24/KVH=4, head_dim=256,
+page_size=16 AND page_size=784, varlen batches, chunked-prefill-
+continuation, causal-mask signal probes at page/tile boundaries).
+
+**Performance measurement** (`d1_prefill_shape_nsys_diag.py` re-run with
+`SM120_GQA_USE_V2_PREFILL_KERNEL=1`, log-confirmed via `sm120_gqa.py:990
+"v2 prefill kernel path HIT"`, same shape, same process pattern):
+
+| | general kernel (baseline) | v2 kernel | delta |
+|---|---:|---:|---:|
+| `target_model.forward`, ctx16k | 12.094s | 12.644s | **+4.5% slower** |
+| `target_model.forward`, ctx4k | 2.566s | 2.651s | **+3.3% slower** |
+| attention kernel time, ctx16k (nsys) | 2009.0ms (`flash_attn_fwd_kernel_fp8kv`) | 2333.0ms (`flash_attn_prefill_v2_fp8kv_paged`) | **+16.1% slower** |
+
+**The v2 kernel is empirically slower, not faster, at this runtime's real
+batched/paged/`page_size=16`/concurrency=4 shape** -- directly contradicting
+its own validation claim, which was evidently measured at a different
+(likely single-request, larger-page_size, "dense/fixed-shape vertical
+slice") configuration that does not generalize to ours. Reported honestly
+as a dead end for THIS shape; **not enabled** -- no change made to any
+`SM120_GQA_USE_V2_PREFILL_KERNEL` default.
+
+### 14.4 Hypothesis 3b (decode/verify round-loop scaling with kv_len): measured directly, found flat
+
+`d1_decode_round_kvlen_diag.py`, 20 real organic rounds per group, same
+process, same model load, no cudagraph (isolating this specific
+mechanism):
+
+| | kv_len~16384 | kv_len~4096 | ratio |
+|---|---:|---:|---:|
+| mean round time (`mtp_verify_and_commit_batch`) | 127.418ms | 120.164ms | **1.060x** |
+
+Essentially flat for a 4x kv_len increase. Source-grounded explanation:
+`self.decode_fixed_kv_split_size`/`max_num_splits` (`__init__`,
+`runtime/direct_model_runner.py:1013-1016`) are derived ONCE from this
+runner's `blocks_per_slot * block_size` capacity ceiling (targeting 64
+splits/request), NOT from each call's live kv_len -- so a LONGER-context
+slot actually gets MORE real split-KV parallelism (at kv_len=16384,
+`ceil(16384/640)=26` real splits; at kv_len=4096, `ceil(4096/640)=7`),
+which roughly compensates for its larger per-request attention cost. The
+decode/verify loop (post-Phase-2-rewrite spec-decode-GDN mechanism) is
+NOT a source of disproportionate 16K-specific slowdown when measured in
+eager mode.
+
+### 14.5 Hypothesis 2/E (CUDA-graph asymmetry): the real, dominant, verified factor
+
+Source reading confirmed: `mtp_prefill_batch` NEVER takes the captured-graph
+branch, at ANY context length -- `_mtp_sync_and_propose_batch`'s own
+graph-eligibility gate requires `num_new_tokens_list[0] <= _MAX_DECODE_QO_LEN
+(=16)` (`direct_model_runner.py:2377-2381`), and `mtp_prefill_batch` always
+calls it with `num_new_tokens=prompt_len` (4096 or 16384, both `>>16`) -- so
+prefill is correctly, symmetrically eager at BOTH shapes; this is not where
+the asymmetry lives.
+
+The real asymmetry is in how the two numbers being compared were actually
+produced: the 4K/c=4 "parity" headline (section 11.7/13.7) is always run
+with `--cudagraph` (`mtp_w1s_our_runtime_perf.py --batched --cudagraph
+...`), which captures/replays the DECODE/VERIFY round loop via
+`CapturedBatchDecodeGraph`/`CapturedMTPDraftStepGraph`. The 16K/c=4 number
+this doc has reported so far (both the original 4.85x and the follow-up
+2.63x) was run WITHOUT `--cudagraph` (section 12.1/13.6 explicitly say so).
+This is an asymmetric methodology, not a native-vs-ours architectural gap.
+
+**Direct re-measurement**, same command as the existing 16K/c=4 line
+(`mtp_w1s_our_runtime_perf.py --batched --fixture ctx16k --concurrency 4
+--num-requests 8 --max-tokens 256`) with `--cudagraph` added (the ONLY
+difference -- `num_slots` auto-doubles to 8 per the script's own existing
+`num_slots = 2 * concurrency if cudagraph else concurrency` logic, single
+rep, GPU verified idle before):
+
+| | without `--cudagraph` (prior number, section 13.6) | with `--cudagraph` (this section) |
+|---|---:|---:|
+| accepted tok/s (ours) | 25.137 → 46.394 (post D1-fix) | **58.638** |
+| native tok/s (unchanged) | 121.960 | 121.960 |
+| **gap (native/ours)** | **2.629x slower** | **2.080x slower** |
+| TTFT mean | 12.5s | **12.458s** (unaffected, as expected -- prefill is eager at both) |
+| `gpu_busy_pct` | 90.83% | 90.76% |
+| GPU memory peak (nvidia-smi) | 54216/97887 MiB (55.4%) | 64050/97887 MiB (65.4%, no near-OOM concern) |
+| draft_acceptance_rate_pct | (not directly comparable, different rep) | 71.94% (plausible, consistent with the ~70-72% range this project's history reports) |
+
+**+26.4% throughput** (46.394 → 58.638 tok/s) from a pure configuration
+change (no code touched) -- the SAME `--cudagraph` flag the 4K/c=4 headline
+already relies on. Back-derived decomposition: since TTFT (~12.46s,
+cudagraph-invariant) dominates total wall time at this shape (~35s for 2
+batches of 4 requests), the round-loop's own internal speedup is actually
+much larger than +26% in isolation -- round-loop-only time (total wall
+minus 2x TTFT) drops from **~19.3s to ~10.1s** across the 2 batches, close
+to a 2x improvement, consistent with cudagraph eliminating most of the
+per-round Python/launch-dispatch gap this project's Phase-0 ledger (section
+7.4) already quantified for the (pre-Phase-2) round mechanism -- it is
+diluted to +26% overall only because prefill/TTFT, which cudagraph cannot
+touch, is the larger share of wall time at 16K specifically (unlike at 4K,
+where TTFT is a much smaller fraction of total wall time, so the same
+round-loop speedup shows up as a smaller relative contribution to the
+already-near-parity 4K number).
+
+Hypothesis E (native's scheduler giving it a compute/dispatch overlap
+advantage) was separately checked and refuted directly from vLLM source:
+`vllm/config/scheduler.py`'s `SchedulerConfig.get_scheduler_cls()` selects
+`AsyncScheduler` only `if self.async_scheduling` (truthy); native's own
+`launch_test_server.py` never sets `async_scheduling`, so it stays at its
+default `None` (falsy) and native resolves to the SAME synchronous
+`Scheduler` this runtime's `build_vllm_config` explicitly selects
+(`async_scheduling=False`). No asymmetry here -- both sides run the
+identical (non-async) scheduling model.
+
+### 14.6 What remains open: the residual ~2.08x gap, and why it is not chased further this round
+
+After the cudagraph correction, the remaining ~2.08x gap is dominated by
+the prefill/TTFT cost itself (~12.46s, of which 12.09-12.64s is
+`target_model.forward`'s real compute, directly profiled in 14.2-14.3 to
+scale close to linearly with token count -- not a bug -- with the one
+concretely-available alternative kernel (v2 prefill) directly measured to
+be SLOWER, not faster, at this shape). There is no further low-risk,
+bounded lever identified by this round's profiling: both kernel-dispatch
+alternatives available today (general vs. v2) were tried; host-side
+metadata construction and the decode/verify round loop were both directly
+measured and ruled out as disproportionate-at-16K factors; native's
+scheduling model was confirmed identical, not more overlapped.
+
+The one remaining, NOT-yet-tried lever is the same one section 13.8 already
+flagged and declined to attempt: real host-side CHUNKING of
+`mtp_prefill_batch`'s single giant forward call (e.g. into 2048-token
+pieces, matching native's own `max_num_batched_tokens`). This round's own
+measurements sharpen why this is genuinely uncertain rather than a likely
+win: chunking would not reduce total FLOPs (section 13.3), and this
+round's own profiling shows the forward pass ALREADY scales close to
+linearly with token count with no evidence of a fixable inefficiency at
+the current single-shot granularity -- so chunking's plausible benefit, if
+any, would have to come from a qualitatively different mechanism (e.g.
+overlapping host-side dispatch of chunk N+1 with GPU execution of chunk N,
+or reduced peak working-set enabling better cache locality) rather than
+"removing waste," and is unconfirmed by any measurement in this round. It
+is also, as section 13.8 already noted, a materially larger and riskier
+change (correct incremental `kv_len`/position bookkeeping across chunks
+for BOTH the target and draft models, causal-mask correctness at chunk
+boundaries, its own dedicated correctness re-validation) than anything
+attempted this round -- correctly out of scope per this task's own
+structural-change boundary, recommended as the next D1 follow-up if ever
+pursued.
+
+### 14.7 What was changed, and verification
+
+**No file under `runtime/` was modified.** This investigation found no
+code bug in the current HEAD -- both CUDA-graph support and the v2 prefill
+kernel already existed, already worked correctly, and were already
+covered by existing tests; the gap was a previously-unexamined,
+undocumented ASYMMETRY in how the 16K/c=4 shape was being benchmarked
+relative to the 4K/c=4 headline (methodology, not implementation). The
+corrective action is: **future context-length sweeps of this shape should
+use `--cudagraph`**, matching the 4K/c=4 headline's own established
+convention, and the 58.638 tok/s / 2.080x-gap number (not 46.394 / 2.629x)
+is now this project's best-known, correctly-configured result for 16K/c=4.
+
+Two new diagnostic scripts added and committed (`benchmarks/
+d1_prefill_shape_nsys_diag.py`, `benchmarks/d1_decode_round_kvlen_diag.py`),
+following this project's established convention of keeping diagnostics
+that produced real, quantified findings.
+
+**Verification** (full standing rigor, per this task's own instruction):
+
+- **4K/c=4 headline: no regression, because no code changed.** Since zero
+  lines of `runtime/direct_model_runner.py` (or any other production file)
+  were touched, the previously-verified 147.656 tok/s mean (section 13.7,
+  3 reps) is mathematically unaffected -- re-running it would exercise a
+  byte-identical code path. Not re-run this round to conserve GPU time for
+  the new measurements above; flagged explicitly rather than silently
+  assumed.
+- **Full regression suite: 4/4 PASS**, fresh processes, GPU verified idle
+  before each, one process at a time:
+
+  | suite | result |
+  |---|---|
+  | `mtp_gdn_rollback_check.py --repeat 3` | **3/3 PASS** |
+  | `mtp_batch_verify_check.py` | **PASS** (`check0`..`check3` all true, `no_cross_contamination_signal: true`) |
+  | `mtp_ragged_recompute_verify_check.py` | **PASS** (all sub-checks true) |
+  | `mtp_verify_cudagraph_check.py` | **PASS** (all 4 coverage flags true: `verify_graph_batch4_replayed`, `verify_graph_batch2_replayed`, `draft_step0_qo2_graph_replayed`, `draft_continuation_graph_replayed`) |
+
+  Zero regressions -- expected, since no production code changed, but
+  confirmed rather than assumed, per this project's standing rigor.
+
+### 14.8 Bottom line
+
+- The ~2.63x 16K/c=4 gap left open by section 13 is **not one bug**: four
+  candidate mechanisms (prefill-forward superlinear scaling, the general-
+  vs-v2 attention kernel choice, decode/verify round-loop kv_len scaling,
+  native scheduler overlap) were checked with real profiling evidence and
+  found refuted or non-dominant.
+- The one REAL, verified, and substantial factor: **the 16K/c=4 number was
+  never measured with `--cudagraph`**, unlike the 4K/c=4 headline. Adding
+  it (a pure configuration change, zero code risk, already covered by the
+  existing regression suite) recovers **+26.4% throughput**, narrowing the
+  gap from **2.629x to 2.080x**.
+- The remaining ~2.08x is a genuine, directly-profiled, near-linear-scaling
+  compute cost in the single-shot prefill forward pass -- not a bug, and
+  not fixable by either available kernel choice (v2 measured slower, not
+  faster, at this shape). The only remaining lever is real prefill
+  chunking, a structurally bigger, riskier change correctly left as a
+  scoped recommendation for future work, not attempted this round.
