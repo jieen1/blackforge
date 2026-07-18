@@ -1,8 +1,43 @@
 # Implementation Progress
 
-Updated: 2026-07-18
+Updated: 2026-07-19
 
 ## Completed
+
+### D1 64K capacity-raise: real, safe measurements at c=1/c=2 (2026-07-19)
+
+Follows up on the "categorically blocked" 64K/c=4 finding below.
+`blocks_per_slot` (the per-slot KV-cache capacity ceiling,
+`blocks_per_slot * block_size` tokens) was confirmed to ALREADY be a
+per-instance `DirectModelRunner` constructor argument (every one of this
+project's ~30 benchmark scripts already calls it with its own value) --
+the only change was exposing it as a `--blocks-per-slot` CLI flag on
+`mtp_w1s_our_runtime_perf.py` (default 2560, byte-for-byte preserving
+every existing invocation). Full regression suite (4/4 PASS) and the
+4K/c=4 headline (147.931 mean vs. 148.193 baseline, noise-level, no
+regression) both confirmed fresh. New real measurements at 64K with
+`--blocks-per-slot 5120` (no `--cudagraph`), continuously memory-monitored
+throughout: **c=1 = 10.290 accepted tok/s** (peak memory 51.8%), **c=2 =
+11.498 accepted tok/s** (peak memory 74.6%) -- both safely under any
+caution threshold. Native comparison at the same shape (one server
+launch, both legs sequential): c=1 = 9.117 tok/s (**ours 1.129x faster**),
+c=2 = 14.484 tok/s (**native 1.26x faster**, just under the 1.3x flag) --
+the established "ours leads at low concurrency, native retakes the lead
+as concurrency rises" pattern holds at 64K too. A watchdog-methodology
+finding along the way: a flat absolute memory-ceiling safety check
+false-fired during native's own ordinary server startup (its static
+KV-pool baseline sits at ~91-94 GiB by design) -- fixed with a combined
+hard-ceiling + genuine-climbing check, which then completed both legs
+safely. c=4/64K was explicitly NOT attempted (out of scope) -- refined
+the memory-scaling estimate with real 64K data (not extrapolated from
+16K/32K): even with `blocks_per_slot` raised, c=4/64K is estimated at
+~110-113 GiB, still ~15-18% over this card's capacity, so real prefill
+chunking is still required; the two concrete unbuilt pieces (draft-model
+step-0 chunking, GDN chunk-boundary state continuity) are identified and
+scoped as explicit follow-up work, not attempted. Only
+`benchmarks/mtp_w1s_our_runtime_perf.py` was changed -- no file under
+`runtime/` touched. Full writeup: notes/2026-07-18-session-review-and-
+next-steps.md section 18.
 
 ### Phase B, singular↔batch GDN verify mechanism divergence resolved (2026-07-18)
 

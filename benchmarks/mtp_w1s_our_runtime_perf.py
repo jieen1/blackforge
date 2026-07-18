@@ -302,6 +302,7 @@ def _run_once(
     repeats: int,
     batched: bool = False,
     cudagraph: bool = False,
+    blocks_per_slot: int = 2560,
 ) -> dict:
     import torch
 
@@ -337,6 +338,20 @@ def _run_once(
         # see notes/2026-07-18-session-review-and-next-steps.md §16).
         "ctx64k": D1_CTX64K_FIXTURE,
     }[fixture_key]
+    if fixture_key == "ctx64k" and blocks_per_slot * 16 < fixture.prompt_len + max_tokens:
+        # 2026-07-18/19, D1 64K-capacity-raise task (notes/2026-07-18-
+        # session-review-and-next-steps.md section 16): a 65536-token prompt
+        # exceeds the default 40960-token/slot capacity (blocks_per_slot=2560
+        # * block_size=16) during prefill alone, at ANY concurrency -- fail
+        # fast with a clear message instead of the generic capacity
+        # RuntimeError from deep inside build_attention_metadata_batch.
+        raise SystemExit(
+            f"--fixture ctx64k needs --blocks-per-slot >= "
+            f"{-(-(fixture.prompt_len + max_tokens) // 16)} (current "
+            f"blocks_per_slot={blocks_per_slot} only covers "
+            f"{blocks_per_slot * 16} tokens/slot); pass --blocks-per-slot "
+            f"explicitly (e.g. 5120) for this fixture."
+        )
     prompts = load_prompt_token_ids(fixture)
     if num_requests is not None:
         prompts = prompts[:num_requests]
@@ -362,7 +377,7 @@ def _run_once(
         vllm_config,
         num_slots=num_slots,
         block_size=16,
-        blocks_per_slot=2560,
+        blocks_per_slot=blocks_per_slot,
         enable_cudagraph=cudagraph,
     )
     thermal_after_load = _gpu_thermal()
@@ -380,6 +395,7 @@ def _run_once(
         "k": K,
         "batched": batched,
         "cudagraph": cudagraph,
+        "blocks_per_slot": blocks_per_slot,
         "repeats": repeats,
         "reps": reps,
         "thermal_before_load": thermal_before_load,
@@ -412,6 +428,22 @@ def main() -> int:
         "num_slots (the extra half is reserved, disposable capture-warmup "
         "capacity -- see DirectModelRunner._get_verify_graph).",
     )
+    parser.add_argument(
+        "--blocks-per-slot",
+        type=int,
+        default=2560,
+        help="2026-07-18/19, D1 64K-capacity-raise task: DirectModelRunner's "
+        "per-slot KV-cache capacity ceiling is blocks_per_slot * block_size "
+        "(default 2560*16=40960 tokens/slot -- covers every existing 4K/16K/"
+        "32K shape this project has measured). Left at its default for every "
+        "existing invocation; only long-context (>32K) fixtures need this "
+        "raised (e.g. 5120 for ctx64k, ~24%% margin over the 65536+256-token "
+        "minimum). Raising it costs VRAM ONLY for THIS runner instance -- it "
+        "is a per-instance constructor arg, not a global default -- but ALSO "
+        "rescales this runner's own decode_fixed_kv_split_size (see "
+        "DirectModelRunner.__init__), so any change should be re-validated "
+        "against the regression suite, not assumed safe.",
+    )
     args = parser.parse_args()
     if args.cudagraph and not args.batched:
         parser.error("--cudagraph requires --batched")
@@ -424,6 +456,7 @@ def main() -> int:
         args.repeats,
         batched=args.batched,
         cudagraph=args.cudagraph,
+        blocks_per_slot=args.blocks_per_slot,
     )
 
     import json

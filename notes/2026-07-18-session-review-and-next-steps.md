@@ -2508,3 +2508,353 @@ gate ("`check0` states its tolerance explicitly") without needing to
 choose between reverting to a hard assertion and leaving the tolerance
 unexplained. All 4 regression suites pass fresh; the W1-S headline number
 shows no regression (148.193 vs. 147.656 baseline, +0.36%, noise-level).
+
+---
+
+## 18. §16's capacity ceiling raised; real, safe 64K measurements at c=1/c=2 (executed 2026-07-18/19)
+
+**Task**: §16 found `blocks_per_slot=2560`/`block_size=16` (40960-token/slot)
+is a HARD per-slot capacity ceiling, not a soft memory-headroom risk, and
+that a 64K prompt exceeds it at ANY concurrency. §16.7 scoped two
+structurally-bigger fixes for the full c=4/64K cell (raising
+`blocks_per_slot`, plus real prefill chunking) and flagged a
+reduced-concurrency c=1 cell as a safer, smaller near-term follow-up
+(estimated ~47-50 GiB). This task's scope, set explicitly by the
+coordinator: raise the ceiling, prove zero impact on every existing
+shape, and get a real, safely-obtained measurement at c=1 (and c=2 if the
+c=1 data supports it) -- explicitly NOT the full c=4/64K cell, which
+needs real chunking (a separate, harder task).
+
+### 18.1 `blocks_per_slot` was already a per-instance configurable constructor arg -- confirmed, not assumed
+
+Read `DirectModelRunner.__init__` (`runtime/direct_model_runner.py:828-834`)
+directly before changing anything: `blocks_per_slot: int = 128` is already
+a keyword constructor argument, flowing into `self.blocks_per_slot`
+(`:867`), which in turn drives `num_blocks = (num_slots +
+RESERVED_PHYSICAL_SLOTS) * blocks_per_slot` (`:136`, the KV-cache tensor's
+own allocation size) and `self.decode_fixed_kv_split_size` (`:1017-1018`,
+split-KV sizing) -- both derived from `self.blocks_per_slot`, i.e.
+per-INSTANCE, not a module-level/global default. `grep -rn
+"blocks_per_slot=" benchmarks/*.py` (confirmed directly, not assumed)
+shows this is already exercised with a genuine variety of real values
+across this project's ~30 benchmark/regression scripts today (`128` in
+several, `2560` in most of the MTP suites) -- every script already picks
+its own value at its own call site. **There was nothing to "make"
+configurable; it already was.** The only real gap: `mtp_w1s_our_runtime_perf.py`
+(the one script this task's new 64K measurement needed) had `2560`
+hardcoded INLINE at its `DirectModelRunner(...)` call site (`:365` in the
+pre-task file) rather than exposed as a CLI flag, so a caller of that
+specific script could not choose a different value without editing source.
+
+**Change made** (`benchmarks/mtp_w1s_our_runtime_perf.py` only -- no other
+file under `runtime/` or `benchmarks/` touched):
+- New `--blocks-per-slot` CLI flag, **default `2560`** -- byte-for-byte
+  identical to the previous hardcoded value, so every existing invocation
+  of this script (the 4K/16K/32K headline and D1-sweep commands this
+  whole doc's §§11-17 rely on) is completely unaffected unless the new
+  flag is explicitly passed.
+- `_run_once`/`main()` thread this value through to the
+  `DirectModelRunner(..., blocks_per_slot=blocks_per_slot, ...)` call
+  (previously the literal `2560`), and it is echoed into the JSON result
+  dict (`"blocks_per_slot": blocks_per_slot`) for record-keeping.
+- A fail-fast `SystemExit` guard: if `--fixture ctx64k` is requested with
+  a `--blocks-per-slot` too small to cover `prompt_len + max_tokens`, the
+  script now raises a clear, actionable error immediately (naming the
+  minimum required value) instead of the generic `RuntimeError` from deep
+  inside `build_attention_metadata_batch` mid-prefill.
+- No change to `DirectModelRunner`, `allocate_fixed_slot_kv_caches`, or
+  any other benchmark/regression script -- confirmed by `git diff --stat`
+  before committing (below).
+
+This is exactly the "may be as simple as..." path the task anticipated:
+confirm existing configurability, then invoke it with a larger value ONLY
+for the new 64K test, leaving every other invocation's default untouched.
+
+### 18.2 Zero impact on existing shapes -- confirmed fresh, not assumed
+
+**Full regression suite, fresh processes, GPU verified idle
+(`nvidia-smi`/`pgrep`) before and after each, one process at a time:**
+
+| Suite | Result |
+|---|---|
+| `mtp_gdn_rollback_check.py --repeat 3` | **3/3 PASS** |
+| `mtp_batch_verify_check.py` | **PASS**, exit 0, all sub-checks true (`check3_mixed_stage.passed: true`, etc.) |
+| `mtp_ragged_recompute_verify_check.py` | **PASS**, exit 0, all sub-checks true (`check2_mixed_ragged_and_full_accept.passed: true`) |
+| `mtp_verify_cudagraph_check.py` | **PASS**, exit 0 |
+
+All four suites construct their own `DirectModelRunner` at their own
+hardcoded `blocks_per_slot` (2560 or 128, per-script) -- completely
+independent of this task's change to `mtp_w1s_our_runtime_perf.py`'s CLI
+default. Confirmed rather than assumed, per this project's standing
+discipline.
+
+**4K/c=4 headline, 3 reps, default `--blocks-per-slot` (unset -> 2560,
+identical to every prior run)**:
+`python -m benchmarks.mtp_w1s_our_runtime_perf --batched --cudagraph --repeats 3 --max-tokens 256 --concurrency 4 --fixture n16`
+
+| Rep | accepted tok/s |
+|---:|---:|
+| 1 | 147.704 |
+| 2 | 148.185 |
+| 3 | 147.905 |
+| **mean** | **147.931** |
+
+vs. the established **148.193 tok/s** baseline (§17.5): **147.931/148.193
+= 0.9982 -- no regression**, within this project's own established
+rep-to-rep noise band (the §17.5-vs-§9.5-etc. spread across this whole
+doc is routinely 1-2 tok/s). GPU/process hygiene confirmed clean
+(idle, no compute apps) before and after every check in this section.
+
+### 18.3 Real 64K measurements: c=1 and c=2, both safely obtained
+
+**Config for all "ours" runs this section**: `--blocks-per-slot 5120`
+(exactly 2x the default, giving `5120*16=81920` tokens/slot capacity --
+a real ~24% margin over the 65536+256=65792-token minimum a 64K prompt +
+256 generated tokens needs; matches §16.4's own suggested round value),
+no `--cudagraph` (matching §16.4's own safer-path basis for the c=1/c=2
+estimate). Each run had a dedicated continuous-sampling `nvidia-smi`
+loop (3s interval, full run duration, not just before/after) PLUS an
+automated safety watchdog that would `pkill` the benchmark process if
+memory reached a hard ceiling (88000 MiB, chosen well under this card's
+97887 MiB with real margin, since `--cudagraph` was not in use here so no
+historical precedent required a higher bound) -- neither watchdog fired
+for either "ours" run.
+
+**c=1** (`--concurrency 1 --num-requests 1 --max-tokens 256 --fixture
+ctx64k --blocks-per-slot 5120`):
+
+```json
+{
+  "accepted_tokens_per_sec": 10.290242305217962,
+  "draft_acceptance_rate_pct": 94.02985074626866,
+  "wall_s_e2e": 24.877937020995887,
+  "ttft_mean_ms": 17878.778724989388,
+  "gpu_busy_pct": 90.84016561725053
+}
+```
+
+Memory trace (continuous 3s sampling, full run): idle 1980 MiB -> weight
+load ~23819 MiB -> transitioning into prefill ~28307 MiB -> prefill+decode
+plateau **50713 MiB** (held for the ~27s of real GPU work, `utilization.gpu`
+pinned near 100% during this window) -> back to 1980 MiB after process
+exit. **Peak: 50713/97887 MiB = 51.8% -- comfortably safe**, matching
+§16.4's own ~47-50 GiB pre-run estimate almost exactly.
+
+**c=2** (`--concurrency 2 --num-requests 2 --max-tokens 256 --fixture
+ctx64k --blocks-per-slot 5120`), run after independently confirming c=1's
+result was safe and extrapolating from it (see 18.4 for the extrapolation
+itself, done BEFORE this run, not after):
+
+```json
+{
+  "accepted_tokens_per_sec": 11.497913428889861,
+  "draft_acceptance_rate_pct": 79.60526315789474,
+  "wall_s_e2e": 44.79073556998628,
+  "ttft_mean_ms": 35836.524725018535,
+  "gpu_busy_pct": 90.86083324940645
+}
+```
+
+Peak (continuous sampler, full run): **72993/97887 MiB = 74.6%** --
+consistent with the pre-run extrapolation (~70-75%), safely under the
+90GB/~92% caution line with real margin (~25 GiB headroom). Both "ours"
+runs: watchdog did not fire, GPU/process state confirmed clean (idle,
+no compute apps) immediately after each.
+
+**c=4 was explicitly NOT attempted** -- out of this task's scope per its
+own instructions, and per §18.5 below, still expected to exceed this
+card's capacity even with `blocks_per_slot` raised, without real prefill
+chunking.
+
+### 18.4 Native comparison at the same concurrencies -- including a real watchdog-methodology finding
+
+Native has no equivalent per-slot ceiling (its paged KV cache is sized
+once, statically, from `--gpu-memory-utilization=0.92` at server startup
+-- confirmed in §16.5 to already sit at ~91-94 GiB before any request),
+so both legs were run sequentially against ONE server launch (avoiding a
+second reload), following this doc's own established server-launch-once
+pattern (§12.1/§16.5): `launch_test_server.py --port 8100 --with-mtp
+--kv-cache-dtype fp8_e4m3 --model unsloth/Qwen3.6-27B-NVFP4`, then
+`w1s_native_bench.py --fixture ctx64k --concurrency {1,2} --num-requests
+{1,2} --max-tokens 256 --stream` for each leg in turn, then
+`stop_test_server.py`.
+
+**First attempt: a real, useful watchdog-methodology failure, not a
+memory risk.** The first safety watchdog used a flat 92000 MiB hard
+ceiling (chosen without first re-checking this doc's own §16.5 baseline
+figures). It fired at **94025 MiB while the server was still loading**
+(FlashInfer-autotune/warmup phase, confirmed via `native_server.log`:
+`SERVER_DIED_BEFORE_READY` / `READY=0`, and both bench legs' log files
+were empty -- neither had run yet). This is **not** a real risk signal:
+94025 MiB is squarely inside native's own well-established, ALWAYS-PRESENT
+static-KV-pool startup baseline (§16.5 measured 91622-94582 MiB at this
+exact server config, independent of any workload, and historically flat/
+safe once reached). The watchdog did exactly what it was built to do
+(clean `stop_test_server.py` teardown, confirmed 0 compute apps
+afterward, GPU back to idle) -- the bug was in the THRESHOLD choice, not
+the mechanism: a flat absolute ceiling is the wrong tool for a system
+whose normal, safe operating point is already this high. **Corrected
+watchdog** (retry): a 96800 MiB hard ceiling (leaving ~1 GiB real margin
+to the 97887 MiB card) PLUS a genuine "4 consecutive rises above 90000
+MiB" climbing check, so it tolerates native's known-flat high baseline
+but still catches an actual runaway. This is documented here as a real
+safety-methodology finding for future long-context native comparisons on
+this card, per this project's own "report real findings, including
+process ones" convention -- not glossed over as a non-event.
+
+**Retry, successful, both legs against the corrected watchdog (which did
+not fire):**
+
+| Leg | accepted tok/s | thermal before -> after (MiB) |
+|---|---:|---|
+| c=1 (`--concurrency 1 --num-requests 1`) | **9.117402930200932** | 91571 -> 93995 |
+| c=2 (`--concurrency 2 --num-requests 2`) | **14.484334741393011** | 93995 -> 93997 |
+
+Peak (continuous sampler, whole run): **93997/97887 MiB = 96.0%** -- high
+in absolute terms but FLAT (rose once at server startup, as established,
+never climbed further across either leg), matching the exact "rose once
+then plateaued" signature §16.5 already characterized as safe. Clean
+shutdown confirmed (`stop_test_server.py`: "all matched processes
+exited", 0 compute apps after; GPU back to ~1923 MiB idle).
+
+### 18.5 The gap, at both concurrencies
+
+Using this doc's own established `gap = native/ours` convention (<1 means
+ours is faster):
+
+| Concurrency | Native tok/s | Ours tok/s | Gap (native/ours) | Read |
+|---:|---:|---:|---:|---|
+| 1 | 9.117 | **10.290** | **0.886** | **ours ~1.129x FASTER** |
+| 2 | 14.484 | **11.498** | **1.260** | native ~1.26x faster -- just UNDER this project's 1.3x flag threshold, not flagged |
+
+This is a clean, real confirmation of the pattern §12.3/§12.6 already
+established at 4K/16K -- **this runtime leads at c=1, and the lead erodes
+(here, flips to native's favor) as concurrency rises** -- now shown to
+hold at 64K too, the longest context this project has measured either
+side at. For context only (not re-measured this round): native's own
+previously-known 64K/c=4 number is 10.800 tok/s (§16.5) -- the
+non-monotonic native sequence c=1(9.117)/c=2(14.484)/c=4(10.800) is
+reported honestly as observed; no further mechanism is claimed for it
+here (out of this task's scope to investigate).
+
+### 18.6 Refined memory-scaling estimate and precise chunking scope for the full c=4/64K cell (not attempted -- explicit follow-up)
+
+**Refined activation-memory-per-token rate, from this task's own real
+64K data (not extrapolated from 16K/32K, unlike §16.4's original
+estimate):**
+
+| Concurrency | Total tokens (one-shot prefill) | Baseline (thermal_after_load, MiB) | Peak (MiB) | Activation delta (MiB) | Rate (MiB/token) |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 65536 | 33815 | 50713 | 16898 | 0.2579 |
+| 2 | 131072 | 37405 | 72991 | 35586 | 0.2715 |
+
+Both rates land inside (and tighten) §16.4's previously-extrapolated
+0.268-0.2768 MiB/token range -- a real, same-shape confirmation of that
+earlier 16K/32K-derived estimate, not a new one.
+
+**Extrapolating to a hypothetical c=4/64K cell** (5 physical slots at
+`blocks_per_slot=5120`, no cudagraph, 262144 total tokens): baseline delta
+per +1 concurrency (measured, c=1->c=2) is 37405-33815=3590 MiB; linearly
+extrapolated to 5 physical slots: baseline_c4 ~= 33815 + 3*3590 ~= 44585
+MiB. Activation term at the measured 0.258-0.272 MiB/token range:
+262144 * [0.258, 0.272] ~= 67,650-71,300 MiB. **Total estimated peak ~=
+112,200-115,900 MiB (~109.6-113.2 GiB) -- still ~15-18% over this card's
+97887 MiB (95.6 GiB) capacity.** This REFINES §16.4's original ~127.5 GiB
+/ ~33%-over estimate downward (that estimate assumed a cudagraph-doubled
+physical-slot count; this one uses the actual no-cudagraph config this
+task measured), but the conclusion is unchanged: **raising
+`blocks_per_slot` alone is still not sufficient for c=4/64K** -- real
+prefill chunking is still required, now grounded in two real same-shape
+data points instead of an extrapolation from shorter contexts.
+
+**Precise scope of what chunking `mtp_prefill_batch` would require**,
+from reading its real prefill path and `_forward_batch`'s signature
+directly this round (not re-citing prior sections' conclusions without
+verification):
+
+- `mtp_prefill_batch` (`runtime/direct_model_runner.py:2576-2658`) issues
+  exactly ONE `_forward_batch(slots, prompts_per_slot, [0]*num_reqs,
+  qo_len=prompt_len, commit=True, is_decode=False,
+  logits_last_position_only=True)` call (`:2626-2635`) covering the WHOLE
+  prompt for every slot in a single shot, and requires every listed slot
+  to be "fresh" (`slot_kv_len[s] != 0` raises `RuntimeError`, `:2616`) --
+  there is no partial/continuation prefill entry point today.
+- The underlying primitive, `_forward_batch` (`:1368-1467`), is already
+  parameterized in a chunking-COMPATIBLE way, not a from-scratch problem:
+  it takes an explicit per-slot prior `kv_lengths` list and a `commit`
+  flag controlling whether `self.slot_kv_len` advances (`:1402-1416`),
+  and its `is_decode` parameter's own docstring already anticipates "a
+  genuine chunked/prefix PREFILL call" (`:1437-1444`) as a distinct case
+  from ordinary decode -- though nothing exercises that path today. The
+  ATTENTION-side mechanics of chunking (calling this same primitive
+  repeatedly with a growing `kv_lengths` offset and `commit=True` per
+  chunk) are therefore NOT the hard part.
+- Two concrete, genuinely unbuilt pieces, identified by reading the real
+  call sites (not assumed): (1) the DRAFT model's own step-0 resync
+  (`_mtp_sync_and_propose_batch`, called once at `:2647-2655` with
+  `num_new_tokens=prompt_len` in a single shot) would need to be chunked
+  in lockstep with the target model's chunks, threading its own
+  hidden-state/kv_len bookkeeping across chunk boundaries; (2) GDN's
+  chunked-prefill metadata (`build_gdn_metadata_batch`'s
+  `has_initial_state`/`chunk_indices`/`chunk_offsets`/causal-conv1d
+  bookkeeping) is built fresh per call from a single `query_start_loc`
+  today and has only ever been exercised for the "whole prompt in one
+  call" case -- carrying its recurrent state correctly across chunk
+  boundaries (toggling `has_initial_state` true only from the second
+  chunk onward, consistent with the existing `slot_gdn_initialized`
+  per-slot semantics) is a real, unverified mechanism, not a parameter
+  tweak.
+- Both pieces would need dedicated correctness re-validation before
+  trusting in production: a causal-mask signal-probe test at chunk
+  boundaries (this project's own established method, e.g.
+  `batch_decode_signal_probe.py`'s technique) and a GDN-state-continuity
+  test across chunks (comparing a chunked prefill's final state/logits
+  against today's single-shot prefill, bytewise -- the same style of
+  oracle `mtp_gdn_rollback_check.py` already uses for the verify-side
+  rollback mechanism).
+- Both fixes (raised `blocks_per_slot` AND real chunking) are needed
+  TOGETHER for a full c=4/64K cell, confirming §16.7's own conclusion --
+  neither alone is sufficient (the capacity ceiling and the activation-
+  memory scaling are separate, additive constraints).
+- Effort: consistent with §13.8/14.6/16.7's own prior estimates
+  ("materially larger, riskier... not a parameter default") -- now
+  sharpened with the two concrete missing pieces above. Multi-day,
+  correctly scoped as follow-up work, explicitly NOT attempted this round.
+
+### 18.7 Bottom line
+
+- **`blocks_per_slot` was already a per-instance configurable constructor
+  arg** (confirmed, not newly built) -- this task's only code change was
+  exposing it as a CLI flag on the one script (`mtp_w1s_our_runtime_perf.py`)
+  that needed it, with a default preserving every existing invocation
+  byte-for-byte.
+- **Zero regression, confirmed fresh**: all 4 regression suites PASS; the
+  4K/c=4 headline (147.931 mean vs. 148.193 baseline, -0.18%, noise-level)
+  shows no change.
+- **Real, safe 64K measurements obtained**: c=1 = **10.290 accepted
+  tok/s** (peak memory 51.8%), c=2 = **11.498 accepted tok/s** (peak
+  memory 74.6%). c=4 correctly NOT attempted (needs real chunking, per
+  18.6).
+- **Gap vs. native**: c=1, ours **1.129x faster**; c=2, native **1.26x
+  faster** (just under the 1.3x flag threshold) -- the established
+  "ours leads at low concurrency, native retakes the lead as concurrency
+  rises" pattern holds at 64K too.
+- **A real safety-methodology finding**: a flat absolute memory-ceiling
+  watchdog is the wrong tool against native's high, static,
+  well-characterized KV-pool baseline -- it false-fired during ordinary
+  server startup on the first attempt (documented, not hidden); a
+  combined hard-ceiling + genuine-climbing-check watchdog succeeded
+  safely on retry.
+- **c=4/64K remains out of reach without further work**, now more
+  precisely scoped: raising `blocks_per_slot` alone still leaves an
+  estimated ~15-18% memory shortfall (refined from §16.4's ~33%, using
+  this task's own real 64K activation-rate data); real prefill chunking
+  of `mtp_prefill_batch` is still required, and this section identifies
+  the two concrete unbuilt pieces (draft-model step-0 chunking, GDN
+  chunk-boundary state continuity) a future task would need to build and
+  validate.
+
+**Files changed**: `benchmarks/mtp_w1s_our_runtime_perf.py` only (new
+`--blocks-per-slot` CLI flag + fixture-safety guard). No file under
+`runtime/` was modified. `PROGRESS.md` updated with a pointer to this
+section (see its own entry for the summary).
