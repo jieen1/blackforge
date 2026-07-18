@@ -3517,3 +3517,36 @@ both structurally and empirically.
 the regression-battery log kept in the session scratchpad (measurement
 artifacts, not project source). `PROGRESS.md` updated with a pointer to
 this section.
+
+### 20.6 Addendum (2026-07-18): fixed the `"passed": True` hardcoded literal §20.3 flagged
+
+Follow-up hygiene fix for the exact finding in §20.3/§20.5: `_run_once`
+(`benchmarks/mtp_w1s_our_runtime_perf.py:412-413`, pre-fix) returned
+`"passed": True` unconditionally, tied to no check at all. Fixed by adding
+`_sanity_check_reps()`: a liveness/sanity signal (NOT a correctness
+check -- this script still never re-verifies generated tokens, that
+remains `mtp_batch_verify_check.py`/`mtp_chunked_prefill_check.py`'s job)
+built from numbers this script already computes per rep --
+`total_committed_tokens > 0` and `draft_acceptance_rate_pct` not NaN --
+so a silently-empty/degenerate run (e.g. a runner that never actually
+calls the target/draft model) would now flip `passed` to `false` and the
+script's exit code to 1, instead of always reporting success. Considered
+just deleting the field (this is a performance benchmark, not a
+correctness check), but kept it with a real check behind it since (a) the
+codebase-wide convention is every benchmark script exposes a `"passed"`
+field driving its exit code, and (b) the two numbers used were already
+being computed for the JSON output anyway -- no new instrumentation, no
+invented check.
+
+Checked for downstream consumers first: grepped the whole repo for
+`"passed"` and for `mtp_w1s_our_runtime_perf` references -- every other
+hit is either this script's own convention-following sibling scripts (own
+independent `passed` fields) or a comment/docstring mentioning this
+script's name, not a subprocess/import that parses this script's JSON and
+reads its `passed` key. No downstream breakage risk.
+
+Verified with a real run (`--fixture n16 --concurrency 4 --batched
+--max-tokens 64 --num-requests 8`, GPU idle before/after): completed
+normally, `"passed": true` now genuinely computed
+(`total_committed_tokens=522`, `draft_acceptance_rate_pct=67.24%`, neither
+degenerate). `PROGRESS.md` updated with a pointer.

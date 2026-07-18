@@ -4,6 +4,20 @@ Updated: 2026-07-19
 
 ## Completed
 
+### Fixed `mtp_w1s_our_runtime_perf.py`'s hardcoded `"passed": True` literal (2026-07-18)
+
+Follow-up hygiene fix for the finding directly below (also §20.3/20.5 of
+`notes/2026-07-18-session-review-and-next-steps.md`): the script's
+`"passed"` field was an unconditional literal, not derived from any
+check. Replaced with `_sanity_check_reps()` -- a liveness/sanity signal
+(not a correctness check; token-content correctness stays
+`mtp_batch_verify_check.py`/`mtp_chunked_prefill_check.py`'s job) built
+from numbers this script already computes: `total_committed_tokens > 0`
+and `draft_acceptance_rate_pct` non-NaN across all reps. Confirmed no
+downstream script/tool parses this script's JSON `"passed"` key (grepped
+repo-wide). Verified with a real small run (n16/c=4/batched); full note:
+`notes/2026-07-18-session-review-and-next-steps.md` section 20.6.
+
 ### 16K/c=4 re-measured with chunked prefill: real +14.7% gain, gap narrows 2.080x -> 1.814x, but does NOT close (2026-07-19)
 
 Follow-up to the chunked-batched-prefill entry directly below: re-measured

@@ -42,6 +42,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import subprocess
 import sys
@@ -63,6 +64,28 @@ def _gpu_thermal() -> dict:
     ).stdout.strip().splitlines()[0]
     temp, clock, mem = [x.strip() for x in out.split(",")]
     return {"temperature_c": int(temp), "clock_sm_mhz": int(clock), "memory_used_mib": int(mem)}
+
+
+def _sanity_check_reps(reps: list[dict]) -> bool:
+    """Cheap liveness/sanity signal only -- NOT a correctness check. This
+    script never re-verifies generated-token correctness (see module
+    docstring; that's `mtp_batch_verify_check.py` / `mtp_chunked_prefill_
+    check.py`'s job). All this confirms is that every rep actually produced
+    real output -- committed tokens and a valid (non-NaN) acceptance rate --
+    rather than silently completing with an empty/degenerate run (e.g. a
+    runner that returns immediately without ever calling the target/draft
+    model). Previously this was a hardcoded ``"passed": True`` literal with
+    no check behind it at all (see notes/2026-07-18-session-review-and-
+    next-steps.md section 20.3) -- this replaces that with the cheapest
+    real thing this script's own already-computed numbers can verify."""
+    if not reps:
+        return False
+    for rep in reps:
+        if rep["total_committed_tokens"] <= 0:
+            return False
+        if math.isnan(rep["draft_acceptance_rate_pct"]):
+            return False
+    return True
 
 
 def _run_batch(torch, runner, prompts_batch: list[list[int]], target_output_len: int) -> dict:
@@ -410,7 +433,12 @@ def _run_once(
     ]
 
     return {
-        "passed": True,
+        # Liveness/sanity signal only -- see `_sanity_check_reps`'s
+        # docstring. This is NOT a correctness check (this script doesn't
+        # re-verify generated tokens); it was a hardcoded `True` literal
+        # before 2026-07-18's fix (notes/2026-07-18-session-review-and-
+        # next-steps.md section 20.3).
+        "passed": _sanity_check_reps(reps),
         "num_requests": len(prompts),
         "max_tokens": max_tokens,
         "concurrency": concurrency,
