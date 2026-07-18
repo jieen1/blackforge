@@ -1374,6 +1374,7 @@ class DirectModelRunner:
         fixed_kv_split_size: int | None = None,
         fixed_max_num_splits: int | None = None,
         gdn_spec_num_accepted_tokens_prev: list[int] | None = None,
+        logits_last_position_only: bool = False,
     ) -> torch.Tensor:
         """Real batched decode/verify: ONE batched attention/GDN metadata
         object and ONE ``model.forward()`` call covering every listed slot
@@ -1459,6 +1460,30 @@ class DirectModelRunner:
         ragged per-request list, since every real spec-decode verify call
         submits the same K+1-token draft for every slot. Only
         ``verify_batch_spec`` passes this.
+
+        ``logits_last_position_only`` (2026-07-18, D1-followup fix, default
+        ``False`` preserving every existing call site byte-for-byte): when
+        ``True``, ``self.model.compute_logits(...)`` is applied to ONLY the
+        last position of each slot's ``qo_len`` block (gathered via
+        ``index_select`` right before the vocab-head projection), instead of
+        every position -- the returned ``logits`` is then shaped
+        ``[num_reqs, vocab]``, NOT ``[num_reqs * qo_len, vocab]``. The full,
+        un-gathered ``hidden_states`` is still returned unchanged when
+        ``return_hidden=True`` -- only the tensor fed into ``compute_logits``
+        is sliced. Found via direct instrumentation
+        (``benchmarks/mtp_prefill_batch_memory_diag.py``) profiling the
+        16K-context/c=4 shape flagged in
+        ``notes/2026-07-18-session-review-and-next-steps.md`` section 12:
+        at ``qo_len=16384``/``concurrency=4`` this call's own
+        ``compute_logits`` alone allocates a 31040 MiB ``[65536, 248320]``
+        bf16 tensor of which only 4 rows (0.006%) are ever read by any
+        caller -- only ``mtp_prefill_batch`` needs the anchor logits, and
+        only at each slot's OWN last prompt position. ``decode_batch``/
+        ``verify_batch``/``verify_batch_spec`` genuinely need every
+        position's logits (MTP verify checks every draft token against the
+        target's own prediction) and MUST NOT pass this -- it is only safe
+        when the caller already only reads the last row per slot, which is
+        why only ``mtp_prefill_batch`` sets it.
         """
         num_reqs = len(slot_ids)
         qo_lens = [qo_len] * num_reqs if isinstance(qo_len, int) else list(qo_len)
@@ -1561,7 +1586,22 @@ class DirectModelRunner:
         # real per-round verify/recompute/decode hot path) is exactly
         # where Phase 0's ``nsys`` ledger measured the dominant no-kernel
         # gap this removal targets.
-        logits = self.model.compute_logits(hidden_states)
+        if logits_last_position_only:
+            # 2026-07-18, D1-followup fix: project only each slot's own
+            # last position through the vocab head -- see this parameter's
+            # docstring. ``qo_lens`` (already computed above) gives each
+            # slot's own row count; cumulative sum minus 1 is that slot's
+            # last row in the request-then-position-flattened layout
+            # ``model.forward`` returned.
+            last_idx = torch.tensor(
+                [sum(qo_lens[: i + 1]) - 1 for i in range(num_reqs)],
+                dtype=torch.long,
+                device=self.device,
+            )
+            logits_hidden = hidden_states.index_select(0, last_idx)
+        else:
+            logits_hidden = hidden_states
+        logits = self.model.compute_logits(logits_hidden)
 
         for slot, qo in zip(slot_ids, qo_lens):
             if commit:
@@ -2124,6 +2164,7 @@ class DirectModelRunner:
         *,
         qo_len: int | list[int],
         is_decode: bool,
+        logits_last_position_only: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Batched analogue of ``_mtp_forward`` for the draft model
         (``Qwen3_5MTP``) -- ONE batched attention-metadata object (scoped to
@@ -2152,6 +2193,23 @@ class DirectModelRunner:
         ragged) otherwise -- same convention ``_forward_batch`` uses.
         Returns logits/hidden_states shaped ``[sum(qo_lens), ...]`` in
         request-then-position order.
+
+        ``logits_last_position_only`` (2026-07-18, D1-followup fix, default
+        ``False`` preserving every existing call site byte-for-byte): same
+        contract as ``_forward_batch``'s identical parameter -- when
+        ``True``, BOTH the returned ``logits`` AND the returned
+        ``hidden_states_out`` are gathered down to only each slot's own
+        last position (shape ``[num_reqs, ...]``, not
+        ``[sum(qo_lens), ...]``) before/after ``compute_logits``. Safe here
+        specifically because ``_mtp_sync_and_propose_batch`` (this
+        method's only caller) already discards every non-last-position row
+        of both return values via its own ``index_select`` immediately
+        after calling this method, for every existing call site -- so
+        gathering earlier (before the vocab-head projection, instead of
+        after) changes nothing observable except removing the wasted
+        compute/memory. Only ``_mtp_sync_and_propose_batch``'s step-0 call
+        passes this, and only when its own caller (``mtp_prefill_batch``)
+        requests it -- see that call site.
         """
         if self.mtp_model is None:
             raise RuntimeError(
@@ -2216,6 +2274,14 @@ class DirectModelRunner:
         # is the batched draft-model analogue, called up to K times per
         # round (previously 2 syncs each); same same-stream-ordering
         # reasoning applies.
+        if logits_last_position_only:
+            # 2026-07-18, D1-followup fix: see this parameter's docstring.
+            last_idx = torch.tensor(
+                [sum(qo_lens[: i + 1]) - 1 for i in range(num_reqs)],
+                dtype=torch.long,
+                device=self.device,
+            )
+            hidden_states_out = hidden_states_out.index_select(0, last_idx)
         logits = self.mtp_model.compute_logits(hidden_states_out)
         return logits, hidden_states_out
 
@@ -2227,6 +2293,7 @@ class DirectModelRunner:
         start_pos_list: list[int],
         num_new_tokens: int | list[int],
         k: int,
+        step0_logits_last_position_only: bool = False,
     ) -> dict[int, list[int]]:
         """Batched analogue of ``_mtp_sync_and_propose``: one batched step-0
         sync call, followed by ``k-1`` batched autoregressive steps (each
@@ -2254,6 +2321,25 @@ class DirectModelRunner:
         positional list) so callers can freely pass a SUBSET of the
         runner's active slots (e.g. only the full-accept group from
         ``mtp_verify_and_commit_batch``) without index confusion.
+
+        ``step0_logits_last_position_only`` (2026-07-18, D1-followup fix,
+        default ``False`` preserving every existing call site byte-for-byte):
+        forwarded to step 0's eager ``_mtp_forward_batch`` call (see its
+        identical parameter's docstring) -- only ``mtp_prefill_batch`` sets
+        this, since it already only ever reads each slot's own last-position
+        draft token below, and it is the caller whose ``num_new_tokens``
+        (a full prompt length) makes the full-sequence vocab-head
+        projection this avoids a real cost. **Only actually takes effect
+        when step 0 takes the EAGER branch** (``step0_graph is None``) --
+        when a caller's ``num_new_tokens`` is uniform AND small enough for
+        the captured-graph branch above (e.g. ``mtp_verify_cudagraph_check
+        .py``'s deliberately-short-prompt regression test, with
+        ``enable_cudagraph=True``), this parameter is silently a no-op: the
+        graph path always returns the full, un-gathered shape (see
+        ``step0_already_last_only`` below), which is harmless since that
+        branch is only ever reached for ``num_new_tokens <=
+        _MAX_DECODE_QO_LEN``, far too small for the projection cost to
+        matter anyway.
         """
         num_reqs = len(slots)
         if not (len(shifted_input_ids_per_slot) == num_reqs and len(start_pos_list) == num_reqs):
@@ -2294,6 +2380,26 @@ class DirectModelRunner:
             and num_new_tokens_list[0] <= _MAX_DECODE_QO_LEN
         ):
             step0_graph = self._get_draft_step_graph(num_reqs, num_new_tokens_list[0])
+        # 2026-07-18, D1-followup fix: whether step0's OWN return is already
+        # gathered to last-position-only. NOT simply
+        # ``step0_logits_last_position_only`` -- a caller (e.g.
+        # ``mtp_prefill_batch`` invoked with a SHORT, uniform prompt, as
+        # ``mtp_verify_cudagraph_check.py`` deliberately does to regression-
+        # test this exact graph path) can request the optimization while
+        # STILL legitimately taking the captured-graph branch above (short
+        # prompt + ``enable_cudagraph=True`` -> ``num_new_tokens_list[0] <=
+        # _MAX_DECODE_QO_LEN`` is true). The graph path always returns the
+        # full, un-gathered ``[sum(qo_lens), ...]`` shape (its own
+        # docstring/contract), so the optimization must only be treated as
+        # "applied" when the eager ``_mtp_forward_batch`` branch actually
+        # ran with the flag set -- otherwise this method's own last-index
+        # bookkeeping below would silently read the wrong rows. Falling
+        # back to full (correct, pre-existing) behavior on the graph path
+        # is harmless: that path is only ever reached for small
+        # ``num_new_tokens`` (<= ``_MAX_DECODE_QO_LEN``), where the
+        # full-position vocab-head cost this fix targets was never large
+        # enough to matter in the first place.
+        step0_already_last_only = False
         if step0_graph is not None:
             step0_qo_len = num_new_tokens_list[0]
             tokens_for_graph = (
@@ -2311,7 +2417,9 @@ class DirectModelRunner:
                 start_pos_list,
                 qo_len=num_new_tokens,
                 is_decode=all(n == 1 for n in num_new_tokens_list),
+                logits_last_position_only=step0_logits_last_position_only,
             )
+            step0_already_last_only = step0_logits_last_position_only
         for s, n in zip(slots, num_new_tokens_list):
             self.slot_draft_sync_len[s] += n
 
@@ -2332,11 +2440,23 @@ class DirectModelRunner:
         # every slot's step-0 draft token in one kernel launch; ONE
         # ``.tolist()`` is the single host round-trip for this step.
         draft_tokens: dict[int, list[int]] = {s: [] for s in slots}
-        last_idx_tensor = torch.tensor(
-            [row_offsets[i + 1] - 1 for i in range(num_reqs)], dtype=torch.long, device=step0_logits.device
-        )
-        last_logits = step0_logits.index_select(0, last_idx_tensor)
-        prev_hidden = step0_hidden.index_select(0, last_idx_tensor)
+        if step0_already_last_only:
+            # Already gathered to [num_reqs, ...] (one row per slot, its
+            # own last position) inside ``_mtp_forward_batch`` -- see that
+            # method's docstring. Re-indexing with the OLD full-length
+            # ``row_offsets`` formula here would read the wrong (or
+            # out-of-bounds) rows, so use the tensors directly. Keyed off
+            # ``step0_already_last_only`` (which branch ACTUALLY ran), not
+            # the raw ``step0_logits_last_position_only`` parameter -- see
+            # that variable's own definition above for why they can differ.
+            last_logits = step0_logits
+            prev_hidden = step0_hidden
+        else:
+            last_idx_tensor = torch.tensor(
+                [row_offsets[i + 1] - 1 for i in range(num_reqs)], dtype=torch.long, device=step0_logits.device
+            )
+            last_logits = step0_logits.index_select(0, last_idx_tensor)
+            prev_hidden = step0_hidden.index_select(0, last_idx_tensor)
         prev_tokens = last_logits.argmax(dim=-1).tolist()
         for i in range(num_reqs):
             draft_tokens[slots[i]].append(prev_tokens[i])
@@ -2390,7 +2510,27 @@ class DirectModelRunner:
         constraint ``build_attention_metadata_batch`` documents) -- true
         for this project's W1-S/W2-S frozen fixtures (every prompt is
         exactly the configured ``input_len``), so this is a documented
-        scope boundary, not a limitation for the intended benchmark use."""
+        scope boundary, not a limitation for the intended benchmark use.
+
+        **2026-07-18, D1-followup fix**: both the target model's prefill
+        forward and the draft model's step-0 sync forward now pass
+        ``logits_last_position_only=True`` -- this method only ever reads
+        each slot's OWN last-position logits (the anchor / first draft
+        token), never any other position's, so projecting every position
+        through the vocab head was 100% wasted work. Found by direct
+        instrumentation (``benchmarks/mtp_prefill_batch_memory_diag.py``)
+        of the exact c=4/16K-context shape
+        ``notes/2026-07-18-session-review-and-next-steps.md`` section 12
+        flagged as 4.85x slower than native and peaking at 99.2% of GPU
+        memory: at that shape (``qo_len=16384``, ``concurrency=4``, vocab
+        248320) EACH of the two ``compute_logits`` calls this method used
+        to make allocated an unused ``[65536, 248320]`` bf16 tensor (31040
+        MiB, ~30.3 GiB) of which only 4 rows were ever read -- ~60 GiB of
+        pure waste, and the second such allocation (already competing with
+        the first plus the model+KV-cache baseline for the remaining
+        headroom) took 15.2s by itself, direct evidence of near-OOM
+        allocator pressure compounding the waste. See that section's
+        follow-up entry for the full before/after numbers."""
         if self.mtp_model is None or self.num_speculative_tokens is None:
             raise RuntimeError("no MTP draft model loaded")
         num_reqs = len(slots)
@@ -2418,11 +2558,15 @@ class DirectModelRunner:
             commit=True,
             return_hidden=True,
             is_decode=False,
+            logits_last_position_only=True,
         )
         anchors: dict[int, int] = {}
         shifted_per_slot = []
         for i, s in enumerate(slots):
-            row = target_logits[i * prompt_len + prompt_len - 1]
+            # target_logits is [num_reqs, vocab] (last-position-only, see
+            # logits_last_position_only above) -- row i IS slot i's last
+            # (and only returned) position, no further offset needed.
+            row = target_logits[i]
             anchor = int(row.argmax(dim=-1).item())
             anchors[s] = anchor
             shifted_per_slot.append(prompts_per_slot[i][1:] + [anchor])
@@ -2434,6 +2578,7 @@ class DirectModelRunner:
             [0] * num_reqs,
             num_new_tokens=prompt_len,
             k=self.num_speculative_tokens,
+            step0_logits_last_position_only=True,
         )
         for s in slots:
             self.slot_pending_draft_tokens[s] = draft_tokens_by_slot[s]

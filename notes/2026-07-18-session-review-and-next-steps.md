@@ -1211,3 +1211,292 @@ cell as the gate for whether the fix worked.
   runtime is well ahead of native) but does **not** generalize to
   concurrent long-context prefill, where it inverts sharply. Reporting
   "parity" without this qualification would have been misleading.
+
+---
+
+## 13. D1 follow-up: 16K/c=4 root-caused, fixed, verified (executed 2026-07-18)
+
+**Verdict: the "no chunking" hypothesis section 12 offered is REFUTED as the
+primary mechanism. The real root cause, found by direct instrumentation, not
+inference: `mtp_prefill_batch`'s target-model forward AND its draft-model
+step-0 sync forward both project EVERY position of the full
+`concurrency x prompt_len` batch through the vocab head
+(`compute_logits`), when only each slot's own LAST position is ever read.
+At this shape (vocab_size=248320) that is a `[65536, 248320]` bf16 tensor
+(~30.3 GiB) computed TWICE per prefill call, of which only 4 of 65536 rows
+(0.006%) are ever used. Fixed with an opt-in, zero-risk-to-other-callers
+parameter. Result: the 16K/c=4 gap to native narrows from 4.85x slower to
+2.63x slower (throughput +84.6%, 25.137 -> 46.394 accepted tok/s), and the
+99.2%-of-capacity near-OOM peak drops to 55.4%. The 4K/c=4 headline does
+not regress (142.504 -> 147.656 mean, actually a small genuine
+improvement). A real bug in this fix's own first draft was caught by the
+existing regression suite and corrected before landing -- see 13.5.**
+
+### 13.1 Methodology: confirming/refuting the chunking hypothesis with real evidence
+
+Per this task's charter, the hypothesis was not assumed. Three independent
+lines of investigation, in order:
+
+1. **Read `mtp_prefill_batch`/`_forward_batch`/`_mtp_forward_batch` in full**
+   (`runtime/direct_model_runner.py`). Confirmed: `mtp_prefill_batch`
+   (`:2486` in the pre-fix file) issues exactly ONE `_forward_batch(...,
+   qo_len=prompt_len, ...)` call for the target model, covering every
+   listed slot's full prompt in one `model.forward()` -- no host-side
+   chunking loop anywhere in this path, exactly as section 12 found.
+   Additionally (not previously noted): the draft/MTP model's own step-0
+   resync, reached via `_mtp_sync_and_propose_batch` ->
+   `_mtp_forward_batch`, is called with the SAME `num_new_tokens=prompt_len`
+   -- so the draft model ALSO does one giant non-chunked forward, not just
+   the target model.
+2. **Read native vLLM's real scheduler** (`/home/bot/vllm/vllm/v1/core/sched/
+   scheduler.py:476-477`): confirmed `token_budget` (from
+   `max_num_batched_tokens`, 2048 in this exact config per the launched
+   run's own log line `Chunked prefill is enabled with
+   max_num_batched_tokens=2048`) caps `num_new_tokens` PER SCHEDULER STEP
+   across the WHOLE running batch, regardless of concurrency -- native
+   never processes more than 2048-8192 tokens in one step, confirming the
+   doc's citation. **But also read `gpu_model_runner.py:2192,4386`**:
+   `logits_indices = query_start_loc[1:] - 1` and `sample_hidden_states =
+   hidden_states[logits_indices]` -- native NEVER projects more than one
+   row per running request through the LM head, in EVERY step (decode,
+   chunked-prefill, or otherwise). This second mechanism turned out to be
+   the one that actually matters here, not the chunking budget.
+3. **Profiled the real call directly** (new script,
+   `benchmarks/mtp_prefill_batch_memory_diag.py`, committed): monkey-patches
+   `runner.model.forward`/`compute_logits` and
+   `runner.mtp_model.forward`/`compute_logits` with thin wrappers recording
+   wall time + `torch.cuda.memory_allocated()` before/after each real call,
+   then calls the REAL, unmodified `mtp_prefill_batch(slots, prompts)` at
+   the exact c=4/`D1_CTX16K_FIXTURE` shape. GPU/process hygiene verified
+   idle via `nvidia-smi`/`pgrep`/`ps` immediately before every run in this
+   section (one process at a time throughout; confirmed a mid-session
+   coordinator check that flagged `nvidia-smi --query-compute-apps` as
+   empty during model load was a known false-negative of this machine's
+   WSL2 driver setup, not a hung process -- re-verified directly via `ps -p
+   <pid> -o pcpu,stat,etime` showing 90%+ CPU and running state).
+
+### 13.2 Pre-fix profile: the smoking gun
+
+| call | time | memory delta | output shape | rows actually read |
+|---|---:|---:|---|---:|
+| `target_model.forward` | 12.18s | +640 MiB | `[65536, 5120]` bf16 | all (real compute) |
+| `target_model.compute_logits` | **1.06s** | **+31040 MiB** | `[65536, 248320]` bf16 | **4 / 65536** |
+| `draft_model.forward` (step0) | 0.44s | +640 MiB | `[65536, 5120]` bf16 | all (real compute) |
+| `draft_model.compute_logits` (step0) | **15.20s** | **+31040 MiB** | `[65536, 248320]` bf16 | **4 / 65536** |
+| `draft_model.forward`/`compute_logits` (steps 1-2) | ~0.02s total | ~0 | `[4, ...]` | all (already small) |
+
+Total `mtp_prefill_batch` wall time: **29.197s**. Peak `torch.cuda
+.max_memory_allocated()`: **95702 MiB**; `nvidia-smi` after: **97094 MiB
+(99.2% of the 97887 MiB card)** -- matches section 12's reported
+97110/97887 almost exactly, confirming this diagnostic faithfully
+reproduces the flagged shape and configuration (`num_slots=concurrency`,
+`enable_cudagraph=False` -- back-derived as section 12's own likely
+configuration, since a `2x` cudagraph-reserved `num_slots` would have
+made the KV-cache baseline alone already exceed capacity once this
+waste is added, which did not happen).
+
+**Two findings, not one:**
+- The two `compute_logits` calls alone account for **16.26s of the 29.2s
+  total wall time (55.7%)** -- MORE than the two real model forward passes
+  combined (12.62s) -- for work that is 99.994% discarded.
+- The SECOND huge allocation (draft model's, needing another 30.3 GiB when
+  ~64 GiB is already resident) took **15.2s -- ~14x longer** than the
+  essentially-identical-shaped FIRST allocation (1.06s, at a lower ~32 GiB
+  baseline). This is direct evidence of near-OOM allocator-pressure
+  pathology (consistent with this machine's own documented WSL2
+  memory-allocation-is-slower gotcha) COMPOUNDING the waste, not just
+  "a big GEMM takes longer."
+
+### 13.3 Verdict on the hypothesis
+
+**Refuted in its literal form, confirmed in spirit.** Chunking the
+attention/FFN forward pass itself would not have fixed this: chunking a
+GEMM into N pieces does not reduce its total FLOPs, only reorganizes
+scheduling -- if `mtp_prefill_batch` were chunked but still called
+`compute_logits` on every position of every chunk, the SAME total ~60 GiB
+of wasted vocab-head compute would just be spread across more, smaller
+calls, with the SAME total waste and (per the peak-memory mechanism above)
+still enough transient pressure at c=4/16K to risk the near-OOM condition
+depending on how the chunks overlap.
+
+The real, chunking-orthogonal, and much larger-magnitude (`vocab_size`
+=248320x factor, not a small constant factor) inefficiency is: this
+runtime's own `mtp_prefill_batch` never adopted native's `logits_indices`
+mechanism (project only the position(s) actually needed through the vocab
+head) for its OWN batched-prefill path -- despite this exact idea being
+directly available by inspection of the very vLLM code this whole runtime
+is built alongside.
+
+### 13.4 The fix
+
+Added an opt-in `logits_last_position_only: bool = False` parameter to
+`_forward_batch` and `_mtp_forward_batch` (default `False`, preserving
+EVERY existing call site byte-for-byte -- `decode_batch`/`verify_batch`/
+`verify_batch_spec` genuinely need every position's logits for real MTP
+verification and never pass it), plus a `step0_logits_last_position_only`
+parameter threaded through `_mtp_sync_and_propose_batch`. When set, the
+hidden-state tensor is `index_select`-gathered down to one row per slot
+(each slot's own last position) BEFORE the vocab-head projection, instead
+of after -- the full, un-gathered `hidden_states` is still returned
+unchanged where callers need it (e.g. the draft-model sync step still
+needs the target model's FULL per-position hidden states to correctly
+resync its own recurrent/attention state over the whole prompt; only the
+`compute_logits` INPUT is sliced). Only `mtp_prefill_batch` sets these
+flags to `True`, since it is the only caller that already only reads each
+slot's own last-position logits/draft-token (confirmed by reading its own
+body: `target_logits[i * prompt_len + prompt_len - 1]` for the anchor, and
+`_mtp_sync_and_propose_batch`'s own `index_select(0, last_idx_tensor)` for
+the first draft token -- both discard every other row already).
+
+Files: `runtime/direct_model_runner.py` (`_forward_batch`,
+`_mtp_forward_batch`, `_mtp_sync_and_propose_batch`, `mtp_prefill_batch`);
+new diagnostic `benchmarks/mtp_prefill_batch_memory_diag.py` (committed,
+matches this project's convention of keeping diagnostics that found real
+bugs in the tree).
+
+### 13.5 A real bug in this fix's own first draft, caught by the existing regression suite
+
+The first version of this fix added a defensive `RuntimeError` inside
+`_mtp_sync_and_propose_batch`, asserting that
+`step0_logits_last_position_only=True` could never coincide with the
+captured-draft-step-graph branch (reasoning: `mtp_prefill_batch`'s prompt
+length is always far larger than `_MAX_DECODE_QO_LEN=16`, so the graph
+branch's own size gate should never fire for it). **This assumption was
+wrong** -- running the full regression suite immediately surfaced it:
+`mtp_verify_cudagraph_check.py` deliberately calls `mtp_prefill_batch`
+with a SHORT prompt (`"The capital of France is"`, a handful of tokens)
+under `enable_cudagraph=True`, specifically as its own regression check
+that the draft-step graph branch is correctly reachable from
+`mtp_prefill_batch`'s step-0 call (see that file's own docstring, lines
+89-95, written well before this round). In that legitimate configuration
+`num_new_tokens_list[0] <= _MAX_DECODE_QO_LEN` IS true, the graph branch
+IS taken, and the defensive check fired a hard `RuntimeError`, breaking a
+previously-passing suite.
+
+**Real fix**: track whether step 0's return value was ACTUALLY gathered to
+last-position-only (`step0_already_last_only`), which is only true when
+the EAGER branch ran AND the flag was requested -- not simply the raw
+`step0_logits_last_position_only` parameter value. When the graph branch
+is taken, the optimization is silently skipped (harmless: that branch only
+fires for `num_new_tokens <= 16`, far too small for the vocab-head cost to
+matter) and the pre-existing full-row `index_select` runs exactly as
+before. No `RuntimeError` needed. Re-ran `mtp_verify_cudagraph_check.py`
+after this correction: **PASS**, all 4 coverage flags true including
+`draft_step0_qo2_graph_replayed: true` -- confirming the graph path was
+genuinely exercised through this exact code and handled correctly. This is
+exactly the kind of thing this project's standing "run the full
+regression suite, not just the numbers" discipline exists to catch --
+credited to the suite, not found by inspection first.
+
+### 13.6 Before/after: the 16K/c=4 cell
+
+Real profiling call (`mtp_prefill_batch_memory_diag.py`, same shape,
+`num_slots=4`, no cudagraph):
+
+| | pre-fix | post-fix |
+|---|---:|---:|
+| `target_model.compute_logits` | 1.06s, +31040 MiB | 0.0014s, +2 MiB |
+| `draft_model.compute_logits` (step0) | 15.20s, +31040 MiB | 0.0014s, +3 MiB |
+| total `mtp_prefill_batch` wall time | 29.197s | 12.689s |
+| peak `torch` allocated | 95702 MiB | 45674 MiB |
+| `nvidia-smi` peak | 97094 MiB (99.2%) | 54214 MiB (55.4%) |
+
+Real end-to-end W1-S run at this shape (`mtp_w1s_our_runtime_perf.py
+--batched --fixture ctx16k --concurrency 4 --num-requests 8 --max-tokens
+256`, single rep, matching section 12's own D1 methodology -- 8 requests /
+2 sequential batches of 4 concurrent slots, no `--cudagraph` since
+back-deriving section 12's actual configuration from its memory-peak
+number showed it did not use `--cudagraph` either):
+
+| | pre-fix (section 12) | post-fix (this section) |
+|---|---:|---:|
+| accepted tok/s (ours) | 25.137 | **46.394** |
+| native tok/s (unchanged) | 121.960 | 121.960 |
+| gap (native/ours) | **4.852x slower** | **2.629x slower** |
+| TTFT mean | 34.0 s | **12.5 s** |
+| TTFT p99 | 52.1 s | **12.7 s** |
+| GPU memory peak | 97110/97887 MiB (99.2%) | **54216/97887 MiB (55.4%)** |
+| `gpu_busy_pct` | not reported | 90.83% (healthy) |
+
+**Throughput improved 84.6% (25.137 -> 46.394 tok/s) and the near-OOM
+condition is resolved** (55.4% peak, ~34 GB headroom instead of ~0.8%).
+The remaining 2.63x gap to native is a real, smaller, and structurally
+different problem -- see 13.8.
+
+### 13.7 Confirmed no regression: 4K/c=4 headline and full 4-suite battery
+
+**Headline** (`mtp_w1s_our_runtime_perf.py --batched --cudagraph --repeats
+3 --max-tokens 256 --concurrency 4 --fixture n16`, fresh process, GPU
+verified idle before):
+
+| rep | accepted tok/s |
+|---:|---:|
+| 1 | 146.940 |
+| 2 | 148.647 |
+| 3 | 147.381 |
+| **mean** | **147.656** |
+
+vs. the established **142.504** baseline (section 11.7) -- **no
+regression; a small genuine improvement (+3.6%)**, consistent with the fix
+also trimming a smaller amount of the same waste at 4K context (`qo_len
+=4096`, ~8x smaller than 16K's waste, but not zero). `draft_acceptance_rate
+_pct` (70.29204431017119%) and `total_committed_tokens` (4116) are
+bit-identical to every prior measurement in this project's history across
+all 3 reps -- confirms zero change to generation correctness/determinism.
+Note `mtp_prefill_batch`'s `qo_len=4096` here still exceeds
+`_MAX_DECODE_QO_LEN=16`, so this run exercises the EAGER (optimization-
+active) branch throughout, same as the 16K cell -- the graph-path
+fallback in 13.5 is not exercised by either of these production shapes,
+only by the short-prompt regression test.
+
+**Full regression suite**, fresh processes, GPU verified idle before each,
+one process at a time:
+
+| suite | result |
+|---|---|
+| `mtp_gdn_rollback_check.py --repeat 3` | **3/3 PASS** |
+| `mtp_batch_verify_check.py` | **PASS** (`check0`..`check3` all true) |
+| `mtp_ragged_recompute_verify_check.py` | **PASS** (all sub-checks true) |
+| `mtp_verify_cudagraph_check.py` | **PASS** (after the 13.5 correction; all 4 coverage flags true) |
+
+Zero regressions.
+
+### 13.8 What remains open: the residual ~2.63x gap
+
+The confirmed, dominant root cause (wasted full-position vocab-head
+projection) is fixed. The REMAINING gap is smaller and different in
+character: `target_model.forward` itself -- the real attention+FFN
+compute over 65536 positions across 64 layers -- still takes ~12.2s in
+one uninterrupted call, and total wall time for the real 2-batch/8-request
+run (44.3s) is dominated by this real compute, not by any further
+identifiable waste. Two candidate explanations for the residual gap,
+NEITHER confirmed here (reporting precisely rather than guessing, per this
+task's own instruction):
+
+- **Native's chunking may still matter, but for a different reason than
+  raw compute reduction**: interleaving a 2048-token prefill chunk with
+  other scheduler work could let native's engine loop overlap
+  host-side/scheduling latency with GPU compute across chunks in a way a
+  single giant blocking call cannot -- a scheduling-flexibility argument,
+  not a FLOPs argument.
+- **This runtime's attention kernel may be less efficient at this
+  specific huge-`qo_len` prefill shape than at the small-`qo_len`
+  decode/verify shapes it was tuned for** -- `build_attention_metadata_
+  batch` explicitly routes `qo_len > _MAX_DECODE_QO_LEN` to a different
+  ("general/chunked") kernel dispatch than the specialized fast decode
+  kernel; whether that dispatch is well-tuned for `qo_len=16384` has not
+  been separately profiled.
+
+**Not attempted this round, and correctly so per this task's scope**: real
+host-side chunking of `mtp_prefill_batch`'s forward call (splitting
+`prompt_len` into e.g. 2048-token pieces, matching native's own
+`max_num_batched_tokens`) is a plausible next lever for the residual gap,
+but it is a materially larger, riskier, structural change than this
+round's fix -- it requires correct incremental `kv_len`/position
+bookkeeping across chunks for BOTH the target and draft models, careful
+handling of the causal mask at chunk boundaries, and its own dedicated
+correctness re-validation, not just a parameter default. This round's fix
+was scoped to the CONFIRMED, dominant, safely-opt-in-fixable root cause;
+the residual gap is real but smaller (2.63x, not 4.85x) and its own root
+cause is not yet confirmed by direct profiling -- recommended as the next
+D1 follow-up if pursued, not forced here.

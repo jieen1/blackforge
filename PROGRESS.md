@@ -4,6 +4,42 @@ Updated: 2026-07-18
 
 ## Completed
 
+### Phase D1 follow-up, 16K/c=4 root-caused and fixed (2026-07-18) — wasted full-position vocab-head projection, not lack of chunking
+
+The prior D1 sweep entry below flagged 16K/c=4 as 4.85x slower than native
+with a 99.2%-of-capacity near-OOM peak, and offered an unverified
+hypothesis ("`mtp_prefill_batch` issues one non-chunked forward, unlike
+native's chunked prefill"). Direct instrumentation
+(`benchmarks/mtp_prefill_batch_memory_diag.py`, new, committed) **refutes
+that hypothesis in its literal form**: chunking the forward pass would not
+have helped, since it doesn't reduce total FLOPs. The REAL root cause,
+found by profiling the actual call: both the target model's prefill
+forward and the draft/MTP model's own step-0 sync forward projected
+**every position** of the full `concurrency x prompt_len` batch through
+the vocab head (`compute_logits`) instead of only each slot's own last
+position -- at this shape (vocab_size=248320) that's a `[65536, 248320]`
+bf16 tensor (~30.3 GiB) computed TWICE per prefill call, of which only 4
+of 65536 rows were ever read. The second such allocation alone took 15.2s
+(vs. 1.06s for the first, at a lower memory baseline) -- direct evidence
+of near-OOM allocator pressure compounding the waste.
+
+**Fix**: an opt-in `logits_last_position_only` parameter added to
+`_forward_batch`/`_mtp_forward_batch`/`_mtp_sync_and_propose_batch`
+(`runtime/direct_model_runner.py`), default `False` (byte-for-byte
+unaffected for `decode_batch`/`verify_batch`/`verify_batch_spec`, which
+genuinely need every position's logits) -- only `mtp_prefill_batch` sets
+it `True`. **Result**: 16K/c=4 gap to native narrows from **4.85x slower
+to 2.63x slower** (25.137 -> 46.394 accepted tok/s, +84.6%); GPU memory
+peak drops from **99.2% to 55.4%** of capacity; TTFT mean drops from 34.0s
+to 12.5s. **4K/c=4 headline does not regress** (142.504 -> 147.656 mean, a
+small genuine improvement); all 4 regression suites pass (one real bug in
+this fix's own first draft -- an overly-strict defensive assertion -- was
+caught by `mtp_verify_cudagraph_check.py` and corrected before landing).
+Full methodology, numbers, and the honestly-reported residual ~2.63x gap
+(not yet root-caused; real host-side prefill chunking is the next
+candidate lever, not attempted this round) in `notes/2026-07-18-session-
+review-and-next-steps.md` section 13.
+
 ### Phase D1, shape-generalization sweep (2026-07-18) — c=1 is NOT the weak spot; a worse one found at 16K/c=4
 
 Independent review's falsifier for the ~1.014x "parity" headline
