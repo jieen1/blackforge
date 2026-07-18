@@ -4,6 +4,45 @@ Updated: 2026-07-18
 
 ## Completed
 
+### Phase B, singular↔batch GDN verify mechanism divergence resolved (2026-07-18)
+
+Independent review's Phase B (`notes/2026-07-18-session-review-and-next-steps.md`
+§8.2): `mtp_verify_and_commit` (singular) still used the old chunked-GDN +
+snapshot/restore/recompute-forward mechanism while `mtp_verify_and_commit_batch`
+had migrated to the real spec-decode mechanism (Phase 2). Falsifier check
+(read `benchmarks/mtp_gdn_rollback_check.py` in full before touching code)
+confirmed it tests `snapshot_gdn_state`/`restore_gdn_state` directly, with
+no dependency on `mtp_verify_and_commit` at all -- **option (b) (deprecate
++ delete) is off the table; option (a) (migrate) is correct**, per the
+review's own stated falsifier rule.
+
+**Change**: `mtp_verify_and_commit` (singular) rewritten to call
+`verify_batch_spec`/`build_gdn_metadata_spec_batch`/`_ssm_spec_row` at
+`batch_size=1` -- the exact same mechanism `mtp_verify_and_commit_batch`
+already uses -- removing its snapshot/restore/recompute-forward branch
+entirely. `snapshot_gdn_state`/`restore_gdn_state`/the old chunked
+`verify_batch` are retained unchanged (still exercised directly by
+`mtp_gdn_rollback_check.py` and five other diagnostics), just no longer
+called from any production verify path. ~8 stale docstrings updated
+(including the cosmetic `_forward_batch` fix the review flagged) to match.
+
+**`check0` tolerance**: both `mtp_batch_verify_check.py`'s and
+`mtp_ragged_recompute_verify_check.py`'s already-near-tie-tolerant
+`check0` came back with **0 exact_mismatches AND 0 near_tie_divergences**
+this round (including the ragged suite's forced-reject scenario that
+previously produced the documented "271 vs 198" near-tie flip) -- bit-exact
+agreement is empirically restored now that both paths share one
+mechanism, though the near-tie-tolerant machinery itself is left in place
+(strictly weaker, costs nothing, still catches real regressions).
+
+**Regression**: all 4 suites fresh-run PASS (`mtp_gdn_rollback_check.py`
+3/3, `mtp_batch_verify_check.py` 4/4 checks, `mtp_ragged_recompute_verify_check.py`
+3/3 checks, `mtp_verify_cudagraph_check.py` all coverage flags true).
+**Perf**: W1-S 3-rep mean **148.193 tok/s** vs. the 147.656 baseline
+(+0.36%, noise-level) -- no regression, as expected since this migration
+only touches the non-`--batched` singular entry point. Full writeup:
+`notes/2026-07-18-session-review-and-next-steps.md` section 17.
+
 ### Phase D1, 64K/c=4 attempted: this runtime is CATEGORICALLY BLOCKED (hard capacity ceiling, not an OOM risk); real native number obtained instead (2026-07-18)
 
 Following up on the 32K/c=4 entry below's flagged "48K/64K spot-check"

@@ -643,10 +643,13 @@ def build_gdn_metadata_spec_batch(
     of the real ``GDNAttentionMetadataBuilder.build()`` (``gdn_attn.py``),
     hand-built for our fixed-slot runtime instead of vLLM's paged block
     table. Replaces ``build_gdn_metadata_batch``'s chunked/prefill-shaped
-    treatment of an MTP verify step for ``mtp_verify_and_commit_batch``
-    specifically (``mtp_verify_and_commit``, the singular/looped sibling,
-    keeps using the chunked path + snapshot/restore/recompute -- an
-    intentional, documented divergence, see notes doc section 10/11).
+    treatment of an MTP verify step -- originally for
+    ``mtp_verify_and_commit_batch`` only (``mtp_verify_and_commit``, the
+    singular/looped sibling, kept using the chunked path +
+    snapshot/restore/recompute -- an intentional, documented divergence,
+    see notes doc section 10/11), then (Phase B, same day) for
+    ``mtp_verify_and_commit`` too, called at ``len(slots)==1``: both
+    production verify paths now share this mechanism.
 
     ``qo_len`` here is always ``num_spec + 1`` (the K draft continuations
     + 1 bonus/anchor position) -- unlike ``build_gdn_metadata_batch``,
@@ -972,10 +975,11 @@ class DirectModelRunner:
         # value is 1 (not 0) for a slot's first-ever spec verify right
         # after a real prefill -- selects column 0, the same physical row
         # the chunked prefill forward itself wrote into. Reset to 1 on
-        # ``reset_slot`` and explicitly re-set to 1 in ``mtp_prefill_batch``
-        # for defense in depth. Unused by ``mtp_verify_and_commit`` (the
-        # singular/looped sibling), which still uses the old chunked +
-        # snapshot/restore + recompute-forward mechanism unconditionally.
+        # ``reset_slot`` and explicitly re-set to 1 in both
+        # ``mtp_prefill_batch`` and ``mtp_prefill`` for defense in depth.
+        # Phase B (2026-07-18): also read/updated by ``mtp_verify_and_commit``
+        # (the singular/looped sibling) -- both production verify paths
+        # share this bookkeeping now.
         self.slot_num_accepted_tokens = [1] * num_slots
 
         # Split-KV parallelism for decode/verify-shaped batched kernel calls
@@ -1400,19 +1404,35 @@ class DirectModelRunner:
         ``qo_len`` for every listed slot. The forward pass ALWAYS
         physically writes K/V for all ``qo_len`` positions regardless of
         this flag -- ``commit`` only controls this method's own
-        bookkeeping. Real MTP verify calls (``verify_batch``) pass
-        ``commit=False``, since the actual committed length is not known
-        until the caller's accept/reject decision runs on the returned
-        logits (2026-07-17, fixing the exact "physically-written vs.
-        committed" conflation Codex-sol's review flagged) -- the caller
-        (``mtp_verify_and_commit``) is responsible for advancing
-        ``slot_kv_len`` by the REAL committed length afterward. Attention's
-        own KV needs no explicit rollback either way (content/position
-        addressed -- positions beyond the real committed length are simply
-        never read again); only GDN's recurrent state needs the
-        snapshot/restore + recompute-forward repair on a non-full-accept
-        outcome, exactly as already verified by
-        ``benchmarks/mtp_gdn_rollback_check.py``.
+        bookkeeping. Real MTP verify calls (``verify_batch``/
+        ``verify_batch_spec``) pass ``commit=False``, since the actual
+        committed length is not known until the caller's accept/reject
+        decision runs on the returned logits (2026-07-17, fixing the exact
+        "physically-written vs. committed" conflation Codex-sol's review
+        flagged) -- the caller (``mtp_verify_and_commit``/``_batch``) is
+        responsible for advancing ``slot_kv_len`` by the REAL committed
+        length afterward. Attention's own KV needs no explicit rollback
+        either way (content/position addressed -- positions beyond the
+        real committed length are simply never read again).
+
+        **2026-07-18, Phase B update**: GDN's recurrent state used to need
+        an explicit ``snapshot_gdn_state``/``restore_gdn_state`` + a real
+        recompute-forward repair on a non-full-accept outcome -- that was
+        true for both ``mtp_verify_and_commit`` and
+        ``mtp_verify_and_commit_batch`` through 2026-07-18, then only for
+        the singular path (Phase 2 migrated the batched path off it), and
+        as of Phase B is no longer true for EITHER production verify path:
+        both now go through the real spec-decode GDN mechanism
+        (``gdn_spec_num_accepted_tokens_prev`` below), under which the
+        recurrent state's per-position OUTPUT is already causally valid
+        for every candidate position regardless of which are later
+        accepted -- only the STATE COMMIT (which physical row survives to
+        be read next round) is acceptance-aware, so no rollback is ever
+        needed. ``snapshot_gdn_state``/``restore_gdn_state`` themselves are
+        retained as tested, standalone primitives (still directly exercised
+        by ``benchmarks/mtp_gdn_rollback_check.py`` and several other
+        diagnostics -- see ``mtp_verify_and_commit``'s docstring), just no
+        longer called from any production verify path.
 
         ``is_decode`` (2026-07-17 addition, default ``True`` preserving
         ``decode_batch``/``verify_batch``'s existing behavior byte-for-byte):
@@ -1667,10 +1687,13 @@ class DirectModelRunner:
         return_hidden: bool = False,
     ) -> torch.Tensor:
         """MTP/speculative-decode verify via the REAL spec-decode GDN
-        mechanism (Phase 2, 2026-07-18) -- ``verify_batch``'s sibling for
-        ``mtp_verify_and_commit_batch`` only. Same call shape/return
-        convention as ``verify_batch`` (raw logits AND hidden states,
-        request-then-position order, ``commit=False`` -- caller advances
+        mechanism (Phase 2, 2026-07-18) -- ``verify_batch``'s sibling,
+        originally for ``mtp_verify_and_commit_batch`` only, and (Phase B,
+        same day) for ``mtp_verify_and_commit`` too (called at
+        ``len(slot_ids)==1``) -- both production verify paths share this
+        method now. Same call shape/return convention as ``verify_batch``
+        (raw logits AND hidden states, request-then-position order,
+        ``commit=False`` -- caller advances
         ``slot_kv_len``/``slot_num_accepted_tokens`` after accept/reject).
         The only difference is GDN metadata construction: K+1 dedicated
         SSM state rows per slot (``build_gdn_metadata_spec_batch``,
@@ -1750,8 +1773,21 @@ class DirectModelRunner:
         steps.md's section 8) instead of a blocking pageable D2H memcpy
         (89-117ms/round, per that doc's section 7). API/return shape is
         UNCHANGED (same dict keys, same per-layer ``(conv, ssm)`` tuple
-        shape) -- callers (``restore_gdn_state``, both
-        ``mtp_verify_and_commit``/``_batch``) do not need to change.
+        shape) -- callers (``restore_gdn_state``, and, at the time, both
+        ``mtp_verify_and_commit``/``_batch``) did not need to change.
+
+        **2026-07-18, Phase B**: neither production verify path
+        (``mtp_verify_and_commit``/``_batch``) calls this method any more
+        -- both migrated to the real spec-decode GDN mechanism (see
+        ``mtp_verify_and_commit``'s docstring), under which state commit is
+        acceptance-aware and no snapshot/restore is ever needed. This
+        method is retained as a tested, standalone primitive: a falsifier
+        check (before Phase B's migration) confirmed
+        ``benchmarks/mtp_gdn_rollback_check.py`` tests it directly
+        (independent of any MTP verify call), and several other
+        diagnostics (``mtp_real_draft_check.py``, ``mtp_trace_driven_probe.py``,
+        ``mtp_slot_identity_pinpoint_diag.py``, ``mtp_batch_divergence_diag.py``,
+        ``phase0_nsys_gap_ledger_diag.py``) call it directly too.
 
         Tags the snapshot with the SOURCE slot id and this slot's current
         generation counter (``self.slot_gdn_snapshot_gen``, bumped on
@@ -2028,6 +2064,13 @@ class DirectModelRunner:
             raise RuntimeError("no MTP draft model loaded")
         if self.slot_kv_len[slot] != 0 or self.slot_draft_sync_len[slot] != 0:
             raise RuntimeError(f"slot {slot} is not fresh")
+        # Phase 2/Phase B (2026-07-18), defense in depth: bootstrap value
+        # for the spec-decode GDN mechanism's first-ever verify round on
+        # this slot -- already 1 via __init__/reset_slot for any slot that
+        # actually went through one of those, set explicitly here too so
+        # this invariant holds regardless of how the slot got to "fresh"
+        # (mirrors mtp_prefill_batch's identical defense-in-depth line).
+        self.slot_num_accepted_tokens[slot] = 1
         target_logits, target_hidden = self._forward(
             slot, prompt_token_ids, start_pos=0, is_decode=False, return_hidden=True
         )
@@ -2046,59 +2089,92 @@ class DirectModelRunner:
 
     def mtp_verify_and_commit(self, slot: int, anchor: int, draft_tokens: list[int]) -> dict:
         """Unified MTP cycle funnel point for verify+commit+resync+propose
-        -- the ONE method a real multi-round loop calls repeatedly (no
-        separate "decode" coordinator needed; see the design note below on
-        why). Submits ``[anchor] + draft_tokens`` through the real,
-        already-verified ``verify_batch`` (``commit=False`` -- see its
-        docstring), applies greedy ``determine_accept_reject``, and on any
-        non-full-accept outcome repairs GDN state (``restore_gdn_state`` +
-        a real recompute forward for exactly the committed length) and
-        corrects ``slot_kv_len``. The draft model's own KV needs no repair
-        either way -- see ``_mtp_forward``'s docstring.
+        -- the ONE method a real multi-round loop calls repeatedly for a
+        SINGLE slot (no separate "decode" coordinator needed; see the
+        design note below on why).
 
-        Recompute input alignment (2026-07-17, fixed after a real bug was
-        caught by direct KV-content reasoning, not just shape/bookkeeping
-        checks -- see notes/direct-model-runner-design.md): the token
+        **2026-07-18, Phase B migration** (independent review's
+        ``notes/2026-07-18-session-review-and-next-steps.md`` Phase B,
+        option (a); see this session's own addendum for the falsifier
+        check and the result): now uses the REAL spec-decode GDN mechanism
+        (``verify_batch_spec``/``build_gdn_metadata_spec_batch``/
+        ``_ssm_spec_row``) -- the exact same mechanism
+        ``mtp_verify_and_commit_batch`` adopted in Phase 2, applied here at
+        batch_size=1 -- instead of the old chunked-GDN-metadata +
+        ``snapshot_gdn_state``/``restore_gdn_state`` + recompute-forward
+        mechanism this method used through 2026-07-18. This was the last
+        production call site of the old mechanism. ``snapshot_gdn_state``/
+        ``restore_gdn_state`` are NOT deleted as a result: the falsifier
+        check for this migration (before touching any code) confirmed
+        ``benchmarks/mtp_gdn_rollback_check.py`` tests them directly as
+        primitives (snapshot/restore around a real multi-step "detour",
+        with no MTP verify call involved at all), and several other
+        diagnostics (``mtp_real_draft_check.py``, ``mtp_trace_driven_probe.py``,
+        ``mtp_slot_identity_pinpoint_diag.py``, ``mtp_batch_divergence_diag.py``,
+        ``phase0_nsys_gap_ledger_diag.py``) call them directly too -- they
+        remain in the codebase as tested, live (if no longer
+        production-verify-path-connected) primitives. The old chunked
+        ``verify_batch`` is retained for the same reason (still called
+        directly by several diagnostics and by ``decode_batch``'s qo_len=1
+        path via ``build_gdn_metadata_batch``).
+
+        Why no accept/reject branch is needed any more (mirrors
+        ``mtp_verify_and_commit_batch``'s own docstring): GDN's recurrent
+        state, under the real spec-decode kernel, computes a causally-valid
+        PER-POSITION output for every one of the K+1 candidate positions in
+        a single verify forward, unconditionally -- only the recurrent
+        STATE COMMIT (which physical row survives to be read next round) is
+        acceptance-aware, via ``num_accepted_tokens``/``_ssm_spec_row``.
+        This slot's hidden states for positions ``0..committed_len-1`` are
+        therefore already sitting in ``verify_hidden``, correct, from the
+        ONE verify forward this method issues -- a plain slice (never a
+        second forward pass) is all the draft resync step needs, for a
+        full accept exactly as much as for any partial reject.
+
+        Persistent per-slot bookkeeping this method updates:
+        ``self.slot_num_accepted_tokens[slot]`` (this slot's real committed
+        length from ITS OWN last verify round, or bootstrap 1 right after a
+        real ``mtp_prefill``) -- read by ``build_gdn_metadata_spec_batch``
+        (via ``verify_batch_spec``) to select which of last round's K+1
+        dedicated SSM rows holds the valid state to resume from.
+
+        Recompute input alignment (2026-07-17, unchanged by this
+        migration -- see notes/direct-model-runner-design.md): the token
         whose OWN K/V gets written at position ``kv_len_before + i`` is
-        the i-th QUERY INPUT of that forward call, matching
-        ``verify_batch``'s own convention where ``draft[0]=anchor``'s K/V
-        lands at ``kv_len_before`` (mirroring ``prefill()``/``decode()``'s
-        established contract: the anchor/greedy-next token is NOT written
-        into KV until it is fed back in as the FOLLOWING call's input).
-        ``decision["committed"]`` is ``[accepted_draft_0, ..., accepted_
-        draft_{n-1}, recovery]`` -- the recovery/bonus token is, symmetrically,
-        NOT yet written into KV either (it becomes the next round's own
-        anchor-equivalent). So the real input tokens for positions
-        ``kv_len_before..+committed_len-1`` are ``real_new_tokens =
-        [anchor] + committed[:-1]`` (anchor + accepted drafts, dropping the
-        not-yet-written recovery token) -- NOT ``committed`` itself, which
-        would silently write the WRONG token content into the KV cache
-        while still looking correct on every shape/length/bookkeeping
-        check (exactly why the verification gradient calls for real
-        numerical/content checks, not just invariant checks).
+        the i-th QUERY INPUT of the verify forward, matching
+        ``verify_batch``/``verify_batch_spec``'s shared convention where
+        ``draft[0]=anchor``'s K/V lands at ``kv_len_before`` (mirroring
+        ``prefill()``/``decode()``'s established contract: the
+        anchor/greedy-next token is NOT written into KV until it is fed
+        back in as the FOLLOWING call's input). ``decision["committed"]``
+        is ``[accepted_draft_0, ..., accepted_draft_{n-1}, recovery]`` --
+        the recovery/bonus token is, symmetrically, NOT yet written into KV
+        either (it becomes the next round's own anchor-equivalent). So the
+        real input tokens for positions ``kv_len_before..+committed_len-1``
+        are ``real_new_tokens = [anchor] + committed[:-1]`` (anchor +
+        accepted drafts, dropping the not-yet-written recovery token) --
+        NOT ``committed`` itself, which would silently write the WRONG
+        token content into the KV cache while still looking correct on
+        every shape/length/bookkeeping check.
 
         Draft catch-up + next-round propose, folded into ONE call
-        (2026-07-17 multi-round design): after committing, the draft's own
-        KV is behind by exactly ``real_new_tokens`` (it was last synced at
-        the END of the PREVIOUS round -- ``mtp_prefill``/this same method
-        -- so ``slot_draft_sync_len`` always equals ``slot_kv_len`` from
-        BEFORE this round's commit). Syncing the draft over
-        ``real_new_tokens`` (shifted by one, ending in the recovery/bonus
-        token as the final candidate -- exactly ``_mtp_sync_and_propose``'s
-        existing step-0 pattern, just generalized from
-        ``mtp_prefill``'s "whole prompt" range to "this round's newly
-        committed range") both catches the draft's KV up to
-        ``slot_kv_len`` again (restoring the invariant) AND, at that same
-        call's LAST position (processing the recovery/bonus token as a
-        candidate against the target's hidden state up through the last
-        real position), produces the FIRST draft token for the NEXT
-        round -- for free, no extra forward call. ``_mtp_sync_and_propose``
-        then runs the usual K-1 further autoregressive steps on top. This
-        mirrors real vLLM's own design (propose() runs immediately after
-        postprocess_sampled(), not as a separate deferred step) more
-        closely than an earlier draft of this method (which returned an
-        unused ``last_hidden`` and left resync/propose to a separate,
-        never-built ``mtp_decode``).
+        (2026-07-17 multi-round design, unchanged by this migration): after
+        committing, the draft's own KV is behind by exactly
+        ``real_new_tokens`` (it was last synced at the END of the PREVIOUS
+        round -- ``mtp_prefill``/this same method -- so
+        ``slot_draft_sync_len`` always equals ``slot_kv_len`` from BEFORE
+        this round's commit). Syncing the draft over ``real_new_tokens``
+        (shifted by one, ending in the recovery/bonus token as the final
+        candidate -- exactly ``_mtp_sync_and_propose``'s existing step-0
+        pattern, just generalized from ``mtp_prefill``'s "whole prompt"
+        range to "this round's newly committed range") both catches the
+        draft's KV up to ``slot_kv_len`` again (restoring the invariant)
+        AND, at that same call's LAST position (processing the
+        recovery/bonus token as a candidate against the target's hidden
+        state up through the last real position), produces the FIRST draft
+        token for the NEXT round -- for free, no extra forward call.
+        ``_mtp_sync_and_propose`` then runs the usual K-1 further
+        autoregressive steps on top.
 
         Returns the accept/reject decision plus ``next_anchor`` (the
         recovery/bonus token -- feed this as ``anchor`` to the NEXT
@@ -2107,31 +2183,28 @@ class DirectModelRunner:
         k = len(draft_tokens)
         draft = [anchor] + draft_tokens
         kv_len_before = self.slot_kv_len[slot]
-        snapshot = self.snapshot_gdn_state(slot)
-        verify_logits, verify_hidden = self.verify_batch(
-            [slot], [draft], [kv_len_before], return_hidden=True
+        num_accepted_prev = self.slot_num_accepted_tokens[slot]
+
+        verify_logits, verify_hidden = self.verify_batch_spec(
+            [slot],
+            [draft],
+            [kv_len_before],
+            num_accepted_tokens_prev=[num_accepted_prev],
+            return_hidden=True,
         )
         decision = determine_accept_reject(draft, verify_logits)
         committed_len = decision["num_accepted"] + 1
         # Real input tokens for positions kv_len_before..+committed_len-1:
         # anchor followed by the accepted drafts (NOT the recovery token --
-        # see the docstring above). Valid for EITHER branch below.
+        # see the docstring above).
         real_new_tokens = [anchor] + decision["committed"][:-1]
 
-        if decision["num_accepted"] == k:
-            self.slot_kv_len[slot] = kv_len_before + k + 1
-            real_new_hidden = verify_hidden
-        else:
-            self.restore_gdn_state(slot, snapshot)
-            self.slot_kv_len[slot] = kv_len_before
-            _, real_new_hidden = self._forward_batch(
-                [slot],
-                [real_new_tokens] if committed_len > 1 else real_new_tokens,
-                [kv_len_before],
-                qo_len=committed_len,
-                commit=True,
-                return_hidden=True,
-            )
+        self.slot_kv_len[slot] = kv_len_before + committed_len
+        self.slot_num_accepted_tokens[slot] = committed_len
+        # Ragged slice of the ONE verify forward's hidden states -- valid
+        # for a full accept exactly as much as for any partial reject, see
+        # the docstring above.
+        real_new_hidden = verify_hidden[:committed_len]
 
         next_anchor = decision["committed"][-1]
         next_draft_tokens = self._mtp_sync_and_propose(
@@ -2650,12 +2723,17 @@ class DirectModelRunner:
         DIFFERENT qo_len per ragged recompute group), this graph lookup is
         now always the exact same shape every round, for every slot.
 
-        ``mtp_verify_and_commit`` (the singular/looped sibling) is
-        intentionally NOT migrated -- it still uses the old chunked +
-        snapshot/restore + recompute-forward mechanism unconditionally,
-        so ``snapshot_gdn_state``/``restore_gdn_state`` remain in place
-        (still exercised by ``benchmarks/mtp_gdn_rollback_check.py`` and
-        by the singular path), just no longer called from here.
+        **2026-07-18, Phase B**: ``mtp_verify_and_commit`` (the
+        singular/looped sibling) was, through this point, intentionally
+        NOT migrated -- it used the old chunked + snapshot/restore +
+        recompute-forward mechanism unconditionally. Phase B (see that
+        method's own docstring) migrated it to this SAME spec-decode
+        mechanism, applied at batch_size=1 -- both production verify paths
+        now share one mechanism. ``snapshot_gdn_state``/``restore_gdn_state``
+        remain in the codebase regardless (a falsifier check confirmed
+        ``benchmarks/mtp_gdn_rollback_check.py`` and several other
+        diagnostics test/use them directly, independent of either verify
+        path), just no longer called from ANY production verify path.
 
         Returns a dict keyed by slot id, each value shaped exactly like
         ``mtp_verify_and_commit``'s own return dict (plus ``next_anchor``/

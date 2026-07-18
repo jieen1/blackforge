@@ -2309,3 +2309,202 @@ lower-risk follow-up than the full fix in item 2 above.
   `benchmarks/generate_synthetic_fixtures.py`,
   `benchmarks/mtp_w1s_our_runtime_perf.py`, and
   `benchmarks/w1s_native_bench.py`.
+
+---
+
+## 17. Phase B: the singular↔batch GDN verify mechanism divergence resolved (executed 2026-07-18)
+
+**Task**: this doc's own §8.2 Phase B ("Resolve the singular↔batch
+mechanism divergence", P1 tech debt). Two options were on the table: (a)
+migrate `mtp_verify_and_commit` (singular) to the same spec-decode GDN
+mechanism `mtp_verify_and_commit_batch` adopted in Phase 2, or (b)
+formally deprecate the singular path and delete
+`snapshot_gdn_state`/`restore_gdn_state`. §8.2's own falsifier for (b):
+"if any diagnostic genuinely needs the snapshot/restore primitive (e.g.
+`mtp_gdn_rollback_check.py` validates it directly), (b) is off the
+table and (a) is the path."
+
+### 17.1 Falsifier check: option (b) is off the table
+
+Read `benchmarks/mtp_gdn_rollback_check.py` in full before touching any
+code. It does not go anywhere near `mtp_verify_and_commit` at all -- it
+drives two independent physical slots through plain `_forward`/`decode`
+calls, calls `runner.snapshot_gdn_state(detour_slot)` directly, runs 4
+real extra decode steps as a "detour," then calls
+`runner.restore_gdn_state(detour_slot, snapshot)` directly and asserts the
+restored slot's logits and all-48-layer GDN state tensors are BYTEWISE
+IDENTICAL to a twin slot that never took the detour. This is the file's
+entire purpose ("the decisive test for whether restore() actually undoes
+the detour's real state changes, not just makes the generated text look
+plausible afterward") -- a direct, load-bearing test of the two primitives
+themselves, with zero dependency on any MTP verify call. Per §8.2's own
+falsifier wording, this conclusively takes option (b) off the table.
+**Option (a) is the path**, confirmed by direct evidence, not assumption.
+
+(Independently, `mtp_batch_divergence_diag.py`, `mtp_real_draft_check.py`,
+`mtp_trace_driven_probe.py`, `mtp_slot_identity_pinpoint_diag.py`, and
+`phase0_nsys_gap_ledger_diag.py` all also call `snapshot_gdn_state`/
+`restore_gdn_state` directly, independent of either verify entry point --
+further reinforcing that these are live, tested primitives regardless of
+what `mtp_verify_and_commit` does.)
+
+### 17.2 What changed: `runtime/direct_model_runner.py`
+
+Read `mtp_verify_and_commit` (singular) and `mtp_verify_and_commit_batch`
+(the already-migrated Phase 2/CUDA-graph-reconciliation version, §§11-12
+above) side by side. The batched method's own mechanism
+(`verify_batch_spec`/`build_gdn_metadata_spec_batch`/`_ssm_spec_row`,
+already generic over `slots: list[int]`) required no new design to apply
+at `batch_size=1` -- exactly the "more direct, simpler application of the
+same already-proven mechanism" this task anticipated:
+
+- `mtp_verify_and_commit`'s body was rewritten to call `self.verify_batch_spec`
+  (passing `num_accepted_tokens_prev=[self.slot_num_accepted_tokens[slot]]`)
+  instead of `self.verify_batch` + `self.snapshot_gdn_state`. The
+  full-accept/partial-reject branch was removed entirely: `slot_kv_len`
+  and `slot_num_accepted_tokens` are now updated unconditionally to
+  `kv_len_before + committed_len` / `committed_len`, and the draft resync
+  step's input hidden states are a plain slice `verify_hidden[:committed_len]`
+  of the ONE verify forward's output -- valid for a full accept exactly as
+  much as for any partial reject, per the same "GDN's per-position OUTPUT
+  is already causally valid; only the STATE COMMIT is acceptance-aware"
+  reasoning `mtp_verify_and_commit_batch`'s own Phase 2 docstring
+  established. No `_forward_batch` recompute call, no
+  `restore_gdn_state` call, remain in this method.
+- `mtp_prefill` (singular) gained the same defense-in-depth
+  `self.slot_num_accepted_tokens[slot] = 1` bootstrap line
+  `mtp_prefill_batch` already had (the value is already 1 via
+  `__init__`/`reset_slot` for any slot that went through either, but the
+  explicit set removes the implicit dependency, matching the batched
+  method's own stated rationale).
+- `snapshot_gdn_state`/`restore_gdn_state`/the old chunked `verify_batch`
+  are **NOT deleted** (per §17.1) -- they remain exactly as they were,
+  still exercised by `mtp_gdn_rollback_check.py` and the other diagnostics
+  listed above. They are simply no longer called from ANY production MTP
+  verify path (neither singular nor batched) as of this change.
+- Docstrings updated to match (no longer describing the singular path as
+  "intentionally not migrated"): `mtp_verify_and_commit`'s own docstring
+  (full rewrite, mirroring `mtp_verify_and_commit_batch`'s Phase 2
+  docstring structure), `mtp_verify_and_commit_batch`'s paragraph that
+  previously said the singular sibling "is intentionally NOT migrated",
+  `build_gdn_metadata_spec_batch`'s docstring, `verify_batch_spec`'s
+  docstring ("only" -> also singular), `snapshot_gdn_state`'s docstring
+  (added an explicit "neither production path calls this any more, kept
+  as a tested standalone primitive" note), the `__init__` comment next to
+  `self.slot_num_accepted_tokens`'s allocation, and the cosmetic stale
+  docstring the original review flagged in `_forward_batch`'s `commit`
+  parameter section (previously described GDN rollback as unconditionally
+  needed on non-full-accept "as already verified by
+  `benchmarks/mtp_gdn_rollback_check.py`" -- now describes the real
+  spec-decode mechanism and the fact that neither production path needs
+  rollback any more, with `snapshot_gdn_state`/`restore_gdn_state`
+  explicitly noted as retained-but-disconnected primitives).
+
+No change was made to `_mtp_sync_and_propose`/`_mtp_forward` (the
+singular draft-model sync/propose helpers) or to `build_attention_metadata`
+(the singular attention-metadata builder) -- these are a separate,
+un-flagged divergence (the draft model registers no GDN layer at all, so
+they were never part of "the GDN verify mechanism divergence" this Phase
+targeted) and were out of this task's scope.
+
+### 17.3 `check0`'s tolerance: empirically back to bit-exact, not merely re-loosened
+
+Both `mtp_batch_verify_check.py`'s `check0_batch1_equivalence` and
+`mtp_ragged_recompute_verify_check.py`'s
+`check0_batch1_forced_reject_equivalence` already carry the near-tie-tolerant
+methodology Phase 2 introduced (§11.2) -- since that methodology is a
+strict superset of bit-exact (an exact match trivially satisfies "own
+reference check passes on both sides, no divergence to explain"), no code
+change to either check was needed to test whether bit-exactness actually
+returned; the existing near-tie machinery reports it directly via its
+`exact_mismatches`/`near_tie_divergences` fields.
+
+**Result, this round's fresh runs**: both checks report **zero**
+`near_tie_divergences` AND zero `exact_mismatches` --
+`mtp_batch_verify_check.py`'s check0 (6 organic rounds) and
+`mtp_ragged_recompute_verify_check.py`'s check0 (6 rounds, each with a
+forced decoy reject cycling through positions 0/1/2 -- the exact scenario
+that previously produced the documented "271 vs 198" near-tie flip at
+round 3) both came back with the singular and batched paths committing
+IDENTICAL tokens every round. This is the expected outcome now that both
+paths call the literal same underlying primitive
+(`verify_batch_spec`/`build_gdn_metadata_spec_batch`) at `batch_size=1` --
+the previously-observed divergence was a genuine artifact of the two
+paths using different mechanisms (chunked vs. spec), not of batch_size=1
+vs. batch_size=4 cross-slot batching effects (which check0 was never
+exposed to in the first place, since both its slots run at `len(slots)=1`).
+
+Per this task's own gate ("restore `check0`'s bit-exact assumption ... or
+explicitly document why it still can't be"): **bit-exact agreement is
+empirically restored** for both check0 tests at their current sample size
+(6 rounds each, one of which forces rejects at all 3 possible positions).
+This is stated as an empirical observation over these specific runs, not
+a mathematical proof that NO input can ever produce a divergence between
+`len(slots)=1` calls that happen to run through different Python call
+sites (`mtp_verify_and_commit` vs. `mtp_verify_and_commit_batch([s], ...)`)
+-- both now bottom out in the identical `verify_batch_spec`/`_forward_batch`
+call with identical arguments, so no NEW noise source was introduced by
+this migration; any residual risk of divergence is the same as calling
+the same function twice on different slot ids, which is not expected to
+differ. The near-tie-tolerant methodology in both files is **left in
+place** (not reverted to a hard bit-exact assertion) since it is strictly
+weaker and costs nothing -- both checks will still catch a real
+regression (an "unexplained" mismatch that fails one side's own reference
+check), and will not spuriously fail if some future change reintroduces a
+genuine mechanism difference for an unrelated reason.
+
+### 17.4 Regression suite (fresh runs, this round)
+
+| Suite | Result |
+|---|---|
+| `mtp_gdn_rollback_check.py --repeat 3` | **3/3 PASS** (bit-exact, unaffected -- tests the primitives directly, not through either verify path) |
+| `mtp_batch_verify_check.py` | **PASS**, all 4 sub-checks true; `check0_batch1_equivalence`: 0 exact_mismatches, 0 near_tie_divergences, self_consistent |
+| `mtp_ragged_recompute_verify_check.py` | **PASS**, all 3 sub-checks true; `check0_batch1_forced_reject_equivalence`: 0 exact_mismatches, 0 near_tie_divergences (the previously-documented 271/198 flip did not recur) |
+| `mtp_verify_cudagraph_check.py` | **PASS**; `per_slot_ok` all true across all 8 scenarios + shrinking-batch; all 4 coverage flags (`verify_graph_batch4_replayed`, `verify_graph_batch2_replayed`, `draft_step0_qo2_graph_replayed`, `draft_continuation_graph_replayed`) true -- unaffected by this change (it exercises the already-migrated batched path's graph machinery, untouched here) |
+
+GPU/process hygiene (`pgrep -af`, `nvidia-smi --query-gpu`/`--query-compute-apps`)
+confirmed clean (idle, no compute apps) before this round started and
+after every one of the four suites and the perf run below.
+
+### 17.5 Performance: no regression to the headline number
+
+`python -m benchmarks.mtp_w1s_our_runtime_perf --batched --cudagraph --repeats 3 --max-tokens 256 --concurrency 4 --fixture n16`
+(same protocol as every prior W1-S measurement; current baseline per
+PROGRESS.md's D1 vocab-logits-fix entry: **147.656 mean tok/s**).
+
+| Rep | accepted_tokens/s | ms/accepted token | draft acceptance % | gpu_busy_pct |
+|---|---:|---:|---:|---:|
+| 1 | 148.675 | 6.726 | 70.292 | 90.59% |
+| 2 | 147.313 | 6.788 | 70.292 | 90.55% |
+| 3 | 148.592 | 6.730 | 70.292 | 90.59% |
+| **mean** | **148.193** | 6.748 | 70.292 | 90.58% |
+
+`total_committed_tokens` (4116) and `draft_acceptance_rate_pct`
+(70.29204431017119%) are bit-for-bit identical across all 3 reps and
+identical to the pre-Phase-B baseline (§12.4) -- expected, since this
+migration only touches the singular (non-batched) code path, which the
+`--batched --cudagraph` benchmark never calls. **148.193/147.656 = 1.0036x
+-- no regression** (a hair above baseline, well within this project's own
+established rep-to-rep noise band). This is the expected outcome: Phase B
+is a correctness/tech-debt change to the ALREADY-slower, non-`--batched`
+entry point, not a performance change to the headline `--batched
+--cudagraph` path at all.
+
+### 17.6 Bottom line
+
+Option (a) was correct, confirmed by directly reading
+`mtp_gdn_rollback_check.py` rather than assuming. `mtp_verify_and_commit`
+(singular) now shares the exact same real spec-decode GDN mechanism as
+`mtp_verify_and_commit_batch`, applied at batch_size=1 -- one GDN verify
+mechanism in the tree, per this doc's own Phase B gate.
+`snapshot_gdn_state`/`restore_gdn_state` remain as tested, live (if
+production-verify-disconnected) primitives, not dead code -- confirmed
+before touching anything, not asserted after the fact. `check0` in both
+`mtp_batch_verify_check.py` and `mtp_ragged_recompute_verify_check.py`
+empirically returned to bit-exact agreement (0 near-tie divergences, 0
+exact mismatches) while keeping its near-tie-tolerant machinery in place
+as a strictly-weaker, cost-free safety margin -- satisfying this doc's own
+gate ("`check0` states its tolerance explicitly") without needing to
+choose between reverting to a hard assertion and leaving the tolerance
+unexplained. All 4 regression suites pass fresh; the W1-S headline number
+shows no regression (148.193 vs. 147.656 baseline, +0.36%, noise-level).
