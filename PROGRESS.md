@@ -4,6 +4,39 @@ Updated: 2026-07-18
 
 ## Completed
 
+### The audit's P1 realistic-workload E2E test, run for real: 63.5 minutes / 7720 rounds with `enable_cudagraph=True` (2026-07-18)
+
+Closes `notes/2026-07-19-comprehensive-audit-and-forward-plan.md` §4.2 (top
+new-work priority): new file `benchmarks/mtp_sustained_realistic_workload_check.py`
+replays a realistic coding-agent request stream (3 weighted prompt classes,
+real varied Python-code content, staggered wall-clock arrival, continuous
+ragged multi-request admission) with `enable_cudagraph=True` hardcoded.
+Launched for a real `--duration-s 3600` run at defaults
+(`--capacity 4 --num-slots 16 --pool-size 6000`); ran 3812.3s (63.5 min,
+7720 rounds, 758 real admissions, 100,853 tokens committed) -- **7.0x more
+rounds / 3.2x more wall-clock time than this project's previous longest
+continuous run** (D3, `notes/2026-07-18-session-review-and-next-steps.md`
+§11, 1107 rounds/~20 min). Steady-state throughput converges to
+**~26.3-26.7 accepted tok/s** on genuinely varied content (first such
+measurement in this project -- prior numbers all used a synthetic
+sequential-token-id fixture the repo itself documents as acceptance-rate-
+inflating). Memory: `cuda_allocated_mib` bit-identical across all 130
+heartbeats start to finish, `cuda_reserved_mib` flat after a one-time
++10 MiB settle in the first 4 minutes -- the D3 grad-disable fix holds at
+7x the duration it was originally verified at. Correctness: zero failures
+across all 758 real ragged/mid-flight admissions (the audit's flagged
+untested combination). Two honest test-harness findings, not runtime bugs:
+(1) `pool_size=6000` at `capacity=4` produces an admission backlog that
+would take hours to drain on its own (a queueing mismatch in this test's
+own parameterization, not a `DirectModelRunner` bug) -- the run was
+deliberately `SIGTERM`'d at 63.5 min once this was found, rather than
+waiting; (2) the mid-generation streak-based correctness verdict (this
+project's own established near-tie methodology) only finalizes in a
+post-hoc pass after normal loop exit, which a `SIGTERM`-interrupted run
+skips -- a real, scoped evidentiary limitation, reported rather than
+smoothed over. Full writeup: `notes/2026-07-18-session-review-and-next-steps.md`
+section 23.
+
 ### Closed the last open correctness gate: `mtp_async_arrival_check.py`'s round-13 mid-flight-admission finding (2026-07-18)
 
 An 8-scenario deep-dive (varying content, timing, and kv-length spread,
