@@ -4,6 +4,38 @@ Updated: 2026-07-19
 
 ## Completed
 
+### Ragged-length batched prefill (DONE) + mid-flight slot admission (built, structurally demonstrated, one open finding) -- the last major D2 gap (2026-07-19)
+
+Closes the original independent review's D2 item (`notes/2026-07-18-
+session-review-and-next-steps.md` §8/§21): `mtp_prefill_batch` no longer
+hard-requires uniform prompt length across a batch -- it reuses the
+already-built, already-verified per-slot ragged `qo_len` mechanism
+`_forward_batch`/`_mtp_sync_and_propose_batch` gained 2026-07-17 for the
+recompute-fallback batching round, so no new kernel/metadata mechanism
+was needed. Dedicated correctness test `benchmarks/mtp_ragged_prefill_
+check.py`: **PASS** (both checks), after a real finding -- cross-slot
+batched PREFILL of heterogeneous-content requests shows near-tie
+numerical noise vs. a singular reference, confirmed present in the
+untouched, pre-existing uniform-length code path too, not introduced by
+this change -- was root-caused and the test's tolerance model corrected
+to match this project's own established near-tie convention.
+
+A real async-arrival driver (`benchmarks/mtp_async_arrival_check.py`, 6
+requests, staggered arrival, different lengths, slot reuse) confirms
+mid-flight admission is structurally supported by the EXISTING mechanism
+(zero production code changes needed for this half) -- all 6 requests
+admit/generate/finish correctly. One real, characterized (not hand-waved)
+numerical-noise finding was found at a batch-composition shape never
+exercised before (mixing freshly-admitted and long-running slots): a
+7.9375-logit-unit divergence, self-healing within one round, decoded to a
+"continue vs. break a repeated phrase" near-tie, not a data-corruption
+bug -- flagged as an explicit, precisely-scoped open follow-on rather than
+claimed closed, per this task's own stated discipline. Full 4-suite
+regression battery: PASS. 4K/c=4 headline re-measured: 156.939 tok/s mean,
+bit-identical `total_committed_tokens`/`draft_acceptance_rate_pct` to
+every prior measurement -- confirms zero regression. Full writeup:
+`notes/2026-07-18-session-review-and-next-steps.md` section 21.
+
 ### Fixed `mtp_w1s_our_runtime_perf.py`'s hardcoded `"passed": True` literal (2026-07-18)
 
 Follow-up hygiene fix for the finding directly below (also §20.3/20.5 of

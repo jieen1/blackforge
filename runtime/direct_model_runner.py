@@ -2642,12 +2642,45 @@ class DirectModelRunner:
         forward (``_forward_batch``, now able to accept never-forwarded
         slots -- see its 2026-07-17 GDN-init-guard relaxation) covering
         every listed slot, followed by ONE batched draft-sync+propose
-        funnel (``_mtp_sync_and_propose_batch``). Requires every listed
-        slot's prompt to have the SAME length (the uniform-``qo_len``
-        constraint ``build_attention_metadata_batch`` documents) -- true
-        for this project's W1-S/W2-S frozen fixtures (every prompt is
-        exactly the configured ``input_len``), so this is a documented
-        scope boundary, not a limitation for the intended benchmark use.
+        funnel (``_mtp_sync_and_propose_batch``).
+
+        **2026-07-19, continuous-batching round (ragged-length prefill):**
+        prompts no longer need the SAME length. Through this round, this
+        method hard-asserted every slot's prompt was exactly the same
+        length (true for the W1-S/W2-S frozen fixtures, but not for real
+        async serving, where different requests genuinely arrive with
+        different prompt lengths). This is now generalized -- see the
+        ``elif is_uniform_len`` / ``else`` split in the body below -- by
+        reusing the SAME per-slot-ragged ``qo_len``/``num_new_tokens`` LIST
+        mechanism ``_forward_batch``/``_mtp_sync_and_propose_batch`` already
+        built and verified for the 2026-07-17 recompute-fallback batching
+        round (see their own docstrings: ``build_attention_metadata_batch``/
+        ``build_gdn_metadata_batch`` already construct correct CSR/
+        cu_seqlens-style metadata for a ragged per-request qo_len list; the
+        general/chunked attention kernel this routes to is already
+        documented, in ``vllm/v1/attention/backends/sm120_gqa.py``, as
+        correct for "arbitrary mixed prefill+decode batches" -- ragged
+        MULTI-REQUEST prefill lengths are exactly that kernel's designed use
+        case, not new territory). No new kernel/metadata mechanism was
+        needed for this -- confirmed by direct reading before writing this
+        branch, the same discipline the chunking round below already
+        established. Every EXISTING (uniform-length) caller takes the
+        EXACT SAME code path as before, byte-for-byte (the ``elif
+        is_uniform_len`` branch is the untouched pre-2026-07-19 code) --
+        only a genuinely ragged batch exercises the new ``else`` branch.
+
+        ``chunk_size`` is NOT YET generalized to ragged batches: the
+        chunked loop below advances every slot's chunk boundary in
+        lockstep from a single shared ``running_kv_len``/
+        ``running_draft_len`` counter, which assumes uniform length by
+        construction. Combining ragged lengths with ``chunk_size`` raises
+        ``NotImplementedError`` with an explicit message rather than
+        silently mis-chunking -- a precisely scoped, real follow-on (see
+        ``notes/2026-07-18-session-review-and-next-steps.md`` section 21),
+        not something this round needed: real async admission prompts are
+        far short of the 8K+ context where chunking's memory benefit
+        matters, so this is a deliberate scope boundary, not a gap in the
+        common case.
 
         **2026-07-18, D1-followup fix**: both the target model's prefill
         forward and the draft model's step-0 sync forward now pass
@@ -2727,9 +2760,25 @@ class DirectModelRunner:
         num_reqs = len(slots)
         if len(prompts_per_slot) != num_reqs:
             raise ValueError("slots and prompts_per_slot must have equal length")
-        prompt_len = len(prompts_per_slot[0])
-        if not all(len(p) == prompt_len for p in prompts_per_slot):
-            raise ValueError("mtp_prefill_batch requires every slot's prompt to have equal length")
+        if num_reqs == 0:
+            return {}
+        prompt_lens = [len(p) for p in prompts_per_slot]
+        is_uniform_len = len(set(prompt_lens)) <= 1
+        # 2026-07-19: chunking's loop below advances every slot's chunk
+        # boundary from a SINGLE shared running counter -- a genuine
+        # uniform-length assumption, not yet generalized (see this method's
+        # docstring). Ragged batches that don't actually need chunking
+        # (every prompt already fits in one chunk) are unaffected.
+        needs_chunking = chunk_size is not None and max(prompt_lens) > chunk_size
+        if needs_chunking and not is_uniform_len:
+            raise NotImplementedError(
+                "mtp_prefill_batch: chunk_size is not yet supported together with "
+                "ragged (per-slot different-length) prompts -- either omit "
+                "chunk_size (fine for real async-admission prompt lengths, far "
+                "short of where chunking's memory benefit matters) or prefill "
+                "this slot alone with chunk_size set. See "
+                "notes/2026-07-18-session-review-and-next-steps.md section 21."
+            )
         for s in slots:
             if self.slot_kv_len[s] != 0 or self.slot_draft_sync_len[s] != 0:
                 raise RuntimeError(f"slot {s} is not fresh")
@@ -2741,12 +2790,13 @@ class DirectModelRunner:
             # to "fresh".
             self.slot_num_accepted_tokens[s] = 1
 
-        if chunk_size is None or prompt_len <= chunk_size:
+        if not needs_chunking and is_uniform_len:
             # Unchanged from before 2026-07-19: one giant forward each for
             # the target model and the draft model's step-0 sync. This
             # branch is byte-for-byte the prior implementation -- every
             # existing caller that never passes ``chunk_size`` (or whose
             # prompt already fits in one chunk) takes this exact path.
+            prompt_len = prompt_lens[0]
             target_logits, target_hidden = self._forward_batch(
                 slots,
                 prompts_per_slot if prompt_len > 1 else [p[0] for p in prompts_per_slot],
@@ -2781,6 +2831,54 @@ class DirectModelRunner:
                 self.slot_pending_draft_tokens[s] = draft_tokens_by_slot[s]
             return {s: {"anchor": anchors[s], "draft_tokens": draft_tokens_by_slot[s]} for s in slots}
 
+        if not needs_chunking:
+            # NEW (2026-07-19, continuous-batching round): genuinely ragged
+            # per-slot prompt lengths, single-shot (no chunking needed).
+            # Mirrors the uniform branch above exactly, except ``qo_len``/
+            # ``num_new_tokens`` are passed as a per-slot LIST instead of a
+            # shared scalar -- both ``_forward_batch`` and
+            # ``_mtp_sync_and_propose_batch`` already generalize to this
+            # (built 2026-07-17 for the recompute-fallback batching round;
+            # see this method's docstring), so no new mechanism is added
+            # here, only new USAGE of an already-verified one. Always passes
+            # ``prompts_per_slot``/``shifted_per_slot`` as nested per-slot
+            # lists (never the uniform branch's flattened-scalar-1 special
+            # case) -- correct for every prompt_len, including a degenerate
+            # length-1 slot, since a per-slot qo_len list of all-1s is
+            # already treated identically to the scalar case by both
+            # ``build_attention_metadata_batch`` and ``build_gdn_metadata_
+            # batch`` (value-based, not type-based -- see their docstrings).
+            target_logits, target_hidden = self._forward_batch(
+                slots,
+                prompts_per_slot,
+                [0] * num_reqs,
+                qo_len=prompt_lens,
+                commit=True,
+                return_hidden=True,
+                is_decode=False,
+                logits_last_position_only=True,
+            )
+            anchors = {}
+            shifted_per_slot = []
+            for i, s in enumerate(slots):
+                row = target_logits[i]
+                anchor = int(row.argmax(dim=-1).item())
+                anchors[s] = anchor
+                shifted_per_slot.append(prompts_per_slot[i][1:] + [anchor])
+
+            draft_tokens_by_slot = self._mtp_sync_and_propose_batch(
+                slots,
+                shifted_per_slot,
+                target_hidden,
+                [0] * num_reqs,
+                num_new_tokens=prompt_lens,
+                k=self.num_speculative_tokens,
+                step0_logits_last_position_only=True,
+            )
+            for s in slots:
+                self.slot_pending_draft_tokens[s] = draft_tokens_by_slot[s]
+            return {s: {"anchor": anchors[s], "draft_tokens": draft_tokens_by_slot[s]} for s in slots}
+
         # Chunked path (2026-07-19). Processes the prompt in
         # ``ceil(prompt_len / chunk_size)`` sequential pieces. Each chunk's
         # target-model forward is a genuine paged-KV-cache continuation of
@@ -2788,6 +2886,9 @@ class DirectModelRunner:
         # each chunk's draft-model forward is fed that SAME chunk's target
         # hidden states, mirroring the whole-prompt case's own
         # target_hidden -> draft-model wiring one chunk at a time.
+        # Reaching here requires is_uniform_len (checked above), so
+        # slots[0]'s own prompt length speaks for the whole batch.
+        prompt_len = prompt_lens[0]
         anchors = {}
         step0_logits: torch.Tensor | None = None
         step0_hidden: torch.Tensor | None = None

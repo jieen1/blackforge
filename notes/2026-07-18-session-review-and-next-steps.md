@@ -3550,3 +3550,242 @@ Verified with a real run (`--fixture n16 --concurrency 4 --batched
 normally, `"passed": true` now genuinely computed
 (`total_committed_tokens=522`, `draft_acceptance_rate_pct=67.24%`, neither
 degenerate). `PROGRESS.md` updated with a pointer.
+
+---
+
+## 21. Ragged-length batched prefill + mid-flight slot admission (executed
+2026-07-19) -- the last major gap from the original review's Phase D2
+
+This closes (ragged prefill) and precisely scopes (mid-flight admission) the
+last standing production-readiness gap the original independent review
+named under D2 (§8, "Phase D — Production-readiness gaps the narrow
+benchmark left"): `mtp_prefill_batch` hard-required every slot's prompt to
+have the same length, and no benchmark had ever modeled async request
+arrival/departure at varying lengths -- every prior round tested a
+synchronous, uniform-shape, fixed-batch-size workload. Two genuinely
+different pieces of work, reported separately per their own real status.
+
+### 21.1 Ragged-length batched prefill -- DONE, verified, committed
+
+**Design.** `mtp_prefill_batch` (`runtime/direct_model_runner.py`) no
+longer asserts every slot's prompt has the same length. The key discovery,
+confirmed by direct reading BEFORE writing any code (this project's own
+standing discipline): the underlying primitives this method calls --
+`_forward_batch`, `_mtp_forward_batch`, `_mtp_sync_and_propose_batch`,
+`build_attention_metadata_batch`, `build_gdn_metadata_batch` -- were
+**already fully generalized to a per-slot RAGGED `qo_len`/`num_new_tokens`
+list**, built 2026-07-17 for a structurally-identical problem this
+project's own history already solved: `mtp_verify_and_commit_batch`'s
+recompute-fallback group, where different slots need a different number
+of real tokens replayed in ONE batched call (`notes/2026-07-17-post-
+ragged-round-next-steps.md`). Every one of those functions' own docstrings
+already documents the CSR/`cu_seqlens`-style construction as
+value-based, not type-based, and already routes a non-uniform batch to
+the SAME general/chunked attention kernel this project's genuine
+multi-token prefills already use (`vllm/v1/attention/backends/
+sm120_gqa.py` documents that kernel as correct for "arbitrary mixed
+prefill+decode batches"). This meant the real work was a THIRD branch in
+`mtp_prefill_batch` (`is_uniform_len` ragged vs. not), not new kernel/
+metadata mechanism -- the existing uniform branch is preserved
+byte-for-byte (untouched code, same condition, same tensors) so every
+current caller is unaffected.
+
+`chunk_size` (§19's chunking feature) is deliberately NOT generalized to
+ragged batches this round -- the chunking loop advances every slot's
+chunk boundary from a single shared counter, a genuine uniform-length
+assumption. Combining the two now raises `NotImplementedError` with an
+explicit message rather than silently mis-chunking; real async-admission
+prompts are far short of the 8K+ context where chunking's memory benefit
+matters, so this is a deliberate, stated scope boundary, not a gap in the
+common case.
+
+**Correctness test: `benchmarks/mtp_ragged_prefill_check.py`.** Two
+checks, both PASS:
+
+- **Check 0**: 4 slots, 4 different real prompt lengths (300/777/1536/4096
+  tokens, sliced from 4 different frozen W1-S fixture prompts), prefilled
+  together in ONE ragged `mtp_prefill_batch` call, each slot's anchor
+  compared against an independent single-slot `mtp_prefill` reference.
+- **Check 1**: 4 real, human-readable, genuinely ragged prompts ("The
+  capital of France/Japan/Germany/Italy is", padded to 612/948/1284/1956
+  tokens), 6 real `mtp_verify_and_commit_batch` rounds, each slot's real
+  committed content replayed through an independent per-round reference
+  (near-tie tolerant, this project's established methodology) -- the real
+  gate for cross-request contamination.
+
+**A real finding, not glossed over**: an early, stricter version of check
+0 required BIT-EXACT anchor+draft agreement (reasoning: unlike chunking,
+ragged batching adds no new external call boundary per slot). It FAILED
+for the shortest prompt -- anchor matched, but the K proposed draft
+tokens diverged completely. A dedicated isolation probe (ad hoc, not
+committed) traced this to **cross-slot batched PREFILL numerical noise
+when slots hold heterogeneous real content -- and confirmed this is a
+PRE-EXISTING characteristic of the untouched, pre-2026-07-19 uniform-
+length code path too**, not something the ragged generalization
+introduces: batching 4 DIFFERENT-content prompts of the SAME length
+(300) through the OLD code reproduces the identical divergence class
+(margin 0.4375, full-vocab max_abs_diff 0.46 -- a genuine near-tie, not a
+gross bug). This is the SAME "cross-slot batching-order noise" class this
+project has already documented multiple times (verify's spec-decode
+kernel, chunked-prefill's GDN bf16 round-trip) showing up in a third
+place nobody had previously bit-exact-tested at batch_size>1 with real
+heterogeneous content. Fixed by adopting this project's own established
+near-tie-tolerant methodology for check 0's anchor gate (raw proposed
+draft tokens are informational only -- they are speculative proposals
+subject to verification the very next round, never committed output by
+themselves; the real safety net is the accept/reject step every round
+already goes through). Re-run: **both checks PASS**
+(`all_anchors_ok_within_tolerance: true`, `gdn_all_sane: true`,
+`check1 passed: true`, `no_cross_contamination_signal: true`).
+
+**Files**: `runtime/direct_model_runner.py` (`mtp_prefill_batch`, ragged
+generalization), `benchmarks/mtp_ragged_prefill_check.py` (new).
+
+### 21.2 Mid-flight slot admission -- built, structurally demonstrated, one
+real numerical finding flagged as a precisely-scoped open follow-on
+
+**Structural finding (the actual question this item asked)**: NO new
+plumbing was needed. `mtp_verify_and_commit_batch` already treats
+`slots`/`anchors`/`draft_tokens` as plain per-call arguments with no
+notion of "how many rounds this slot has been active" -- every persistent
+per-slot field it reads (`slot_kv_len`, `slot_draft_sync_len`,
+`slot_num_accepted_tokens`, `slot_gdn_initialized`) is independently
+addressed by physical slot, not by round count or batch history.
+`reset_slot` already fully clears a finished slot's state for reuse. This
+means a batch mixing a genuinely-fresh slot (just returned from
+`mtp_prefill_batch`, `slot_num_accepted_tokens=1`) with long-running ones
+was ALREADY structurally supported by the existing mechanism -- confirmed
+by direct reading before building anything, then confirmed for real by
+driving it end-to-end (below).
+
+**The driver: `benchmarks/mtp_async_arrival_check.py`.** 6 requests,
+DIFFERENT prompt lengths (360-1180 tokens), arriving in three waves over
+a fixed 4-slot capacity pool: 2 initial (round 0), 2 more admitted
+TOGETHER (one ragged `mtp_prefill_batch` call, exercising §21.1's new
+code) while the first 2 are already mid-decode (round 4), and 2 more
+admitted one at a time later, reusing slots freed by earlier finishers
+(rounds 9/11, queued if no slot is free yet -- a real admission-control
+wait, not an error). Arrival is round-indexed (this project's other
+benchmarks are similarly round-indexed, not wall-clock-scheduled), so the
+whole run costs real GPU time only.
+
+**Result: structurally works.** All 6 requests admitted, generated, and
+finished correctly; physical slots 0 and 1 were each genuinely reused
+(freed by A/B, re-admitted for E/F) with correct, uncorrupted content;
+the ragged-batched admission of C+D together succeeded. Throughput (a
+NEW, distinctly-scoped measurement, eager mode, NOT comparable to the
+cudagraph 4K/c=4 headline): **20.27-20.65 accepted tok/s** across two
+runs, 262 total committed tokens over ~12.7-12.9s wall time.
+
+**A real, characterized finding, reported honestly, not hidden**:
+reproducibly (bit-identical across repeated runs -- deterministic, not
+run-to-run randomness), ONE per-round independent-reference check exceeds
+this project's established `NEAR_TIE_LOGIT_MARGIN=2.0` (**7.9375** logit
+units, vs. every other round's exact match or <=0.5 near-tie) for request
+D, at the FIRST round whose batch composition mixes two long-running
+slots (9 rounds deep) with two freshly-admitted ones (their own first
+round) -- a batch SHAPE no test in this project's history had exercised
+before (every prior test either starts all slots together or only ever
+shrinks the batch). Investigated, not dismissed:
+
+1. **Decoded, not just measured**: the diverging candidates are `"\n\n"`
+   (the independent reference's pick) vs. `" Italy"` (the real, committed
+   choice) at the exact point `"...The capital of Italy is Rome. The
+   capital of Italy is Rome."` -- i.e. a "continue the already-degenerate
+   repeated phrase" vs. "end it with a paragraph break" decision, both
+   locally plausible continuations of the SAME known synthetic-fixture
+   repetition artifact this project has documented elsewhere (a prompt's
+   continuation degenerating into a repeated phrase once pushed past its
+   natural stopping point) -- not a content-quality regression.
+2. **Addressing re-confirmed clean**: `_ssm_spec_row`/
+   `build_gdn_metadata_spec_batch`'s per-slot SSM-row formula is keyed
+   only by logical slot + that slot's OWN `num_accepted_tokens_prev`, with
+   no cross-slot term anywhere in the formula (re-read directly, not
+   assumed).
+3. **Fully self-healing**: request D's reference check returns to exact
+   bit-match the very next round and stays bit-exact for the remaining
+   ~17 rounds of its own generation -- unlike this project's own
+   established genuine-state-corruption signature (compounds/persists
+   across rounds), this vanishes in exactly one round.
+
+**Conclusion**: the SAME cross-slot batching-order numerical noise class
+already documented multiple times in this project (verify's spec-decode
+kernel's "271 vs 198" near-tie, chunked-prefill's GDN bf16 round-trip,
+§21.1's ragged-prefill heterogeneous-content batching), confirmed here at
+a NEW trigger (a batch mixing freshly-admitted and long-running slots --
+never exercised before this round) and a larger single-instance magnitude
+than previously measured at the verify stage. **Not judged a blocking
+correctness bug** (evidence above), but explicitly flagged as an open
+numerical-hardening item for this specific batch-composition shape, not
+swept under "noise" without the evidence to back that call.
+
+**Why this is reported as a precisely-scoped follow-on, not closed**: per
+this task's own explicit standing instruction, mid-flight admission is
+NOT claimed as a fully-verified, production-ready deliverable the way
+§21.1 is. `mtp_async_arrival_check.py`'s own `passed` gate honestly
+reports `false` for this run (correctly -- it is not loosened to force a
+green result). The mechanism is real, demonstrated, and requires zero
+production code changes -- but this specific numerical finding has not
+been re-validated against this project's full end-to-end generation-
+quality bar (the Phase A methodology, §10: real reference-vs-ours
+token-sequence comparison over many generations) the way a
+production-readiness sign-off would need. **Recommended next step**: run
+Phase A's own methodology specifically against mixed-admission-round
+batch compositions (not just the uniform-arrival shape §10 already
+covered), to determine whether this magnitude is typical for this
+specific batch shape or was itself a rarer, larger-than-usual sample.
+
+**Files**: `benchmarks/mtp_async_arrival_check.py` (new) -- no production
+runtime code changed for this half of the task (confirmed: the mechanism
+this driver exercises already existed).
+
+### 21.3 Regression suite and 4K/c=4 headline: unaffected
+
+Full existing regression battery, fresh clean processes, GPU/process
+hygiene confirmed idle before/after each:
+
+| Suite | Result |
+|---|---|
+| `mtp_gdn_rollback_check.py --repeat 3` | **3/3 PASS** |
+| `mtp_batch_verify_check.py` | **PASS** (all sub-checks true) |
+| `mtp_ragged_recompute_verify_check.py` | **PASS** (all sub-checks true) |
+| `mtp_verify_cudagraph_check.py` | **PASS** (all 4 replay-coverage flags true) |
+
+**4K/c=4 headline** (`mtp_w1s_our_runtime_perf.py --batched --cudagraph
+--repeats 3 --max-tokens 256 --concurrency 4 --fixture n16` -- exercises
+`mtp_prefill_batch`'s UNCHANGED uniform-length branch, since this fixture
+is uniform-length, exactly as it always has):
+
+| rep | accepted tok/s |
+|---:|---:|
+| 1 | 155.790 |
+| 2 | 156.052 |
+| 3 | 158.974 |
+| **mean** | **156.939** |
+
+`total_committed_tokens=4116` and `draft_acceptance_rate_pct=
+70.29204431017119%` bit-identical across all 3 reps and to every prior
+measurement in this project's history -- **confirms zero change to
+generation correctness/determinism**, exactly as expected since this
+exact code path is provably byte-for-byte unchanged. The raw throughput
+(156.939 vs. the most recent established 165.730, §19.5) sits a bit
+below that baseline but is explained by thermal state, not a regression:
+this run's GPU was at 70-73C throughout (`thermal_before/after`), against
+§19.5's own noted "cool 53C/2272MHz state" -- consistent with this
+project's own documented Max-Q thermal-sensitivity gotcha, not a code
+change (the code path is unchanged, and correctness is bit-identical).
+
+### 21.4 Bottom line
+
+- **Ragged-length batched prefill: DONE.** Real, verified, committed --
+  `mtp_prefill_batch` now accepts genuinely different-length prompts per
+  slot in one batched call, reusing already-built-and-verified
+  primitives, zero regression to any existing (uniform) call path.
+- **Mid-flight slot admission: structurally supported, demonstrated
+  end-to-end, one real numerical-noise finding flagged as an explicit,
+  precisely-scoped open follow-on** (not closed this round) -- no
+  production code changes were needed for the mechanism itself.
+- **Regression suite: 4/4 PASS. 4K/c=4 headline: unaffected**
+  (156.939 tok/s mean, bit-identical correctness signals).
+
+`PROGRESS.md` updated with a pointer to this section.
