@@ -831,6 +831,33 @@ class DirectModelRunner:
         blocks_per_slot: int = 128,
         enable_cudagraph: bool = False,
     ) -> None:
+        # 2026-07-18, D3 memory-growth fix: this whole class is a pure
+        # inference runtime (never computes a backward pass) but, unlike
+        # real vLLM's ``GPUModelRunner`` (whose ``execute_model`` always
+        # runs under ``@torch.inference_mode()``), NOTHING in this
+        # hand-rolled runner ever disabled autograd -- confirmed by
+        # grepping this whole file for "grad" before this fix: zero hits.
+        # Every real (non-CUDA-graph) forward call (``_forward``/
+        # ``_forward_batch``/``_mtp_forward``/``_mtp_forward_batch``,
+        # exercised every round via the eager step-0 fallback whenever
+        # active slots' committed lengths are ragged -- the common case at
+        # real draft-acceptance rates < 100%) therefore built a full
+        # autograd graph rooted at the model's own parameters
+        # (``requires_grad=True`` by default, never explicitly frozen by
+        # this project's loading path). Root-caused via
+        # ``benchmarks/memory_growth_diag.py``: ``torch.cuda
+        # .memory_allocated()`` (NOT just ``memory_reserved()``) grew
+        # continuously and monotonically round over round with no
+        # plateau -- real live-tensor growth, not allocator fragmentation
+        # -- reaching 69055 MiB allocated / 97261 MiB nvidia-smi (99.3% of
+        # the 97887 MiB card) after 3 W1-S passes, matching the review's
+        # reported near-OOM figure almost exactly. ``torch.set_grad_enabled
+        # (False)`` (process-global, not a context manager that needs a
+        # matching exit -- this runner's process never needs grad) is the
+        # standard fix for this exact class of bug and is set as early as
+        # possible, before any model construction or forward call.
+        torch.set_grad_enabled(False)
+
         self.vllm_config = vllm_config
         self.num_slots = num_slots
         self.block_size = block_size

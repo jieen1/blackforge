@@ -1,6 +1,6 @@
 # Implementation Progress
 
-Updated: 2026-07-17
+Updated: 2026-07-18
 
 ## Completed
 
@@ -1924,6 +1924,43 @@ sides, remained fluent and on-topic — no repetition, no gibberish, no
 degeneration. Full methodology, per-prompt tables, and the qualitative
 read of every diverging tail: `notes/2026-07-18-session-review-and-next-steps.md`
 section 10.
+
+### D3 — memory-growth-across-rounds: root-caused and fixed (2026-07-18) — real leak (missing grad-disable), not fragmentation; memory now flat over 1107 rounds, small perf improvement
+
+An independent review's D3 finding (`notes/2026-07-18-session-review-and-next-steps.md`
+§8) had already fired its own falsifier: a fresh W1-S run peaked at
+97227 MiB against the 97887 MiB card (99.3%, only ~660 MiB short of
+OOM) at merely 4096-token context. Localized with a new committed
+diagnostic (`benchmarks/memory_growth_diag.py`) that samples both
+`torch.cuda.memory_allocated()` and `memory_reserved()` at every
+decode/verify round boundary across multiple W1-S passes in one
+process. **Verdict: a real, continuously-growing live-tensor leak, not
+allocator fragmentation** — `memory_allocated()` itself climbed
+monotonically ~25 MiB/round with zero plateau across 1107 rounds (3
+passes), reaching 69055 MiB allocated / 97261 MiB nvidia-smi, matching
+the review's figure almost exactly.
+
+**Root cause**: `runtime/direct_model_runner.py` never disabled
+autograd anywhere (`grep -n "grad"` returned zero hits before the
+fix) — unlike real vLLM's `GPUModelRunner` (always `@torch
+.inference_mode()`), every eager forward call (hit essentially every
+round via `_mtp_sync_and_propose_batch`'s step-0 fallback whenever
+active slots' committed lengths are ragged — the common case at ~70%
+draft-acceptance) built a full, never-freed autograd graph against the
+model's own persistent, in-place-updated KV/GDN state buffers.
+
+**Fix**: one line, `torch.set_grad_enabled(False)`, added at the top
+of `DirectModelRunner.__init__`. **Verified**: re-ran the identical
+1107-round diagnostic — `allocated`/`reserved` now perfectly flat
+(41147.0/61128 MiB) for every one of the 12 sampled batch boundaries,
+~34% headroom to the card's ceiling (vs. 0.7% before). All 4
+correctness suites re-ran fresh with zero regressions. Real W1-S 3-rep
+perf **improved slightly** (137.784 → 142.504 mean accepted tok/s,
++3.4%; gap to native narrows from ~1.05x to ~1.014x) — disabling
+unneeded autograd bookkeeping is a small perf win, not a cost, so this
+was a pure win, not a tradeoff. Full methodology, before/after
+round-by-round tables, and regression/perf detail:
+`notes/2026-07-18-session-review-and-next-steps.md` §11.
 
 ### Phase 0 — Baseline contract
 

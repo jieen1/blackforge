@@ -774,3 +774,223 @@ measurement scripts/outputs, not project source):
 `build_prompts.py`, `capture_ours.py`, `capture_reference.py`,
 `verify_inlining_faithful.py`, `compare.py`, `prompts.json`,
 `ours_result.json`, `reference_result.json`, `comparison_report.json`.
+
+---
+
+## 11. D3 (near-OOM memory growth): root-caused, fixed, verified
+(executed 2026-07-18)
+
+**Verdict: real leak of live GPU tensors, not allocator fragmentation.
+Root cause: this hand-rolled runtime never disabled autograd. One-line
+fix (`torch.set_grad_enabled(False)`). Memory now provably flat over
+1107 rounds (3 full W1-S passes), and the fix came with a small perf
+*improvement*, not a regression.** This closes D3, the falsifier §8/D3
+flagged as already fired.
+
+### 11.1 Methodology
+
+Wrote `benchmarks/memory_growth_diag.py` (committed): reimplements the
+same real call sequence `_run_batch_batched` uses
+(`mtp_prefill_batch`/`mtp_verify_and_commit_batch`, `--batched
+--cudagraph` shape, n16/c4/K=3/256 tokens) but samples
+`torch.cuda.memory_allocated()` **and** `torch.cuda.memory_reserved()`
+(not just one) at every batch boundary, plus every 10th individual
+decode/verify round, across multiple full passes over the W1-S fixture
+in the SAME process (no reload between passes -- the exact condition
+D3's falsifier needs). `memory_allocated()` is the caching allocator's
+own live-referenced-tensor-bytes counter; `memory_reserved()` is total
+segment memory the allocator holds (live + cached-but-freed). Flat
+allocated + growing reserved = fragmentation, no true leak. Both
+growing = a genuine accumulating live-tensor reference somewhere.
+Cross-checked against `nvidia-smi`'s own `memory.used` at every batch
+boundary throughout (never relied on the allocator's self-report alone).
+
+GPU/process hygiene: verified idle via `nvidia-smi`/`pgrep` immediately
+before every run in this section (never assumed from memory), one
+GPU-heavy process at a time throughout.
+
+### 11.2 Before the fix: confirmed real leak, not fragmentation
+
+Ran 3 passes (1107 total decode/verify rounds) on the pre-fix code.
+`memory_allocated()` sampled at each of the 12 batch boundaries:
+
+| round | pass | batch | allocated (MiB) | reserved (MiB) | nvidia-smi (MiB) |
+|---:|---:|---:|---:|---:|---:|
+| 87 | 0 | 0 | 43480.1 | 63454 | 65906 |
+| 183 | 0 | 1 | 45810.8 | 71306 | 73758 |
+| 284 | 0 | 2 | 48147.0 | 71404 | 73855 |
+| 369 | 0 | 3 | 50456.2 | 71476 | 73928 |
+| 456 | 1 | 0 | 52779.6 | 71556 | 74008 |
+| 552 | 1 | 1 | 55110.3 | 79408 | 81859 |
+| 653 | 1 | 2 | 57446.5 | 79506 | 81957 |
+| 738 | 1 | 3 | 59755.7 | 79580 | 82031 |
+| 825 | 2 | 0 | 62079.0 | 87418 | 89869 |
+| 921 | 2 | 1 | 64409.7 | 87510 | 89961 |
+| 1022 | 2 | 2 | 66746.0 | 87608 | 90059 |
+| 1107 | 2 | 3 | 69055.2 | 95442 | 97261 |
+
+`memory_allocated()` (live tensor bytes) grew **continuously and
+monotonically**, every single batch, with **no plateau** across all 3
+passes -- roughly +25 MiB every individual round, +2.3 GB per 90-round
+batch, zero drops at batch or pass boundaries (`reset_slot`'s in-place
+KV/GDN-state overwrite did not free anything). This is decisive: a
+pure-fragmentation story (flat `allocated`, growing `reserved` only)
+does not fit the data -- `allocated` itself is the thing growing. Final
+state: 69055 MiB allocated / 97261 MiB `nvidia-smi` against the 97887
+MiB card -- **99.3% of capacity**, matching the review's reported
+figure (97227/97887) almost exactly, and reproducing the same near-OOM
+condition on demand. `reserved` tracks `allocated` upward (it must,
+since reserved >= allocated) rather than independently ballooning, so
+`reserved`'s growth here is a *consequence* of the real leak, not a
+separate fragmentation effect layered on top.
+
+### 11.3 Root cause: no `torch.no_grad()`/`inference_mode()` anywhere
+
+`grep -n "grad" runtime/direct_model_runner.py` returned **zero hits**
+before this fix -- confirmed directly, not assumed. This file drives a
+27B-parameter model's forward pass every decode/verify round
+(`_forward_batch`, and critically `_mtp_forward_batch` via the eager
+step-0 fallback in `_mtp_sync_and_propose_batch`, which is hit on
+essentially every round in production: step-0 only uses the
+`CapturedMTPDraftStepGraph` when every active slot's committed length
+is *uniform* that round, and at a ~70% per-token draft-acceptance rate
+with `concurrency=4`/`K=3`, four slots landing on the identical accept
+count by chance is the exception, not the rule). Unlike real vLLM's
+`GPUModelRunner` (whose `execute_model` always runs under
+`@torch.inference_mode()`), nothing in this hand-rolled runner ever
+disabled gradient tracking, so every one of those eager forward calls
+built a full autograd graph rooted at the model's parameters
+(`requires_grad=True` by default -- this project's loading path never
+explicitly freezes them). The model's own persistent, in-place-updated
+buffers (paged KV cache, GDN conv/ssm recurrent state) being written to
+every round under live autograd tracking is the natural mechanism for
+why the retained graph never got freed round-to-round -- consistent
+with the observed steady ~25 MiB/round, no-plateau growth, and with
+growth continuing right through `reset_slot`'s own in-place
+resets/overwrites (an in-place op under autograd tracking extends the
+graph rather than severing it).
+
+This is the standard, well-documented class of PyTorch bug ("memory
+grows during an inference-only loop because nothing disabled
+autograd") and the standard fix is exactly what real vLLM already does
+at its own execution boundary -- this hand-rolled runtime had simply
+never added the equivalent when it took over model execution from
+vLLM's own runner.
+
+Note on the review's original two named suspects: the `_fill_buffers`/
+`build_*_metadata_*` per-call `torch.tensor(...)` staging tensors
+(review's suspect #1) are **int32/int64/bool** -- floating-point-only
+autograd literally cannot attach to them, so they are not a contributor
+to the `allocated` growth observed here (they may contribute a much
+smaller, secondary `reserved`-only fragmentation effect from varying
+per-round sizes, but that is not what is driving this near-OOM
+trajectory). The dominant, decisive mechanism is the missing
+grad-disable around the real floating-point model forward calls, found
+by actually tracing the data rather than accepting the review's
+suspects at face value, per this project's own standing discipline.
+
+### 11.4 The fix
+
+One line, added as early as possible in `DirectModelRunner.__init__`
+(`runtime/direct_model_runner.py`, before any model construction or
+forward call):
+
+```python
+torch.set_grad_enabled(False)
+```
+
+Global and process-wide (not a context manager needing a matching
+exit) -- appropriate because this class represents an entire
+pure-inference runtime process that never computes a backward pass.
+Checked for conflicts: none of the four correctness suites or this
+project's other benchmark scripts reference `grad` anywhere, so nothing
+relies on autograd being enabled inside a `DirectModelRunner` process.
+
+### 11.5 After the fix: memory flat over 1107 rounds, ~34% headroom
+
+Re-ran the **identical** 3-pass/1107-round diagnostic post-fix:
+
+| round | pass | batch | allocated (MiB) | reserved (MiB) | nvidia-smi (MiB) |
+|---:|---:|---:|---:|---:|---:|
+| 87 | 0 | 0 | 41147.0 | 61128 | 64359 |
+| 183 | 0 | 1 | 41147.0 | 61128 | 64298 |
+| 284 | 0 | 2 | 41147.0 | 61128 | 64302 |
+| 369 | 0 | 3 | 41147.0 | 61128 | 64298 |
+| 456 | 1 | 0 | 41147.0 | 61128 | 64298 |
+| 552 | 1 | 1 | 41147.0 | 61128 | 64298 |
+| 653 | 1 | 2 | 41147.0 | 61128 | 64298 |
+| 738 | 1 | 3 | 41147.0 | 61128 | 64298 |
+| 825 | 2 | 0 | 41147.0 | 61128 | 64299 |
+| 921 | 2 | 1 | 41147.0 | 61128 | 64302 |
+| 1022 | 2 | 2 | 41147.0 | 61128 | 64298 |
+| 1107 | 2 | 3 | 41147.0 | 61128 | 64222 |
+
+**Both `allocated` and `reserved` are perfectly flat (identical to
+sub-0.01 MiB precision) from round 87 through round 1107** -- steady,
+non-monotonic, comfortably clears the review's own gate ("steady,
+non-monotonic reserved memory over >=100 rounds ... with >=10% headroom
+to the ceiling") at more than 10x the required round count. Peak
+`nvidia-smi` usage 64359 MiB against 97887 MiB total -- **~34.3%
+headroom**, versus 0.7% headroom (near-OOM) before the fix. Process
+returned to the normal ~2 GiB idle baseline on exit, confirmed via
+`nvidia-smi` immediately after.
+
+### 11.6 Regression suite: all 4 PASS, unchanged
+
+Ran all four fresh (GPU verified idle before each, one process at a
+time):
+
+| suite | result |
+|---|---|
+| `mtp_gdn_rollback_check.py` | `passed: true`, `logits_exact_equal: true`, `gdn_state_close: true` (48/48 GDN layers) |
+| `mtp_batch_verify_check.py` | `passed: true` (all 4 sub-checks: `check0_batch1_equivalence`, `check1_numerical_twin`, `check2_signal_probe`, `check3_mixed_stage`) |
+| `mtp_ragged_recompute_verify_check.py` | `passed: true` |
+| `mtp_verify_cudagraph_check.py` | `passed: true`, all 4 graph-shape coverage flags true (`verify_graph_batch4_replayed`, `verify_graph_batch2_replayed`, `draft_step0_qo2_graph_replayed`, `draft_continuation_graph_replayed`) |
+
+Zero regressions from the fix.
+
+### 11.7 W1-S 3-rep perf: no regression -- a small improvement instead
+
+Real `benchmarks.mtp_w1s_our_runtime_perf --batched --cudagraph
+--repeats 3 --max-tokens 256 --concurrency 4 --fixture n16`, post-fix:
+
+| rep | accepted tok/s | draft accept % | committed toks | `thermal_after.memory_used_mib` |
+|---|---:|---:|---:|---:|
+| 1 | 142.517 | 70.29204 | 4116 | 63879 |
+| 2 | 143.149 | 70.29204 | 4116 | 63879 |
+| 3 | 141.847 | 70.29204 | 4116 | 63879 |
+| **mean** | **142.504** | 70.29204 | 4116 | 63879 |
+
+`draft_acceptance_rate_pct`/`total_committed_tokens` are bit-for-bit
+identical to every prior measurement in this project's history (70.29204431017119%,
+4116) -- confirms the fix changed nothing about generation correctness.
+`thermal_after.memory_used_mib` is now **identical across all 3 reps**
+(63879 MiB every time) -- the *production* benchmark script itself
+shows the same flat-memory signature the dedicated diagnostic found,
+not just a diagnostic-script artifact.
+
+**Performance did not regress -- it improved slightly**: 142.504 mean
+vs. this review's own 137.784 pre-fix mean (+3.4%) and the original
+session's 136.750 (+4.2%), narrowing the gap to native's 144.54 from
+~1.05x to **~1.014x**. Consistent with the mechanism: disabling
+autograd tracking removes real (if previously unmeasured) per-call
+overhead -- saved-tensor bookkeeping, version-counter updates -- on
+every eager forward call, so this is not a "paid a perf tax for
+memory safety" tradeoff; both improved together because the same root
+cause (unnecessary autograd tracking) was responsible for both a small
+perf tax and the memory leak.
+
+### 11.8 Bottom line
+
+D3's falsifier ("already fired") is now closed: memory is flat, not
+climbing, and the review's own numeric gate (>=100 rounds, >=10%
+headroom) is cleared with a wide margin (1107 rounds, ~34% headroom).
+The fix is a single line (`torch.set_grad_enabled(False)` in
+`DirectModelRunner.__init__`), root-caused with real
+`memory_allocated()`-vs-`memory_reserved()` evidence (not assumed from
+the review's own framing), verified with the full existing 4-suite
+regression battery (zero regressions) and a real W1-S 3-rep perf
+re-measurement (small improvement, not a cost). Diagnostic script
+`benchmarks/memory_growth_diag.py` is committed alongside the fix,
+matching this project's convention of keeping the diagnostics that
+found real bugs in the tree.
