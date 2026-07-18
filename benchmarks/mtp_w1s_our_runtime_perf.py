@@ -128,7 +128,9 @@ def _run_batch(torch, runner, prompts_batch: list[list[int]], target_output_len:
     return {"per_slot": per_slot, "ttft_s": ttft_s, "itl_samples": itl_samples}
 
 
-def _run_batch_batched(torch, runner, prompts_batch: list[list[int]], target_output_len: int) -> dict:
+def _run_batch_batched(
+    torch, runner, prompts_batch: list[list[int]], target_output_len: int, chunk_size: int | None = None
+) -> dict:
     """2026-07-17 cross-slot-batched analogue of ``_run_batch``: ONE
     ``mtp_prefill_batch`` call covering every slot in this request batch,
     then a loop of ONE ``mtp_verify_and_commit_batch`` call per round
@@ -139,7 +141,13 @@ def _run_batch_batched(torch, runner, prompts_batch: list[list[int]], target_out
     wall time is bracketed at the BATCH-CALL level, not per-slot (a real
     batched call is one shared kernel launch -- there is no per-slot
     sub-interval to attribute it to individually, unlike the round-robin
-    path's naturally-serial single-slot calls)."""
+    path's naturally-serial single-slot calls).
+
+    ``chunk_size`` (2026-07-19, chunked-prefill round, default ``None``
+    preserving every existing invocation byte-for-byte): forwarded
+    directly to ``mtp_prefill_batch``'s identical new parameter -- see
+    that method's docstring. Only affects the ONE prefill call below;
+    the decode/verify round loop is unchanged either way."""
     num = len(prompts_batch)
     slots = list(range(num))
     for s in slots:
@@ -157,7 +165,7 @@ def _run_batch_batched(torch, runner, prompts_batch: list[list[int]], target_out
     end_evt = torch.cuda.Event(enable_timing=True)
     t0 = time.perf_counter()
     start_evt.record()
-    prefill_result = runner.mtp_prefill_batch(slots, prompts_batch)
+    prefill_result = runner.mtp_prefill_batch(slots, prompts_batch, chunk_size=chunk_size)
     end_evt.record()
     torch.cuda.synchronize()
     t1 = time.perf_counter()
@@ -221,7 +229,14 @@ def _run_batch_batched(torch, runner, prompts_batch: list[list[int]], target_out
 
 
 def _run_measurement(
-    torch, runner, prompts: list[list[int]], max_tokens: int, concurrency: int, rep: int, batched: bool = False
+    torch,
+    runner,
+    prompts: list[list[int]],
+    max_tokens: int,
+    concurrency: int,
+    rep: int,
+    batched: bool = False,
+    chunk_size: int | None = None,
 ) -> dict:
     """ONE repetition of the full W1-S request set against an
     ALREADY-LOADED runner (no reload between reps -- reps are for
@@ -239,7 +254,11 @@ def _run_measurement(
     num_batches = (len(prompts) + concurrency - 1) // concurrency
     for batch_idx, batch_start in enumerate(range(0, len(prompts), concurrency)):
         batch = prompts[batch_start : batch_start + concurrency]
-        out = _run_batch_batched(torch, runner, batch, max_tokens) if batched else _run_batch(torch, runner, batch, max_tokens)
+        out = (
+            _run_batch_batched(torch, runner, batch, max_tokens, chunk_size=chunk_size)
+            if batched
+            else _run_batch(torch, runner, batch, max_tokens)
+        )
         for s, stats in out["per_slot"].items():
             total_drafts += stats["num_drafts"]
             total_draft_tokens += stats["num_draft_tokens"]
@@ -303,6 +322,7 @@ def _run_once(
     batched: bool = False,
     cudagraph: bool = False,
     blocks_per_slot: int = 2560,
+    chunk_size: int | None = None,
 ) -> dict:
     import torch
 
@@ -383,7 +403,9 @@ def _run_once(
     thermal_after_load = _gpu_thermal()
 
     reps = [
-        _run_measurement(torch, runner, prompts, max_tokens, concurrency, r + 1, batched=batched)
+        _run_measurement(
+            torch, runner, prompts, max_tokens, concurrency, r + 1, batched=batched, chunk_size=chunk_size
+        )
         for r in range(repeats)
     ]
 
@@ -396,6 +418,7 @@ def _run_once(
         "batched": batched,
         "cudagraph": cudagraph,
         "blocks_per_slot": blocks_per_slot,
+        "chunk_size": chunk_size,
         "repeats": repeats,
         "reps": reps,
         "thermal_before_load": thermal_before_load,
@@ -444,9 +467,26 @@ def main() -> int:
         "DirectModelRunner.__init__), so any change should be re-validated "
         "against the regression suite, not assumed safe.",
     )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=None,
+        help="2026-07-19, chunked-prefill round: split mtp_prefill_batch's "
+        "target/draft-model forward calls into sequential chunk_size-token "
+        "pieces instead of one giant forward covering the whole prompt -- "
+        "bounds peak prefill activation memory to chunk_size*concurrency "
+        "regardless of total prompt length (see "
+        "runtime.direct_model_runner.DirectModelRunner.mtp_prefill_batch's "
+        "docstring and notes/2026-07-18-session-review-and-next-steps.md "
+        "section 19). Requires --batched (the singular, non-batched path "
+        "has no chunked prefill). Default None preserves every existing "
+        "invocation's single-shot prefill behavior byte-for-byte.",
+    )
     args = parser.parse_args()
     if args.cudagraph and not args.batched:
         parser.error("--cudagraph requires --batched")
+    if args.chunk_size is not None and not args.batched:
+        parser.error("--chunk-size requires --batched")
 
     result = _run_once(
         args.max_tokens,
@@ -457,6 +497,7 @@ def main() -> int:
         batched=args.batched,
         cudagraph=args.cudagraph,
         blocks_per_slot=args.blocks_per_slot,
+        chunk_size=args.chunk_size,
     )
 
     import json

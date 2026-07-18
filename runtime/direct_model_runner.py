@@ -284,6 +284,16 @@ _MAX_DECODE_QO_LEN = 16
 # ragged-qo_len generalization below, for faithfulness to the real
 # formula, not because it currently changes any real call's outcome.
 
+_DEFAULT_PREFILL_CHUNK_SIZE = 8192
+# The suggested value for ``mtp_prefill_batch``'s ``chunk_size`` parameter
+# (2026-07-19, chunked-prefill round) -- matches native vLLM's own
+# ``--max-num-batched-tokens=8192`` default (``sm120-flash-attention/
+# vllm_integration/launch_test_server.py``), so a chunked run and native's
+# own chunked-prefill scheduler bound a single forward call's token count
+# identically. Not itself used as ``mtp_prefill_batch``'s default (that
+# stays ``None`` = unchunked, for full backward compatibility) -- callers
+# that want chunking pass this explicitly.
+
 
 def build_attention_metadata_batch(
     *,
@@ -2358,6 +2368,75 @@ class DirectModelRunner:
         logits = self.mtp_model.compute_logits(hidden_states_out)
         return logits, hidden_states_out
 
+    def _mtp_run_continuation_steps(
+        self,
+        slots: list[int],
+        draft_tokens: dict[int, list[int]],
+        prev_tokens: list[int],
+        prev_hidden: torch.Tensor,
+        next_pos_list: list[int],
+        running_prior_kv_len: list[int],
+        k: int,
+    ) -> None:
+        """The k-1 batched autoregressive draft-continuation steps that
+        follow step 0, appending each step's greedy token to
+        ``draft_tokens[slot]`` IN PLACE (``draft_tokens`` must already hold
+        step 0's own token for every slot in ``slots`` -- this method only
+        APPENDS the remaining k-1).
+
+        Extracted (2026-07-19, chunked-prefill round,
+        ``notes/2026-07-18-session-review-and-next-steps.md`` section 19)
+        from ``_mtp_sync_and_propose_batch``'s own tail as a shared helper:
+        pure code motion, not a behavior change -- ``_mtp_sync_and_propose_batch``'s
+        call site below passes exactly the same local variables its old
+        inlined body used, in the same order. This is what lets
+        ``mtp_prefill_batch``'s new chunked path (which computes step 0
+        itself, chunk by chunk, so each chunk's target hidden states can be
+        fed to the draft model as soon as they exist, rather than needing
+        the whole prompt's hidden states materialized at once) reuse the
+        EXACT same, already-verified continuation logic afterward instead
+        of a second, independently-written copy of it -- the two entry
+        points (whole-prompt step 0 vs. chunked step 0) differ only in how
+        ``prev_tokens``/``prev_hidden``/``next_pos_list``/
+        ``running_prior_kv_len`` were produced, not in what happens to them
+        next.
+
+        ``next_pos_list``/``running_prior_kv_len`` are each slot's
+        position/prior-kv-len immediately after step 0 -- numerically
+        identical to each other at entry in every real call (both start
+        equal right after step 0 and both advance by exactly 1 every
+        iteration below), the same invariant
+        ``CapturedMTPDraftStepGraph``'s own docstring documents."""
+        num_reqs = len(slots)
+        draft_step_graph = self._get_draft_step_graph(num_reqs) if self.enable_cudagraph else None
+        for _ in range(1, k):
+            if draft_step_graph is not None:
+                step_logits, step_hidden = draft_step_graph.replay(slots, prev_tokens, prev_hidden, running_prior_kv_len)
+            else:
+                step_logits, step_hidden = self._mtp_forward_batch(
+                    slots,
+                    prev_tokens,
+                    prev_hidden,
+                    running_prior_kv_len,
+                    next_pos_list,
+                    qo_len=1,
+                    is_decode=True,
+                )
+            # qo_len=1 uniform -> step_logits/step_hidden already have
+            # exactly one row per slot in ``slots`` order (request-then-
+            # position order degenerates to plain per-request order here),
+            # so no index_select/cat needed -- a single batched argmax
+            # over the whole tensor plus ONE ``.tolist()`` covers every
+            # slot in this step.
+            new_prev_tokens = step_logits.argmax(dim=-1).tolist()
+            for i in range(num_reqs):
+                draft_tokens[slots[i]].append(new_prev_tokens[i])
+            prev_tokens = new_prev_tokens
+            prev_hidden = step_hidden
+            for i in range(num_reqs):
+                next_pos_list[i] += 1
+                running_prior_kv_len[i] += 1
+
     def _mtp_sync_and_propose_batch(
         self,
         slots: list[int],
@@ -2543,37 +2622,22 @@ class DirectModelRunner:
         # ``CapturedMTPDraftStepGraph``'s docstring -- which is what makes
         # a single-length-list captured graph replay valid for this
         # specific loop.
-        draft_step_graph = self._get_draft_step_graph(num_reqs) if self.enable_cudagraph else None
-        for _ in range(1, k):
-            if draft_step_graph is not None:
-                step_logits, step_hidden = draft_step_graph.replay(slots, prev_tokens, prev_hidden, running_prior_kv_len)
-            else:
-                step_logits, step_hidden = self._mtp_forward_batch(
-                    slots,
-                    prev_tokens,
-                    prev_hidden,
-                    running_prior_kv_len,
-                    next_pos_list,
-                    qo_len=1,
-                    is_decode=True,
-                )
-            # qo_len=1 uniform -> step_logits/step_hidden already have
-            # exactly one row per slot in ``slots`` order (request-then-
-            # position order degenerates to plain per-request order here),
-            # so no index_select/cat needed -- a single batched argmax
-            # over the whole tensor plus ONE ``.tolist()`` covers every
-            # slot in this step.
-            new_prev_tokens = step_logits.argmax(dim=-1).tolist()
-            for i in range(num_reqs):
-                draft_tokens[slots[i]].append(new_prev_tokens[i])
-            prev_tokens = new_prev_tokens
-            prev_hidden = step_hidden
-            for i in range(num_reqs):
-                next_pos_list[i] += 1
-                running_prior_kv_len[i] += 1
+        # 2026-07-19, chunked-prefill round: the actual k-1 loop body is now
+        # ``_mtp_run_continuation_steps`` (pure code motion, see its
+        # docstring) -- shared with ``mtp_prefill_batch``'s new chunked
+        # path, which computes step 0 itself (chunk by chunk) and needs
+        # this exact same, already-verified tail afterward.
+        self._mtp_run_continuation_steps(
+            slots, draft_tokens, prev_tokens, prev_hidden, next_pos_list, running_prior_kv_len, k
+        )
         return draft_tokens
 
-    def mtp_prefill_batch(self, slots: list[int], prompts_per_slot: list[list[int]]) -> dict[int, dict]:
+    def mtp_prefill_batch(
+        self,
+        slots: list[int],
+        prompts_per_slot: list[list[int]],
+        chunk_size: int | None = None,
+    ) -> dict[int, dict]:
         """Batched analogue of ``mtp_prefill``: ONE real target prefill
         forward (``_forward_batch``, now able to accept never-forwarded
         slots -- see its 2026-07-17 GDN-init-guard relaxation) covering
@@ -2603,7 +2667,61 @@ class DirectModelRunner:
         the first plus the model+KV-cache baseline for the remaining
         headroom) took 15.2s by itself, direct evidence of near-OOM
         allocator pressure compounding the waste. See that section's
-        follow-up entry for the full before/after numbers."""
+        follow-up entry for the full before/after numbers.
+
+        ``chunk_size`` (2026-07-19, chunked-prefill round, default ``None``
+        preserving every existing call site byte-for-byte -- see
+        ``notes/2026-07-18-session-review-and-next-steps.md`` section 19
+        for the full design/verification writeup): when given, and the
+        prompt is longer than ``chunk_size``, splits the single giant
+        target-model-forward-then-draft-model-step-0-forward this method
+        otherwise does into multiple sequential ``chunk_size``-token
+        pieces, so no one ``model.forward()`` call ever processes more
+        than ``chunk_size * len(slots)`` tokens at once -- the fix for the
+        16K/32K-context near-OOM activation-memory scaling section 12-18
+        already root-caused and quantified (peak transient working set
+        scales with ``qo_len * concurrency``; chunking bounds ``qo_len``
+        to ``chunk_size`` regardless of total prompt length). Matches
+        native vLLM's own ``--max-num-batched-tokens=8192`` chunked-prefill
+        convention by default (``_DEFAULT_PREFILL_CHUNK_SIZE`` below).
+
+        Both attention's paged KV cache and GDN's recurrent
+        ``conv_state``/``ssm_state`` carry over correctly across chunks of
+        the SAME slot's own prefill with **no new mechanism** -- both were
+        already fully general, just never exercised this way before
+        (confirmed by direct reading, not assumed, before writing this):
+        ``_forward_batch``'s existing ``kv_lengths``/``commit=True``
+        parameters already make each chunk's attention forward a genuine
+        paged-KV continuation of the previous chunk (the SM120 general/
+        FP8-KV kernel's own module docstring, ``vllm/v1/attention/backends
+        /sm120_gqa.py``, already documents itself as correct for "pure
+        prefill, chunked-prefill continuation, and arbitrary mixed
+        prefill+decode batches" -- chunking here is new USAGE of that
+        kernel path, not new kernel work); and GDN's ``has_initial_state``
+        (built from ``self.slot_gdn_initialized`` inside
+        ``build_gdn_metadata_batch``) is already False only for a
+        genuinely fresh slot and unconditionally set True at the end of
+        EVERY ``_forward_batch`` call regardless of ``qo_len`` (see that
+        method's last few lines) -- so chunk 1 of a fresh slot's prefill
+        correctly gets ``has_initial_state=False`` (matching today's
+        single-shot behavior) and chunk 2 onward correctly gets
+        ``has_initial_state=True``, reading back exactly the
+        conv/ssm-state row chunk 1's own forward pass wrote, with zero new
+        code in either metadata builder. This is the SAME per-physical-slot
+        flag every decode/verify round already relies on for
+        cross-ROUND state continuity -- generalized here, for the first
+        time, to WITHIN-one-prefill continuity.
+
+        The draft model's own step-0 sync is chunked in lockstep with the
+        target model (same chunk boundaries, each chunk's target hidden
+        states fed into that SAME chunk's draft forward) -- the other
+        piece ``notes/2026-07-18-session-review-and-next-steps.md`` section
+        18.6 identified as genuinely unbuilt. Only the LAST chunk's
+        anchor/step-0 draft token are ever read; the K-1 further
+        autoregressive draft continuation steps after step 0 are
+        unaffected (still one uniform, small ``qo_len=1`` loop) and reuse
+        ``_mtp_run_continuation_steps`` -- the exact same, already-verified
+        tail ``_mtp_sync_and_propose_batch`` itself uses."""
         if self.mtp_model is None or self.num_speculative_tokens is None:
             raise RuntimeError("no MTP draft model loaded")
         num_reqs = len(slots)
@@ -2623,39 +2741,143 @@ class DirectModelRunner:
             # to "fresh".
             self.slot_num_accepted_tokens[s] = 1
 
-        target_logits, target_hidden = self._forward_batch(
-            slots,
-            prompts_per_slot if prompt_len > 1 else [p[0] for p in prompts_per_slot],
-            [0] * num_reqs,
-            qo_len=prompt_len,
-            commit=True,
-            return_hidden=True,
-            is_decode=False,
-            logits_last_position_only=True,
-        )
-        anchors: dict[int, int] = {}
-        shifted_per_slot = []
-        for i, s in enumerate(slots):
-            # target_logits is [num_reqs, vocab] (last-position-only, see
-            # logits_last_position_only above) -- row i IS slot i's last
-            # (and only returned) position, no further offset needed.
-            row = target_logits[i]
-            anchor = int(row.argmax(dim=-1).item())
-            anchors[s] = anchor
-            shifted_per_slot.append(prompts_per_slot[i][1:] + [anchor])
+        if chunk_size is None or prompt_len <= chunk_size:
+            # Unchanged from before 2026-07-19: one giant forward each for
+            # the target model and the draft model's step-0 sync. This
+            # branch is byte-for-byte the prior implementation -- every
+            # existing caller that never passes ``chunk_size`` (or whose
+            # prompt already fits in one chunk) takes this exact path.
+            target_logits, target_hidden = self._forward_batch(
+                slots,
+                prompts_per_slot if prompt_len > 1 else [p[0] for p in prompts_per_slot],
+                [0] * num_reqs,
+                qo_len=prompt_len,
+                commit=True,
+                return_hidden=True,
+                is_decode=False,
+                logits_last_position_only=True,
+            )
+            anchors: dict[int, int] = {}
+            shifted_per_slot = []
+            for i, s in enumerate(slots):
+                # target_logits is [num_reqs, vocab] (last-position-only, see
+                # logits_last_position_only above) -- row i IS slot i's last
+                # (and only returned) position, no further offset needed.
+                row = target_logits[i]
+                anchor = int(row.argmax(dim=-1).item())
+                anchors[s] = anchor
+                shifted_per_slot.append(prompts_per_slot[i][1:] + [anchor])
 
-        draft_tokens_by_slot = self._mtp_sync_and_propose_batch(
-            slots,
-            shifted_per_slot,
-            target_hidden,
-            [0] * num_reqs,
-            num_new_tokens=prompt_len,
-            k=self.num_speculative_tokens,
-            step0_logits_last_position_only=True,
+            draft_tokens_by_slot = self._mtp_sync_and_propose_batch(
+                slots,
+                shifted_per_slot,
+                target_hidden,
+                [0] * num_reqs,
+                num_new_tokens=prompt_len,
+                k=self.num_speculative_tokens,
+                step0_logits_last_position_only=True,
+            )
+            for s in slots:
+                self.slot_pending_draft_tokens[s] = draft_tokens_by_slot[s]
+            return {s: {"anchor": anchors[s], "draft_tokens": draft_tokens_by_slot[s]} for s in slots}
+
+        # Chunked path (2026-07-19). Processes the prompt in
+        # ``ceil(prompt_len / chunk_size)`` sequential pieces. Each chunk's
+        # target-model forward is a genuine paged-KV-cache continuation of
+        # the previous chunk (growing ``kv_lengths``, ``commit=True``) and
+        # each chunk's draft-model forward is fed that SAME chunk's target
+        # hidden states, mirroring the whole-prompt case's own
+        # target_hidden -> draft-model wiring one chunk at a time.
+        anchors = {}
+        step0_logits: torch.Tensor | None = None
+        step0_hidden: torch.Tensor | None = None
+        chunk_start = 0
+        while chunk_start < prompt_len:
+            chunk_end = min(chunk_start + chunk_size, prompt_len)
+            this_chunk_len = chunk_end - chunk_start
+            is_last_chunk = chunk_end == prompt_len
+            chunk_tokens_per_slot = [p[chunk_start:chunk_end] for p in prompts_per_slot]
+
+            # Uniform prompt length -> every slot's kv_len/draft_sync_len
+            # advances identically chunk to chunk, so reading slots[0]'s
+            # own counters is exactly this chunk's shared running value
+            # for every slot (already asserted equal-length above).
+            running_kv_len = self.slot_kv_len[slots[0]]
+            target_logits_chunk, target_hidden_chunk = self._forward_batch(
+                slots,
+                chunk_tokens_per_slot if this_chunk_len > 1 else [p[0] for p in chunk_tokens_per_slot],
+                [running_kv_len] * num_reqs,
+                qo_len=this_chunk_len,
+                commit=True,
+                return_hidden=True,
+                is_decode=False,
+                logits_last_position_only=True,
+            )
+
+            if is_last_chunk:
+                for i, s in enumerate(slots):
+                    anchors[s] = int(target_logits_chunk[i].argmax(dim=-1).item())
+                shifted_chunk_per_slot = [
+                    prompts_per_slot[i][chunk_start + 1 : prompt_len] + [anchors[slots[i]]]
+                    for i in range(num_reqs)
+                ]
+            else:
+                # Not yet at the anchor position -- this chunk's shifted
+                # (draft-model-input) tokens are simply the next real
+                # prompt tokens, no anchor needed yet.
+                shifted_chunk_per_slot = [
+                    prompts_per_slot[i][chunk_start + 1 : chunk_end + 1] for i in range(num_reqs)
+                ]
+
+            running_draft_len = self.slot_draft_sync_len[slots[0]]
+            draft_logits_chunk, draft_hidden_chunk = self._mtp_forward_batch(
+                slots,
+                # ``_mtp_forward_batch`` special-cases the literal scalar
+                # ``qo_len == 1`` to expect a FLAT one-token-per-slot list
+                # (matching ``_forward_batch``'s own convention, and the
+                # equivalent flattening already applied to the target
+                # model's call above) -- only matters for a final remainder
+                # chunk of length 1 with a non-default chunk_size; every
+                # real fixture/chunk-size combination this round uses
+                # divides evenly, so this is a defensive correctness
+                # guard, not something exercised by today's measurements.
+                shifted_chunk_per_slot if this_chunk_len > 1 else [t[0] for t in shifted_chunk_per_slot],
+                target_hidden_chunk,
+                [running_draft_len] * num_reqs,
+                [running_draft_len] * num_reqs,
+                qo_len=this_chunk_len,
+                is_decode=False,
+                # Every chunk (not just the last) only needs each slot's
+                # own last-position output kept -- earlier chunks' full
+                # per-position hidden/logits are never read (the physical
+                # KV-cache write that lets the NEXT chunk continue is a
+                # side effect of the forward call itself, not something
+                # this method needs the returned tensor for).
+                logits_last_position_only=True,
+            )
+            for s in slots:
+                self.slot_draft_sync_len[s] += this_chunk_len
+
+            if is_last_chunk:
+                step0_logits, step0_hidden = draft_logits_chunk, draft_hidden_chunk
+
+            chunk_start = chunk_end
+
+        assert step0_logits is not None and step0_hidden is not None
+        prev_tokens = step0_logits.argmax(dim=-1).tolist()
+        draft_tokens: dict[int, list[int]] = {s: [prev_tokens[i]] for i, s in enumerate(slots)}
+        # Matches _mtp_sync_and_propose_batch's own invariant: both counters
+        # equal ``prompt_len`` here (0 + prompt_len), identical to each
+        # other, exactly what _mtp_run_continuation_steps expects at entry.
+        next_pos_list = [self.slot_draft_sync_len[s] for s in slots]
+        running_prior_kv_len = [self.slot_draft_sync_len[s] for s in slots]
+        self._mtp_run_continuation_steps(
+            slots, draft_tokens, prev_tokens, step0_hidden, next_pos_list, running_prior_kv_len,
+            self.num_speculative_tokens,
         )
         for s in slots:
-            self.slot_pending_draft_tokens[s] = draft_tokens_by_slot[s]
-        return {s: {"anchor": anchors[s], "draft_tokens": draft_tokens_by_slot[s]} for s in slots}
+            self.slot_pending_draft_tokens[s] = draft_tokens[s]
+        return {s: {"anchor": anchors[s], "draft_tokens": draft_tokens[s]} for s in slots}
 
     def mtp_verify_and_commit_batch(
         self,

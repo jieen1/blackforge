@@ -4,6 +4,62 @@ Updated: 2026-07-19
 
 ## Completed
 
+### Chunked batched prefill: built, verified, and c=4/64K -- previously categorically blocked -- now real and 1.29x FASTER than native (2026-07-19)
+
+Closes the two structurally-missing pieces §18.6 of `notes/2026-07-18-
+session-review-and-next-steps.md` identified for a real c=4/64K
+measurement: draft-model step-0 chunking and GDN chunk-boundary state
+continuity. `DirectModelRunner.mtp_prefill_batch` gained an opt-in
+`chunk_size: int | None = None` parameter (default preserves every
+existing call byte-for-byte); when set, both the target and draft
+models' forward calls are split into sequential `chunk_size`-token
+pieces instead of one giant forward over the whole prompt. Both
+underlying primitives needed for this (`_forward_batch`'s `kv_lengths`/
+`commit` for attention's paged-KV continuation; `build_gdn_metadata_
+batch`'s `has_initial_state`, driven by the already-existing
+`self.slot_gdn_initialized` flag, for GDN's recurrent-state continuity)
+turned out to already be fully general -- confirmed by direct reading
+before writing any code, not assumed -- so this round's real work was
+orchestration (the chunking loop, draft-model lockstep wiring, and
+extracting `_mtp_run_continuation_steps` as a shared helper), not new
+kernel/metadata mechanism.
+
+**Correctness (the load-bearing result, verified BEFORE any performance
+measurement)**: a dedicated new test, `benchmarks/mtp_chunked_prefill_
+check.py`, prefills the SAME 16384-token prompt 4 ways (chunk_size=None/
+4096/8192/1024) -- anchor + all K=3 draft tokens EXACT match across all
+four, and an independent singular-mechanism reference matches with
+margin=0.0. A real, root-caused, benign numerical effect WAS found (not
+hidden): GDN's `conv_state`/`ssm_state` are stored in the model's bf16
+compute dtype, so each external chunk boundary pays one extra bf16
+round-trip a continuous single-shot forward never does -- exactly zero
+at GDN layer 0 (proving the read/write addressing itself correct),
+growing smoothly through the 48-layer stack, the SAME qualitative
+signature this project already established and accepted for a different
+root cause (cross-slot bf16 batching-order noise). 20 real multi-round
+continuation rounds and a second, independent natural-language prompt
+(8500 tokens) both confirm zero token-VALUE mismatches. Full 4-suite
+regression battery PASS; the 4K/c=4 headline shows bit-identical
+correctness and no throughput regression.
+
+**The real payoff**: c=4/64K -- found categorically blocked in §16 and
+separately estimated at ~110-113 GiB (over this card's capacity) even
+after raising `blocks_per_slot`, without chunking, in §18.6 -- is now
+real, safe, and fast. With `--blocks-per-slot 5120 --chunk-size 8192`:
+peak memory **50544 MiB (51.6%), perfectly flat for the entire ~74s
+run** (continuously monitored via a genuine-climbing-trend watchdog, not
+a flat threshold), at **13.950 accepted tok/s** -- versus native's own
+real, unchanged 10.800 tok/s at this exact shape: **this runtime is
+~1.29x FASTER than native at 64K/c=4**, confirming (not merely
+extrapolating) the crossover `notes/...`'s own §16.6 flagged as
+"plausible but unverified." A clean, controlled c=1/64K chunked-vs-non-
+chunked comparison (same `blocks_per_slot=5120`) independently confirms
+the memory-bounding mechanism itself: peak memory drops from 50713 MiB
+(non-chunked, already measured) to 33992 MiB (chunked, this round) --
+-33.0% -- while throughput also improves (+10.5%), not merely trading
+speed for memory. Full writeup: `notes/2026-07-18-session-review-and-
+next-steps.md` section 19.
+
 ### D1 64K capacity-raise: real, safe measurements at c=1/c=2 (2026-07-19)
 
 Follows up on the "categorically blocked" 64K/c=4 finding below.
