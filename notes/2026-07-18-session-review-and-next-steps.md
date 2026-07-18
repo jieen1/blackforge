@@ -1971,3 +1971,341 @@ that produced real, quantified findings.
   faster, at this shape). The only remaining lever is real prefill
   chunking, a structurally bigger, riskier change correctly left as a
   scoped recommendation for future work, not attempted this round.
+
+---
+
+## 16. 64K/c=4: this runtime is CATEGORICALLY BLOCKED (not merely risky) --
+real native number obtained instead; trend inconclusive at 64K (executed
+2026-07-18)
+
+**Verdict: this is not an OOM story, it is a hard capacity-ceiling story,
+found analytically BEFORE running anything risky and then confirmed
+empirically with a near-zero-cost repro.** This runtime's own benchmark
+suite hardcodes `blocks_per_slot=2560`/`block_size=16` (a fixed
+40960-token-per-slot ceiling) in ~30 scripts, including
+`mtp_w1s_our_runtime_perf.py`. A single 65536-token (64K) prompt already
+exceeds that ceiling **during prefill alone, before any generation, at
+ANY concurrency** (the check is per-slot, not per-batch) -- so there is no
+"scale down concurrency" path to a real "ours" data point here, unlike a
+true memory-headroom problem. A real native number (**10.800 accepted
+tok/s** at 64K/c=4) WAS obtained safely. The encouraging 2.080x -> 1.116x
+narrowing trend from §§13-15 **cannot be confirmed, refuted, or extended**
+at 64K this round -- only native's own real throughput trend is known, and
+a clearly-labeled (unmeasured) extrapolation of this runtime's own
+established near-linear scaling is offered for context, not as a result.
+
+### 16.1 Safety steps taken, in order (per this task's own instruction)
+
+1. **Fixture check**: `benchmarks/fixtures/` had no 64K fixture (expected,
+   per §12). Built one following the exact §12 convention.
+2. **Analytical estimate BEFORE any run**: read
+   `allocate_fixed_slot_kv_caches`/`build_attention_metadata`/
+   `build_attention_metadata_batch` (`runtime/direct_model_runner.py`)
+   directly. This is what surfaced the hard blocker (§16.2) -- the
+   analytical step itself changed this task's shape before any GPU time was
+   spent on "ours."
+3. **Started conservative**: for "ours," confirmed the blocker with a
+   minimal (`--concurrency 1 --num-requests 1 --max-tokens 8`) repro rather
+   than the full cell -- cheap because it fails during metadata-build,
+   before any real prefill compute. For native (no such ceiling, but
+   already near-96% baseline -- see §16.5), ran a `--concurrency 1
+   --num-requests 1` sanity leg before the real `--concurrency 4
+   --num-requests 4` cell.
+4. **Continuous monitoring**: a background `nvidia-smi
+   --query-gpu=memory.used,memory.total --format=csv,noheader` loop
+   sampled every 5s throughout both the "ours" repro and the entire native
+   server lifetime (startup through both legs), not just before/after.
+5. **Abort discipline**: no abort was needed for either leg (see §16.5 for
+   why the native run, despite sitting close to the stated 90GB/92%
+   caution line throughout, was judged safe to continue -- it was FLAT,
+   not climbing).
+
+GPU/process idleness verified via `nvidia-smi`/`pgrep` immediately before
+starting (1999-2003 MiB baseline, 0% util, no matching processes) and
+immediately after every GPU-heavy step, not assumed from memory.
+
+### 16.2 Fixture built: `d1_ctx64k_prompts.json`
+
+Added `D1_CTX64K_FIXTURE` to `benchmarks/workloads.py` (16 requests,
+`prompt_len=65536`, same formula/seed/tokenizer as `D1_CTX16K_FIXTURE`/
+`D1_CTX32K_FIXTURE` -- explicitly NOT the official W2/W2-S line, same
+caveat as its two predecessors), wired it into
+`benchmarks/generate_synthetic_fixtures.py`'s fixture list, and generated
+it (`python -m benchmarks.generate_synthetic_fixtures`, CPU-only, 8.3s,
+no GPU involved). Also wired the `"ctx64k"` key into both
+`mtp_w1s_our_runtime_perf.py`'s fixture dict/`--fixture` choices and
+`w1s_native_bench.py`'s `FIXTURES` dict (matching the exact §12 pattern) --
+needed for native's real measurement below, and left in place for "ours"
+so the blocker is directly reproducible by anyone re-running this fixture
+key, not silently absent from the CLI.
+
+### 16.3 The analytical estimate: a HARD capacity ceiling, not a soft memory risk
+
+`allocate_fixed_slot_kv_caches` (`runtime/direct_model_runner.py:101`)
+sizes the paged attention KV-cache tensor as `num_blocks = (num_slots +
+RESERVED_PHYSICAL_SLOTS) * blocks_per_slot` -- i.e. **`blocks_per_slot` is
+a FIXED, request-independent per-slot capacity ceiling**
+(`blocks_per_slot * block_size` tokens), not something that grows with
+context length. Every one of this runtime's ~30 benchmark/regression
+scripts (`grep -rn "blocks_per_slot=" benchmarks/*.py`, checked directly)
+hardcodes it to **2560** (with `block_size=16` -> **40960-token-per-slot
+ceiling**), including `mtp_w1s_our_runtime_perf.py:355`, the script every
+D1 cell in this doc has used. `D1_CTX32K_FIXTURE`'s 32768-token prompts
+fit under this ceiling with ~6912 tokens (~17%) to spare (plus up to 256
+generated tokens); **a single 65536-token (64K) prompt does not fit AT
+ALL** -- it exceeds the ceiling by 24576 tokens before generating even one
+token, and the capacity check (`build_attention_metadata_batch`,
+`:430`, and the equivalent single-slot `build_attention_metadata`, `:192`)
+is evaluated **per slot**, so this is independent of concurrency: c=1,
+c=2, and c=4 all hit the identical failure.
+
+**Confirmed empirically, not just by reading the code** (this project's
+own standing "verify, don't assume" discipline): ran the REAL entry point
+end to end --
+
+```
+python -m benchmarks.mtp_w1s_our_runtime_perf --batched --fixture ctx64k \
+  --concurrency 1 --num-requests 1 --max-tokens 8
+```
+
+Model loaded successfully (~37s, peaked at **31125 MiB**, 31.8% -- trivial,
+confirmed via the continuous monitor), then failed immediately on the
+first prefill call, BEFORE any large-tensor GPU work:
+
+```
+RuntimeError: slot 0 kv_len 65536 exceeds this slot's 40960-token capacity
+  (runtime/direct_model_runner.py:430, build_attention_metadata_batch,
+   called from mtp_prefill_batch -> _forward_batch)
+```
+
+Process exited cleanly; GPU returned to the 2002 MiB idle baseline
+immediately after (confirmed via `nvidia-smi`/`pgrep`). **This is a
+categorical block, not a "too risky at this scale" situation** -- there is
+no `--num-requests`/concurrency reduction that avoids it, unlike a true
+memory-headroom problem.
+
+### 16.4 Why bumping `blocks_per_slot` alone would NOT make this safe either -- quantified
+
+Per this task's own instruction ("real numbers beat extrapolation"), before
+recommending "just raise `blocks_per_slot`" as the fix, its own memory cost
+was computed from the same source:
+
+- **Per-token attention KV-cache footprint** (`get_kv_cache_shape`,
+  `/home/bot/vllm/vllm/v1/attention/backends/sm120_gqa.py:629`): shape
+  `(num_blocks, 2, block_size, num_kv_heads, head_size)`, fp8_e4m3 (1
+  byte/element). Per block: `2 * 16 * 4 * 256 = 32768` bytes (32 KiB) --
+  across the model's 16 real full-attention layers (the other 48 are GDN,
+  whose state tensors depend on `num_slots`, not `blocks_per_slot`, and are
+  a small, fixed cost unaffected by this section's math).
+- **Current KV-cache tensor size** (`blocks_per_slot=2560`, `--cudagraph`
+  at c=4 -> `num_slots=8`, `+1` reserved -> 9 physical slots): `num_blocks
+  = 9*2560 = 23040`; total = `23040 * 32768 * 16 layers` = **11.25 GiB**.
+- **Minimum `blocks_per_slot` for a single 64K request**: `(65536 +
+  256)/16 = 4112` blocks exactly, zero margin. Mirroring the ~17-25%
+  margin convention `D1_CTX16K/32K_FIXTURE` already have over their own
+  ceiling, a natural round choice is **`blocks_per_slot=5120`** (exactly
+  2x today's value, 81920-token capacity, ~24% margin) -- **this exact
+  value is NOT applied in this task**, per its own instruction not to
+  attempt the fix; given here only to size its cost.
+- **KV-cache tensor size AT `blocks_per_slot=5120`** (same c=4/`--cudagraph`
+  config): `num_blocks = 9*5120 = 46080`; total = **22.5 GiB** -- exactly
+  double, a **+11.25 GiB fixed cost**, paid regardless of how many of the 4
+  requests are actually active.
+- **Activation (single-shot batched-prefill working-set) scaling**,
+  read directly off this doc's own two most recent real cudagraph
+  measurements (same `blocks_per_slot=2560` config both times, so the
+  ~46492 MiB pre-prefill baseline from §15.2's phase trace cancels out
+  cleanly): 16K/c=4 peak 64050 MiB -> activation delta ~17558 MiB (for
+  `4*16384=65536` total tokens in the one-shot forward); 32K/c=4 peak
+  82776 MiB -> activation delta ~36284 MiB (for `4*32768=131072` total
+  tokens). Ratio **2.067x for 2x total-tokens -- confirms §14's
+  near-linear-scaling finding** (already established, not re-derived
+  here) and gives ~0.27-0.28 MiB per total-token processed in one shot.
+- **Extrapolated activation delta at 64K/c=4** (`4*65536=262144` total
+  tokens, exactly 2x 32K's): **~72568 MiB** (clean 2x of 32K's measured
+  delta).
+- **Total estimated peak for a hypothetical, blocks_per_slot=5120-fixed
+  c=4/64K cell**: `46492 (old baseline) + 11520 (KV-cache delta) + 72568
+  (activation delta)` **~= 130580 MiB ~= 127.5 GiB** -- **about 31.9 GiB
+  (~33%) OVER this card's entire 97887 MiB (95.6 GiB) capacity.** This is a
+  decisive, quantified conclusion, not a guess: **raising `blocks_per_slot`
+  alone would trade "cannot run" for "reliably OOMs,"** not fix the cell.
+- **The same math at c=1** (no `--cudagraph`, 2 physical slots instead of
+  9, total tokens `1*65536=65536` -- matching 16K/c=4's total-token count
+  exactly): KV-cache `~5.0 GiB` + baseline weights (~24 GiB, from this
+  project's own repeatedly-observed post-weight-load figures) + activation
+  delta (~17.5-20 GiB, using the matching-total-tokens 16K/c=4 anchor)
+  **~= 47-50 GiB total -- comfortably inside the 95.6 GiB card, ~48 GiB of
+  headroom.** So a reduced-concurrency 64K measurement is plausibly
+  achievable once `blocks_per_slot` is raised; the full c=4 cell is not,
+  without ALSO addressing the activation-memory scaling (real prefill
+  chunking, already flagged as the standing next lever in §13.8/14.6 for
+  an unrelated reason -- this section adds a second, independent reason it
+  matters).
+
+### 16.5 Native: a real 64K/c=4 number, obtained safely
+
+Native has no equivalent per-slot ceiling (paged KV cache sized from
+`--gpu-memory-utilization` at server startup, not from a fixed
+per-request-shape constant), so it was tested directly, with the same
+staged/monitored discipline.
+
+**Launched once** (`launch_test_server.py --port 8100 --with-mtp
+--kv-cache-dtype fp8_e4m3 --model unsloth/Qwen3.6-27B-NVFP4`, matching
+§12.1's exact invocation -- `--max-model-len` default 262144 already covers
+64K). Startup log confirmed the mechanism behind this doc's own recurring
+observation that native sits close to its memory ceiling at EVERY context
+length tested so far (16K: unreported peak; 32K: 94338/97887, 96.4%; see
+§12.2): **`gpu_worker.py`'s own profiling log reports a KV-cache pool of
+64.8 GiB / 1,829,150 tokens, allocated ONCE at startup from
+`--gpu-memory-utilization=0.92`** -- a STATIC budget, sized independent of
+whatever workload runs afterward (1,829,150 tokens is ~27.8x more capacity
+than 4 x 65792 real tokens this cell needed). **Immediately after startup,
+before any request, `nvidia-smi` already read 91622 MiB (93.6%)** -- this
+static pool, not per-request scaling, is the dominant term in every native
+memory figure this whole D1 sweep has recorded.
+
+**Staged execution** (continuous 5s-interval `nvidia-smi` monitoring
+throughout):
+
+| step | command | memory (MiB) | note |
+|---|---|---:|---|
+| server startup | -- | 91622 (93.6%) | static KV-pool baseline, before any request |
+| sanity leg | `w1s_native_bench.py --fixture ctx64k --concurrency 1 --num-requests 1 --max-tokens 32 --stream` | 94046 (96.1%) | rose once, then FLAT for 6+ samples -- no climb |
+| real cell | `w1s_native_bench.py --fixture ctx64k --concurrency 4 --num-requests 4 --max-tokens 256 --stream` | **94582 (96.6%)** | rose once, then FLAT for the remainder -- no climb |
+| server stop | `stop_test_server.py` | 2002 (idle) | confirmed clean via `nvidia-smi`/`pgrep` |
+
+Both legs' memory traces **rose once to a new plateau and then sat
+perfectly flat** (not a monotonic climb) -- the textbook signature of a
+static pool absorbing a one-time allocation, not a leak or runaway
+growth. Peak (94582 MiB, 96.6%) is above the task's stated 90GB/92%
+caution line **in absolute terms**, but the abort criterion is "climbing
+... and still rising," which this was not -- flagged honestly rather than
+silently waved through: this is a genuinely tight margin (~3.3 GiB
+headroom), consistent with (not contradicting) every other native memory
+figure this sweep has recorded, and no abort was warranted by the actual
+observed behavior.
+
+**Real result** (`--concurrency 4 --num-requests 4 --max-tokens 256`,
+single rep, matching this sweep's own established convention):
+
+```json
+{
+  "num_requests": 4, "max_tokens": 256, "concurrency": 4,
+  "wall_s": 64.256,
+  "num_drafts": 327, "num_draft_tokens": 981, "num_accepted_tokens": 694,
+  "draft_acceptance_rate_pct": 70.744,
+  "accepted_tokens_per_sec": 10.800,
+  "ttft_mean_ms": 31558.2, "ttft_p99_ms": 58289.8,
+  "itl_mean_ms": 386.7, "itl_p99_ms": 3217.4
+}
+```
+
+**Native at 64K/c=4: 10.800 accepted tok/s.**
+
+### 16.6 The gap/trend verdict: inconclusive for the ratio, but native's own curve is informative
+
+**No real "ours" number exists at 64K, at any concurrency, without first
+applying (at minimum) the `blocks_per_slot` raise from §16.4 -- and per
+§16.4's own math, that raise alone is insufficient for c=4 (would OOM by
+~32 GiB); only a reduced-concurrency cell would currently be safe once
+raised.** The 2.080x (16K) -> 1.116x (32K) narrowing trend therefore
+**cannot be confirmed to continue, hold flat, or reverse at 64K this
+round** -- there is no denominator to compute a real ratio against.
+
+What IS real: native's own throughput continues to collapse
+super-linearly, though the rate of collapse itself may be decelerating --
+
+| context | native tok/s | ratio vs. previous (2x context) |
+|---|---:|---:|
+| 4K | 144.54 | -- |
+| 16K | 121.960 | 1.185x |
+| 32K | 32.941 | 3.702x |
+| 64K | **10.800** | **3.050x** |
+
+3.050x (32K->64K) is still far worse than linear (2x), continuing the
+established super-linear pattern -- but it is somewhat LESS severe than
+the 3.702x seen for 16K->32K, a first (single-data-point, not yet a
+trend) hint that native's own degradation curve might itself be starting
+to level off at these lengths, rather than accelerating indefinitely.
+
+**For context only -- NOT a measurement, explicitly not to be read as
+one**: if this runtime's own previously-established near-linear scaling
+(1.986x for 16K->32K, §15.4) held one more doubling, its 64K throughput
+would extrapolate to roughly `29.522 / ~1.9-2.0` **~= 14.8-15.5 tok/s
+(unverified)**. Compared against native's REAL 10.800, this hypothetical
+number would put "ours" AHEAD of native (an apparent crossover) --
+consistent with, but in no way confirming, the narrowing trend continuing
+past parity. This is offered only because the task explicitly asked
+whether the trend is "encouraging" -- the honest answer is: the real data
+available says nothing definitive either way at 64K, and native's own
+super-linear collapse continuing (even if decelerating) means a real
+crossover is plausible but unverified.
+
+### 16.7 What a real c=4/64K measurement would need (future work, not attempted here)
+
+Two independent, structurally bigger changes, per this task's own
+instruction not to attempt them in this round:
+
+1. **Raise `blocks_per_slot`** (e.g. to 5120, per §16.4) to remove the hard
+   capacity ceiling. Not a free parameter change: `blocks_per_slot *
+   block_size` is also the ceiling `decode_fixed_kv_split_size`/
+   `max_num_splits` are derived from (`__init__`, targeting "64
+   splits/request" -- see §14.4's citation), so raising it changes
+   split-KV sizing for every OTHER cell too and would need its own
+   re-validation (a full regression-suite pass at minimum) before being
+   trusted -- and it is currently hardcoded identically across ~30
+   benchmark/regression scripts, so either all of them need updating or
+   the change needs to be scoped narrowly to a new copy used only for
+   long-context sweeps.
+2. **Real host-side prefill chunking** of `mtp_prefill_batch`'s single
+   giant forward call (already flagged as the standing next lever for the
+   ~2.08x residual 16K/c=4 gap in §13.8/14.6, for an unrelated reason) --
+   per §16.4's own math, this is now ALSO a hard prerequisite for a safe
+   c=4/64K cell specifically, since the activation-memory term alone
+   (~72.6 GiB extrapolated) is the dominant contributor to the ~127.5 GiB
+   estimate exceeding this card's capacity. Chunking would need correct
+   incremental `kv_len`/position bookkeeping across chunks for both the
+   target and draft models and its own correctness re-validation -- not a
+   parameter change.
+
+**A narrower, safer near-term alternative**: per §16.4's c=1 estimate
+(~47-50 GiB, comfortably safe), raising `blocks_per_slot` ALONE (without
+prefill chunking) would likely be enough to get a real "ours" number at
+64K/c=1 (and plausibly c=2). This would not answer the c=4 question this
+task was set up to answer, but it would give a real (not extrapolated)
+data point for whether this runtime's own near-linear-scaling claim
+(§14/§15) genuinely holds one more context doubling -- a strictly smaller,
+lower-risk follow-up than the full fix in item 2 above.
+
+### 16.8 Bottom line
+
+| Context | Concurrency | Native tok/s | Ours tok/s | Gap (native/ours) | Flag |
+|---|---:|---:|---:|---:|---|
+| 16K | 4 | 121.960 | 58.638 | 2.080 | **>1.3x -- FLAG** |
+| 32K | 4 | 32.941 | 29.522 | 1.116 | under 1.3x -- no flag |
+| 64K | 4 | **10.800** (real) | **BLOCKED** -- hard capacity ceiling, not measurable at any concurrency without raising `blocks_per_slot` (which alone would then OOM by ~32 GiB at c=4, per §16.4) | n/a | **blocked, not measured** |
+
+- The 64K/c=4 cell was **not completed**, but for a reason this task's own
+  safety framing did not fully anticipate: not a memory-risk judgment call,
+  but a hard, unconditional, code-level capacity ceiling, found
+  analytically before any risky run and confirmed empirically at near-zero
+  cost.
+- A real native number WAS obtained safely (**10.800 accepted tok/s**,
+  peak memory 94582/97887 MiB = 96.6%, flat throughout, no abort needed) --
+  continuing native's super-linear collapse (3.050x for the 32K->64K
+  doubling, slightly less severe than 16K->32K's 3.702x).
+- The narrowing gap trend (2.080x -> 1.116x -> ?) is **inconclusive at
+  64K**: no real "ours" ratio exists to report. A clearly-labeled,
+  unverified extrapolation of this runtime's own established near-linear
+  scaling suggests a crossover (ours ahead of native) is plausible in this
+  range, but this is explicitly NOT a result -- confirming it needs the
+  two structural fixes in §16.7, which are correctly left as scoped future
+  work, not attempted this round.
+- No production code was touched. Changes this round are measurement
+  infrastructure only: a new frozen fixture
+  (`benchmarks/fixtures/d1_ctx64k_prompts.json`), its `D1_CTX64K_FIXTURE`
+  definition (`benchmarks/workloads.py`), its wiring into
+  `benchmarks/generate_synthetic_fixtures.py`,
+  `benchmarks/mtp_w1s_our_runtime_perf.py`, and
+  `benchmarks/w1s_native_bench.py`.

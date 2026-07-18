@@ -311,6 +311,7 @@ def _run_once(
     from benchmarks.workloads import (
         D1_CTX16K_FIXTURE,
         D1_CTX32K_FIXTURE,
+        D1_CTX64K_FIXTURE,
         W1_S_FIXTURE,
         W1_S_FIXTURE_N128,
         load_prompt_token_ids,
@@ -326,6 +327,15 @@ def _run_once(
         # these two.
         "ctx16k": D1_CTX16K_FIXTURE,
         "ctx32k": D1_CTX32K_FIXTURE,
+        # 2026-07-18, D1 sweep continuation: wired for completeness, but see
+        # workloads.py's D1_CTX64K_FIXTURE docstring -- this runtime's fixed
+        # blocks_per_slot=2560 (40960-token/slot capacity, hardcoded just
+        # below) is SMALLER than a single 65536-token prompt, so a real run
+        # against this fixture will raise a capacity RuntimeError during
+        # prefill, at ANY concurrency, until blocks_per_slot is deliberately
+        # raised (a real, structurally bigger config change, not made here --
+        # see notes/2026-07-18-session-review-and-next-steps.md §16).
+        "ctx64k": D1_CTX64K_FIXTURE,
     }[fixture_key]
     prompts = load_prompt_token_ids(fixture)
     if num_requests is not None:
@@ -383,7 +393,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--concurrency", type=int, default=4)
-    parser.add_argument("--fixture", choices=["n16", "n128", "ctx16k", "ctx32k"], default="n16")
+    parser.add_argument("--fixture", choices=["n16", "n128", "ctx16k", "ctx32k", "ctx64k"], default="n16")
     parser.add_argument("--num-requests", type=int, default=None)
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument(

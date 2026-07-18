@@ -4,6 +4,56 @@ Updated: 2026-07-18
 
 ## Completed
 
+### Phase D1, 64K/c=4 attempted: this runtime is CATEGORICALLY BLOCKED (hard capacity ceiling, not an OOM risk); real native number obtained instead (2026-07-18)
+
+Following up on the 32K/c=4 entry below's flagged "48K/64K spot-check"
+next step. Before running anything, the analytical pre-run check this
+task required (reading `allocate_fixed_slot_kv_caches`/
+`build_attention_metadata_batch`, `runtime/direct_model_runner.py`)
+surfaced a HARD blocker: every one of this runtime's benchmark scripts
+hardcodes `blocks_per_slot=2560`/`block_size=16` (a fixed 40960-token/slot
+capacity ceiling, independent of context length), and a single 65536-token
+(64K) prompt exceeds that ceiling **during prefill alone, at ANY
+concurrency** (the check is per-slot, not per-batch) — confirmed
+empirically with a near-zero-cost repro (`RuntimeError: slot 0 kv_len
+65536 exceeds this slot's 40960-token capacity`, failing right after model
+load, before any expensive compute). Unlike a true memory-headroom
+problem, no `--num-requests`/concurrency reduction avoids this. Further
+quantified analytically: raising `blocks_per_slot` to fix it (e.g. to
+5120) would ALSO fail for the full c=4 cell — the resulting KV-cache
+tensor + this runtime's own established near-linear-scaling
+activation-memory cost extrapolate to **~127.5 GiB, ~33% over this card's
+97887 MiB (95.6 GiB) capacity** — so a real fix needs BOTH a
+`blocks_per_slot` raise AND real prefill chunking (the same lever already
+flagged in the D1-follow-up entries below for an unrelated reason); a
+reduced-concurrency (c=1) cell would likely fit (~47-50 GiB estimated)
+with just the `blocks_per_slot` raise, flagged as a smaller, safer future
+follow-up.
+
+Native has no equivalent ceiling (paged KV cache sized from
+`--gpu-memory-utilization=0.92` at server startup — confirmed via its own
+startup log to be a STATIC 64.8 GiB / 1,829,150-token pool, ~27.8x more
+than this cell's real need, already sitting at 91622 MiB/93.6% before any
+request), so it WAS measured safely (staged: a `--concurrency 1
+--num-requests 1` sanity leg, then the real `--concurrency 4
+--num-requests 4` cell), with continuous 5s memory monitoring throughout:
+**10.800 accepted tok/s** at 64K/c=4, peak memory 94582/97887 MiB (96.6%,
+rose once then held perfectly flat — no runaway climb, no abort needed
+despite sitting above the task's stated 90GB caution line in absolute
+terms). Native's own super-linear collapse continues (3.050x for the
+32K→64K doubling — still far worse than linear, though somewhat less
+severe than 16K→32K's 3.702x).
+
+**The 2.080x → 1.116x narrowing trend is therefore inconclusive at 64K**:
+no real "ours" ratio exists to report. A clearly-labeled, NOT-a-measurement
+extrapolation of this runtime's own near-linear scaling (29.522/~1.9-2.0)
+suggests ~14.8-15.5 tok/s, which would put "ours" ahead of native's real
+10.800 (an apparent crossover) — plausible given native's continuing
+collapse, but explicitly unverified. No production code touched — pure
+measurement infrastructure added (a new frozen fixture,
+`D1_CTX64K_FIXTURE`, and its wiring into the two D1 benchmark scripts).
+Full writeup: notes/2026-07-18-session-review-and-next-steps.md section 16.
+
 ### Phase D1, missing cell measured: 32K/c=4 (2026-07-18) — gap NARROWS to 1.116x, no flag, near-linear-scaling trend confirmed
 
 Section 12.5 of `notes/2026-07-18-session-review-and-next-steps.md` had

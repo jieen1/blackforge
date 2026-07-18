@@ -221,6 +221,28 @@ D1_CTX32K_FIXTURE = PromptFixture(
     prompt_len=32768,
 )
 
+# 2026-07-18, D1 sweep continuation (native/ours gap trend at 4K/16K/32K:
+# 2.08x -> 1.116x, narrowing -- the natural next question is whether this
+# runtime overtakes native at 64K). SAME formula/seed/num_requests=16
+# extension pattern as the two fixtures above -- NOT the official W2/W2-S
+# line, same caveat applies. NOTE (found while wiring this up, see the
+# 2026-07-18 §16 safety note): this runtime's own benchmark scripts
+# hardcode `blocks_per_slot=2560` with `block_size=16` (40960-token/slot
+# capacity ceiling) -- a single 65536-token prompt already exceeds that
+# ceiling on its own (prefill alone, before any generation), independent
+# of concurrency. This fixture is built anyway (cheap, CPU-only, useful
+# regardless) but running `mtp_w1s_our_runtime_perf.py --fixture ctx64k`
+# against this runtime will raise a capacity RuntimeError until that
+# ceiling is deliberately raised -- see the note for the precise scoped fix.
+D1_CTX64K_FIXTURE = PromptFixture(
+    path="d1_ctx64k_prompts.json",
+    tokenizer="unsloth/Qwen3.6-27B-NVFP4",
+    generation_formula=_W1_S_FORMULA,
+    seed=12345,
+    num_requests=16,
+    prompt_len=65536,
+)
+
 
 def main() -> None:
     print(json.dumps({name: asdict(workload) for name, workload in WORKLOADS.items()}, indent=2))

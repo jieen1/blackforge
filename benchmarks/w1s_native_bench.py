@@ -36,6 +36,7 @@ import aiohttp
 from benchmarks.workloads import (
     D1_CTX16K_FIXTURE,
     D1_CTX32K_FIXTURE,
+    D1_CTX64K_FIXTURE,
     W1_S_FIXTURE,
     W1_S_FIXTURE_N128,
     load_prompt_token_ids,
@@ -49,6 +50,12 @@ FIXTURES = {
     # official W2/W2-S line, see workloads.py's own docstring.
     "ctx16k": D1_CTX16K_FIXTURE,
     "ctx32k": D1_CTX32K_FIXTURE,
+    # 2026-07-18, D1 sweep continuation: native has no equivalent fixed
+    # per-slot capacity ceiling (paged KV cache sized from
+    # gpu_memory_utilization at server startup), so this fixture works fine
+    # here even though it is blocked for this runtime's own benchmark --
+    # see workloads.py's D1_CTX64K_FIXTURE docstring.
+    "ctx64k": D1_CTX64K_FIXTURE,
 }
 
 
