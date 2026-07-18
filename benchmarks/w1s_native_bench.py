@@ -33,9 +33,23 @@ import time
 
 import aiohttp
 
-from benchmarks.workloads import W1_S_FIXTURE, W1_S_FIXTURE_N128, load_prompt_token_ids
+from benchmarks.workloads import (
+    D1_CTX16K_FIXTURE,
+    D1_CTX32K_FIXTURE,
+    W1_S_FIXTURE,
+    W1_S_FIXTURE_N128,
+    load_prompt_token_ids,
+)
 
-FIXTURES = {"n16": W1_S_FIXTURE, "n128": W1_S_FIXTURE_N128}
+FIXTURES = {
+    "n16": W1_S_FIXTURE,
+    "n128": W1_S_FIXTURE_N128,
+    # 2026-07-18, Phase D1 shape-generalization sweep: constructed,
+    # same-formula/same-seed fixtures at longer context -- NOT the
+    # official W2/W2-S line, see workloads.py's own docstring.
+    "ctx16k": D1_CTX16K_FIXTURE,
+    "ctx32k": D1_CTX32K_FIXTURE,
+}
 
 
 def _gpu_thermal() -> dict:
@@ -194,10 +208,16 @@ async def _run_once(
     concurrency: int,
     fixture_key: str,
     stream: bool = False,
+    num_requests: int | None = None,
 ) -> dict:
     base_url = f"http://127.0.0.1:{port}"
     fixture = FIXTURES[fixture_key]
     prompts = load_prompt_token_ids(fixture)
+    if num_requests is not None:
+        # 2026-07-18, Phase D1: bound cost at long-context spot-checks by
+        # slicing the frozen fixture down (same convention as this
+        # project's own `mtp_w1s_our_runtime_perf.py --num-requests`).
+        prompts = prompts[:num_requests]
 
     async with aiohttp.ClientSession() as session:
         before = await _fetch_spec_decode_counters(base_url, session)
@@ -278,6 +298,9 @@ def main() -> int:
     parser.add_argument("--fixture", choices=list(FIXTURES.keys()), default="n16")
     parser.add_argument("--stream", action="store_true", help="use SSE streaming to measure TTFT/ITL")
     parser.add_argument("--repeats", type=int, default=1, help="repeat against the SAME already-running server")
+    parser.add_argument(
+        "--num-requests", type=int, default=None, help="slice the frozen fixture down to this many requests"
+    )
     args = parser.parse_args()
 
     reps = []
@@ -285,7 +308,14 @@ def main() -> int:
         thermal_before = _gpu_thermal()
         rep_result = asyncio.run(
             _run_once(
-                args.port, args.model, args.max_tokens, args.temperature, args.concurrency, args.fixture, args.stream
+                args.port,
+                args.model,
+                args.max_tokens,
+                args.temperature,
+                args.concurrency,
+                args.fixture,
+                args.stream,
+                args.num_requests,
             )
         )
         thermal_after = _gpu_thermal()

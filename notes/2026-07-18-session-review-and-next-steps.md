@@ -994,3 +994,220 @@ re-measurement (small improvement, not a cost). Diagnostic script
 `benchmarks/memory_growth_diag.py` is committed alongside the fix,
 matching this project's convention of keeping the diagnostics that
 found real bugs in the tree.
+
+---
+
+## 12. Phase D1 results: shape-generalization sweep (executed 2026-07-18)
+
+**Verdict: the review's own falsifier fired, but on the OPPOSITE axis it
+predicted.** The specific prediction ("at c=1 the cross-slot batching win
+evaporates, the gap likely re-widens there") is **refuted** -- c=1 (and
+c=2) are, in fact, where this runtime's advantage over native is
+**largest** (up to ~1.45x faster than native, not slower). But a real,
+previously untested weak spot was found on a different axis entirely:
+**concurrent (c=4) batched prefill at long context (16K)**, where the
+gap explodes to **4.85x slower than native** and the run peaked at
+**99.2% of GPU memory capacity** (97110/97887 MiB) -- worse than
+anything this project has measured before, including the D3 near-OOM
+incident. This is reported in full per this project's own convention:
+a "gains don't generalize this way" finding is exactly as valuable to
+record as a clean parity result.
+
+### 12.1 Methodology
+
+**Grid covered**: concurrency c in {1, 2, 4} (the project's own scope
+contract, `项目实施规划.md:23`, caps concurrency at 4) x context in
+{4K, 16K}, plus a 32K spot-check at c=4 for native only (ours skipped
+there for a documented safety reason, see 12.4). All cells: single rep
+(NOT the 3-rep protocol), `--max-tokens 256`, `SM120_GQA_USE_V2_DECODE_
+KERNEL=1` on both sides (matching this project's own established
+practice for a same-kernel comparison, PROGRESS.md:2034), same model
+(`unsloth/Qwen3.6-27B-NVFP4`), same `kv_cache_dtype=fp8_e4m3`.
+
+**4K cells**: the existing frozen `w1s_prompts.json` (`W1_S_FIXTURE`,
+n=16), full fixture, both sides -- directly comparable to every prior
+headline number in this doc.
+
+**16K/32K cells**: `W1_S_FIXTURE`'s own generation formula/seed/
+tokenizer had no fixture at these lengths (`workloads.py`'s own
+docstring already flagged the true W2-scale 32768 fixture as "not
+built"). Two new, clearly-labeled, SAME-formula/SAME-seed constructed
+fixtures were built for this task only:
+`benchmarks/fixtures/d1_ctx16k_prompts.json` and
+`d1_ctx32k_prompts.json` (16 prompts each, prompt_len=16384/32768),
+added as `D1_CTX16K_FIXTURE`/`D1_CTX32K_FIXTURE` in
+`benchmarks/workloads.py` with an explicit docstring that they are
+**not** the official W2/W2-S line -- just this sweep's own synthetic
+extension, following `generate_synthetic_fixtures.py`'s existing
+convention. Wired into both `mtp_w1s_our_runtime_perf.py --fixture
+ctx16k/ctx32k` and `w1s_native_bench.py --fixture ctx16k/ctx32k
+--num-requests N` (a `--num-requests` slicing flag was added to the
+native client, mirroring this runtime's own script, to bound cost at
+long context: 8 requests at 16K, 4 at 32K, vs. the full 16 at 4K).
+
+**Ragged prompt lengths**: confirmed genuinely unsupported, not just
+undocumented -- `mtp_prefill_batch` (`runtime/direct_model_runner.py
+:2400-2401`) raises `ValueError("mtp_prefill_batch requires every
+slot's prompt to have equal length")` if lengths differ, exactly the
+constraint the prior review's D2 section named. **Out of scope for this
+sweep per the task's own instruction** -- not worked around with a
+hack; flagged as a real, standing gap (tracked under D2, unchanged).
+
+**Execution order and safety**: native's server was launched ONCE
+(`launch_test_server.py --with-mtp --kv-cache-dtype fp8_e4m3 --model
+unsloth/Qwen3.6-27B-NVFP4`, default `--max-model-len 262144`, already
+enough headroom for every context length tested) and all 6 native cells
+were run against it sequentially, then cleanly stopped
+(`stop_test_server.py`, confirmed 0 compute processes + GPU back to
+~2GB baseline) before starting any of this runtime's own process
+(each invocation of `mtp_w1s_our_runtime_perf.py` reloads the full
+model in a fresh process) -- this machine's tight 23GB system RAM
+relative to the 21.81GB checkpoint (documented in the design doc's own
+"two real infrastructure incidents" section) makes running both sides'
+model loads concurrently a real risk, so the two legs were kept
+strictly sequential, exactly as prior rounds did. `nvidia-smi`/`pgrep`
+verified idle immediately before every leg, not assumed from memory.
+
+### 12.2 The gap table
+
+| Context | Concurrency | Native tok/s | Ours tok/s | Gap (native/ours) | Flag |
+|---|---:|---:|---:|---:|---|
+| 4K | 1 | 41.554 | 60.326 | **0.689** (ours 1.45x faster) | -- |
+| 4K | 2 | 78.421 | 96.809 | **0.810** (ours 1.23x faster) | -- |
+| 4K | 4 | 140.125 | 141.322 | **0.992** (parity, within noise) | -- |
+| 16K | 1 | 30.476 | 37.190 | **0.819** (ours 1.22x faster) | -- |
+| 16K | 4 | 121.960 | 25.137 | **4.852** (native 4.85x faster) | **>1.3x -- FLAG** |
+| 32K | 4 | 32.941 | not measured | n/a | skipped, see 12.4 |
+| 32K | 1 | not measured | not measured (aborted) | n/a | skipped, see 12.4 |
+
+The 4K/c=4 cell cross-checks cleanly against this doc's own established
+numbers: this single fresh rep (140.125 native / 141.322 ours) lands
+inside the noise band of the already-verified 3-rep means (144.54
+native / 142.504 ours, section 11.7) -- both sides' single-rep samples
+fall within the ~9 tok/s rep-to-rep spread section 6 already
+characterized, not a new discrepancy.
+
+### 12.3 c=1 is NOT the weak spot -- the review's specific prediction is refuted
+
+The review's falsifier (section 8/D1) predicted the cross-slot-batching
+win would "evaporate" at c=1 and the gap would "re-widen." **The
+opposite happened**: at both 4K and 16K, c=1 (and c=2 at 4K) are where
+this runtime is *furthest ahead* of native (up to 1.45x faster), and
+the advantage shrinks (not grows) as concurrency rises toward 4. The
+likely mechanism, consistent with everything else this project has
+already found: native vLLM's own per-step engine-loop/scheduler
+overhead is a largely fixed *per-step* tax that amortizes worse at low
+concurrency (fewer tokens committed per step to spread it over), while
+this runtime's hand-rolled loop already eliminated most of that
+overhead from the very first round of this project (before cross-slot
+batching was ever added) -- so at c=1, where no batching benefit is
+even possible on either side, the comparison mostly measures "removed
+scheduler overhead" (a genuine, real, and apparently LARGER advantage
+than previously reported, since it had never been isolated from the
+batching win before this sweep) rather than "batching benefit," and
+that removed-overhead advantage does not depend on concurrency.
+
+### 12.4 The actual weak spot found: concurrent long-context prefill, both a throughput collapse AND a near-OOM
+
+16K/c=4 is a materially worse result than anything in this project's
+history: **4.85x slower than native** (not the ~1.3x ceiling the review
+worried about), TTFT ballooning to a mean of **34.0 seconds** (p99 52.1s,
+vs. 2.9s at 4K/c=4), and GPU memory peaking at **97110/97887 MiB (99.2%
+of capacity)** -- higher even than the pre-D3-fix near-OOM figure
+(97227/97887, section 6) this same doc already flagged as urgent. The
+"warm" second batch within the same rep (21s wall vs. the first batch's
+61s, suggesting a one-time capture/compile cost on the first batch) was
+still only ~49 tok/s once isolated -- still far below native's 121.96,
+so this is not purely a cold-start artifact.
+
+**Source-grounded hypothesis for why (not a fix, out of scope for this
+measurement task)**: `mtp_prefill_batch` (`runtime/direct_model_runner
+.py:2377-2416`) issues exactly ONE non-chunked `_forward_batch(...,
+qo_len=prompt_len, ...)` call covering every concurrent slot's FULL
+prompt length in a single kernel launch -- confirmed by direct reading,
+there is no chunking anywhere in this path. At 16K/c=4 that is a single
+shot attending over qo_len(16384) x concurrency(4) = 65536 query
+positions across every layer at once. Native vLLM, by contrast, runs
+with `--enable-chunked-prefill` (`max_num_batched_tokens=8192`,
+`launch_test_server.py`'s default) regardless of concurrency, so no
+single native step ever processes more than 8192 tokens. This is a
+plausible, code-citation-backed explanation for both symptoms at once
+(large one-shot transient working set -> near-OOM; a shape far outside
+anything this project's kernel work has tuned/validated for ->
+throughput collapse) -- but it is a hypothesis from reading the code,
+not a profiled root cause; confirming it would need an `nsys`/memory
+trace, which is out of scope for this measurement sweep and is called
+out below as the natural follow-up.
+
+Critically, this is **not** simply "long context is slow" -- c=1 at
+16K (batch=1, same 16384-token prefill, no concurrent multiplication)
+was fine (ours *faster* than native, 12.4). The problem is specifically
+the *product* of concurrency and context length in this one non-chunked
+batched-prefill call, not either factor alone.
+
+### 12.5 What was skipped, and why (stated explicitly, not silently)
+
+- **32K/c=4 for this runtime**: skipped deliberately. Given 16K/c=4 already
+  peaked at 99.2% of GPU memory and the mechanism above scales with the
+  concurrency x context product, attempting a cell with double the context
+  at the same concurrency risked a real OOM -- this was a judgment call to
+  not "push through recklessly" per this task's own safety instruction,
+  backed by concrete evidence (the 16K/c=4 result itself) rather than a
+  guess. Native's own 32K/c=4 cell WAS run safely (94338 MiB, 96.4%,
+  32.941 tok/s) since native's paged-KV allocator did not show the same
+  scaling pathology.
+- **32K/c=1 for this runtime**: attempted, then aborted after ~4.5 minutes
+  stuck in weight-loading (vs. the usual 15-90s every other cell in this
+  sweep took) with no forward progress in the log and fluctuating RSS --
+  most likely a cold-page-cache effect from the preceding large-memory
+  16K/c=4 run, not a capability problem (an earlier, smaller dry-run at
+  this exact shape -- 1 request, 32 tokens -- had already completed
+  cleanly, peaking at 71004 MiB, confirming the shape itself works
+  mechanically). Killed cleanly (GPU/RAM confirmed back to idle
+  immediately after) rather than let an anomalous run consume further
+  budget for a cell whose likely answer (c=1 stays fine, per the 4K/16K
+  pattern in 12.3) was already well-supported by two other c=1 data
+  points.
+- **32K/c=1 for native, and c=2 at 16K/32K**: not run at all, to keep the
+  total sweep within budget -- deprioritized because the c=1-vs-c=4
+  pattern was already unambiguous from the cells that WERE run, and c=2
+  behaves as an intermediate point at 4K (0.81, between c=1's 0.69 and
+  c=4's 0.99) with no reason to expect a qualitatively different story at
+  longer context.
+- **Ragged prompt lengths**: out of scope per the task's own instruction,
+  confirmed genuinely blocked (12.1), tracked under the existing D2 item,
+  unchanged.
+
+### 12.6 Revised priority: this is now more urgent than the ~1.057x-chasing question Phase C considered
+
+Phase C (section 8) concluded the remaining ~5-6 tok/s gap at 4K/c=4 was
+not worth chasing. That conclusion is unaffected. But this sweep found
+something that changes the priority ordering of the existing D-series
+items: **16K/c=4's 99.2% memory peak is a more acute near-OOM signal
+than the one that motivated D3** (which was fixed), and it recurs at a
+shape (16K context, c=4, MTP K=3) squarely inside this project's own
+stated target bucket (`项目实施规划.md`'s own three context buckets are
+4K/16K/32K, concurrency 1-4) -- i.e., this is not an out-of-contract
+stress test, it is the actual production shape space this runtime is
+supposed to serve. Recommended next step (not attempted this round,
+consistent with this task's own scope boundary against touching
+`direct_model_runner.py`'s core logic): profile and chunk
+`mtp_prefill_batch`'s single non-chunked forward call the same way
+native's chunked-prefill already does, then re-run this exact 16K/c=4
+cell as the gate for whether the fix worked.
+
+### 12.7 Bottom line
+
+- The review's specific c=1 prediction: **refuted** -- c=1 is this
+  runtime's best relative shape, not its worst, at both context lengths
+  tested.
+- A real, more serious weak spot exists on a different axis: **concurrent
+  batched prefill at long context** -- 16K/c=4 is 4.85x slower than
+  native and comes within 0.8% of the GPU's full memory capacity.
+- The 1.014x-1.057x "parity" headline from the earlier sections of this
+  document is **real but shape-specific**, confirmed exactly as the
+  review's own falsifier framed it (section 9): it holds at c=4/4K (and
+  is actually a conservative floor relative to c=1-2/4K, where this
+  runtime is well ahead of native) but does **not** generalize to
+  concurrent long-context prefill, where it inverts sharply. Reporting
+  "parity" without this qualification would have been misleading.

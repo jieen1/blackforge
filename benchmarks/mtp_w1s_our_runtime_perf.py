@@ -308,10 +308,25 @@ def _run_once(
     sys.path.insert(0, SM120_VLLM_INTEGRATION)
     import register_sm120_backend  # noqa: F401
 
-    from benchmarks.workloads import W1_S_FIXTURE, W1_S_FIXTURE_N128, load_prompt_token_ids
+    from benchmarks.workloads import (
+        D1_CTX16K_FIXTURE,
+        D1_CTX32K_FIXTURE,
+        W1_S_FIXTURE,
+        W1_S_FIXTURE_N128,
+        load_prompt_token_ids,
+    )
     from runtime.direct_model_runner import DirectModelRunner, build_vllm_config
 
-    fixture = {"n16": W1_S_FIXTURE, "n128": W1_S_FIXTURE_N128}[fixture_key]
+    fixture = {
+        "n16": W1_S_FIXTURE,
+        "n128": W1_S_FIXTURE_N128,
+        # 2026-07-18, Phase D1 shape-generalization sweep: same-formula/
+        # same-seed constructed fixtures at longer context, NOT the
+        # official W2/W2-S line -- see workloads.py's own docstring on
+        # these two.
+        "ctx16k": D1_CTX16K_FIXTURE,
+        "ctx32k": D1_CTX32K_FIXTURE,
+    }[fixture_key]
     prompts = load_prompt_token_ids(fixture)
     if num_requests is not None:
         prompts = prompts[:num_requests]
@@ -368,7 +383,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--concurrency", type=int, default=4)
-    parser.add_argument("--fixture", choices=["n16", "n128"], default="n16")
+    parser.add_argument("--fixture", choices=["n16", "n128", "ctx16k", "ctx32k"], default="n16")
     parser.add_argument("--num-requests", type=int, default=None)
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument(

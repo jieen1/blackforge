@@ -192,6 +192,35 @@ W1_S_FIXTURE_N128 = PromptFixture(
     prompt_len=4096,
 )
 
+# 2026-07-18, Phase D1 (shape-generalization sweep, per the session-review
+# doc's own falsifier): the review flagged that context length was only
+# ever measured at 4096 (W1-S), and that the true W2-scale 32768-context
+# fixture is explicitly "not built" (see W2_S's docstring above). These two
+# fixtures are a SAME-FORMULA, SAME-SEED, SAME-num_requests=16 extension of
+# W1_S_FIXTURE to prompt_len=16384/32768 -- built ONLY to give Phase D1 a
+# comparable frozen input at longer context. They are explicitly NOT the
+# official W2/W2-S fixture (no representative -R traffic, no real
+# programming-agent replay) -- just this task's own constructed synthetic
+# fixture, labeled as such so it is never mistaken for W2_S or a
+# `项目实施规划.md`-blessed benchmark.
+D1_CTX16K_FIXTURE = PromptFixture(
+    path="d1_ctx16k_prompts.json",
+    tokenizer="unsloth/Qwen3.6-27B-NVFP4",
+    generation_formula=_W1_S_FORMULA,
+    seed=12345,
+    num_requests=16,
+    prompt_len=16384,
+)
+
+D1_CTX32K_FIXTURE = PromptFixture(
+    path="d1_ctx32k_prompts.json",
+    tokenizer="unsloth/Qwen3.6-27B-NVFP4",
+    generation_formula=_W1_S_FORMULA,
+    seed=12345,
+    num_requests=16,
+    prompt_len=32768,
+)
+
 
 def main() -> None:
     print(json.dumps({name: asdict(workload) for name, workload in WORKLOADS.items()}, indent=2))

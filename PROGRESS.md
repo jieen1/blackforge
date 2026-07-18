@@ -4,6 +4,33 @@ Updated: 2026-07-18
 
 ## Completed
 
+### Phase D1, shape-generalization sweep (2026-07-18) — c=1 is NOT the weak spot; a worse one found at 16K/c=4
+
+Independent review's falsifier for the ~1.014x "parity" headline
+(section 8/D1 of `notes/2026-07-18-session-review-and-next-steps.md`)
+was executed: re-measured the gap to native across concurrency
+c in {1,2,4} x context in {4K,16K,32K spot-check}, single rep per cell.
+**The review's specific prediction (c=1 re-widens the gap) is refuted**
+-- c=1/c=2 are where this runtime is *furthest ahead* of native (up to
+1.45x faster), not behind. **A different, more serious weak spot was
+found instead**: concurrent (c=4) batched prefill at 16K context is
+**4.85x slower than native** and peaks at **99.2% of GPU memory**
+(97110/97887 MiB) -- worse than the D3 near-OOM incident this same doc
+already flagged as urgent, and squarely inside this project's own
+target shape space (4K/16K/32K x c=1-4). Source-grounded hypothesis:
+`mtp_prefill_batch` issues one non-chunked forward over the full
+concurrency x context product with no chunking, unlike native's
+`--enable-chunked-prefill`. Full grid, methodology, and the "what was
+skipped and why" accounting: section 12 of
+`notes/2026-07-18-session-review-and-next-steps.md`. Two new,
+clearly-labeled constructed fixtures added for this sweep
+(`benchmarks/fixtures/d1_ctx16k_prompts.json`/`d1_ctx32k_prompts.json`,
+NOT the official W2/W2-S line) plus a `--num-requests` slicing flag
+added to `w1s_native_bench.py` to bound cost at long context. No
+production code (`direct_model_runner.py`) touched this round -- this
+was a measurement task; profiling/fixing the prefill chunking gap is
+the recommended next step, not attempted here.
+
 ### Phase 3, strategy reset (2026-07-16, fifth pass) — freeze kernel bisection, rebuild top-down
 
 After four debugging passes each surfaced a real, specific, low-level
