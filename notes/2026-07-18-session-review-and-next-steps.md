@@ -889,6 +889,165 @@ grad-disable around the real floating-point model forward calls, found
 by actually tracing the data rather than accepting the review's
 suspects at face value, per this project's own standing discipline.
 
+---
+
+## 15. The skipped D1 cell measured: 32K/c=4 (executed 2026-07-18)
+
+**Task scope: measurement only, per explicit instruction -- no production
+code touched.** Section 12.5 deliberately skipped this exact cell
+("32K/c=4 for this runtime: skipped deliberately... given 16K/c=4 already
+peaked at 99.2% of GPU memory... this was a judgment call to not push
+through recklessly"). That was before the D3 memory-leak fix (§11) and
+the D1 vocab-logits fix (§13) landed, both of which independently lower
+memory pressure at this shape; native's own 32K/c=4 number (32.941 accepted
+tok/s, 94338/97887 MiB = 96.4%) was already known from §12's sweep. This
+section fills in the missing cell with today's HEAD (which already
+includes the grad-disable fix, the vocab-logits fix, and the cudagraph
+correction from §14).
+
+### 15.1 Fixture and command
+
+Confirmed `benchmarks/fixtures/d1_ctx32k_prompts.json` exists (3.8 MiB) and
+matches `D1_CTX32K_FIXTURE` in `benchmarks/workloads.py:215-222` exactly:
+16 prompts, each verified to be exactly 32768 tokens
+(`prompt_token_ids[i]` length checked directly, not assumed from the
+JSON's own `prompt_len` field), same tokenizer/formula/seed as
+`D1_CTX16K_FIXTURE`.
+
+Command, following the same pattern §12/§13/§14 used for `ctx16k` (the
+`--fixture` choices are wired in `mtp_w1s_our_runtime_perf.py:386`,
+confirmed by reading the script directly rather than guessing):
+
+```
+python -m benchmarks.mtp_w1s_our_runtime_perf --batched --cudagraph \
+  --fixture ctx32k --concurrency 4 --num-requests 4 --max-tokens 256
+```
+
+`--num-requests 4` was chosen to exactly match concurrency (one batch, no
+repeats), mirroring native's own 32K/c=4 bounding choice from §12.1 ("4 at
+32K, vs. the full 16 at 4K") and minimizing exposure given this cell's
+known history of memory risk. Single rep, matching this project's
+established D1-sweep convention (single rep, not the 3-rep protocol used
+for the 4K/c=4 headline). `CUDA_HOME`/`PATH` pinned to the 13.3 toolkit;
+GPU/process idleness verified via `nvidia-smi`/`pgrep` immediately before
+starting (2450 MiB baseline, 0% util, no matching processes) and
+immediately after finishing (1995 MiB, 0% util, no stray processes).
+
+### 15.2 Memory monitoring methodology
+
+A background loop sampled `nvidia-smi --query-gpu=memory.used,memory.total
+--format=csv,noheader` every 5 seconds, started before the benchmark
+process and stopped after it exited, logging every sample (not just
+before/after) to catch the actual peak. Full log (31 samples spanning the
+whole run, timestamps are unix seconds):
+
+```
+...(idle 2450-2544 MiB)...
+t+20s   24378-24381 MiB   (model weights loading)
+t+81s   28866 MiB         (weights loaded, runner init)
+t+94s   46492 MiB         (transitioning into prefill)
+t+99s   82768 MiB         (prefill/decode running)
+t+99..126s  82768-82776 MiB, stable plateau for ~30s
+t+131s  back to 2113 MiB  (process exited)
+```
+
+**Peak observed: 82776 MiB / 97887 MiB = 84.6% of capacity.** This is
+comfortably below any near-OOM concern (well short of the 90%+ threshold
+this task flagged for extra caution, and far below the 99.2%/99.3% peaks
+this project hit before the D3/D1 fixes landed). The plateau held steady
+for ~30 seconds across the whole prefill+decode body of the run (not a
+single 5-second spike that 5s-granularity sampling might have missed),
+giving good confidence this is a faithful peak, not an undersampled
+transient. No safety action (no `--num-requests` reduction, no abort) was
+needed -- the run completed cleanly on the first attempt.
+
+### 15.3 Result
+
+```json
+{
+  "num_requests": 4, "max_tokens": 256, "concurrency": 4, "k": 3,
+  "batched": true, "cudagraph": true,
+  "wall_s_e2e": 34.889,
+  "num_drafts": 344, "num_draft_tokens": 1032, "num_accepted_tokens": 686,
+  "draft_acceptance_rate_pct": 66.473,
+  "total_committed_tokens": 1030,
+  "accepted_tokens_per_sec": 29.522,
+  "ttft_mean_ms": 29051.7,
+  "gpu_busy_pct": 90.831
+}
+```
+
+**Measured: 29.522 accepted tok/s.**
+
+### 15.4 The gap, and a genuinely surprising trend reversal
+
+Gap = native / ours = 32.941 / 29.522 = **1.116x** (native ~11.6% faster).
+
+**This is UNDER this project's own 1.3x flag threshold** -- unlike 16K/c=4
+(2.080x, flagged), 32K/c=4 does **not** flag. Put plainly: the gap got
+*better*, not worse, going from 16K to 32K -- the opposite of what a
+naive "residual near-linear-scaling compute cost, extrapolated further"
+reading of §14 would predict.
+
+The mechanism, checked directly from the two known numbers at each
+context length (not re-profiled this round -- a re-profile is the natural
+next step if this is ever chased further, explicitly not attempted here
+per this task's measurement-only scope):
+
+| | 16K -> 32K ratio (2x context) |
+|---|---:|
+| **ours** (58.638 -> 29.522 tok/s) | **1.986x** slower -- almost exactly linear |
+| **native** (121.960 -> 32.941 tok/s) | **3.702x** slower -- far worse than linear |
+
+**This CONFIRMS the §14 near-linear-scaling finding for our own runtime's
+compute** -- 1.986x for a 2x context increase is about as clean a
+near-linear-scaling confirmation as this project has measured anywhere.
+What it does **not** confirm is any assumption that the gap-to-native
+would stay flat or widen: native's own throughput degrades
+*super*-linearly over this same doubling (3.702x, i.e. worse than
+doubling attention's O(L^2) share would alone predict for a system where
+FFN cost -- which scales linearly -- still made up the majority of cost at
+16K). Because native's curve falls faster than ours, the ratio between
+them shrinks as context grows, even though our own absolute throughput is
+also dropping. This is a real, source-unconfirmed (i.e., not re-profiled
+this round) but numerically clean observation, precisely the kind of
+"worth a quick note, not a new investigation" finding this task's
+instructions anticipated.
+
+**Worth flagging for a future task** (not investigated further here, no
+code touched, no new hypothesis tested): if this trend continues, there
+may exist a context length beyond which this runtime's near-linear-scaling
+compute cost curve actually crosses native's super-linear one, i.e. a
+context length at which this runtime is *faster* than native rather than
+merely closer to it. A 48K or 64K spot-check (native + ours, single
+request/single batch to bound cost, same safety discipline as this
+section) would confirm or refute this directly -- flagged as a natural,
+cheap follow-up, not attempted this round.
+
+### 15.5 Safety summary
+
+No safety concerns materialized. Peak memory (84.6%) was well under any
+threshold requiring `--num-requests` reduction or an abort; the single
+planned run (`--num-requests 4`, one batch) completed on the first
+attempt. GPU/process state confirmed idle before and after via direct
+`nvidia-smi`/`pgrep` checks, not assumed.
+
+### 15.6 Bottom line
+
+| Context | Concurrency | Native tok/s | Ours tok/s | Gap (native/ours) | Flag |
+|---|---:|---:|---:|---:|---|
+| 16K | 4 | 121.960 | 58.638 | 2.080 | **>1.3x -- FLAG** |
+| 32K | 4 | 32.941 | **29.522** | **1.116** | under 1.3x -- no flag |
+
+The previously-skipped 32K/c=4 cell is now measured: **29.522 accepted
+tok/s**, a **1.116x gap** to native (not flagged), peak memory **84.6%**
+(safe, no near-OOM). The near-linear-scaling story from §14 holds for our
+own runtime's compute (confirmed cleanly, 1.986x for 2x context); it does
+**not**, however, mean the gap-to-native worsens proportionally --
+empirically the opposite happened here, because native's own scaling
+degrades faster than ours over this range. No new code was written or
+changed this round; this is a pure measurement addition to the D1 sweep.
+
 ### 11.4 The fix
 
 One line, added as early as possible in `DirectModelRunner.__init__`

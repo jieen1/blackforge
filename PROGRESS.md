@@ -4,6 +4,28 @@ Updated: 2026-07-18
 
 ## Completed
 
+### Phase D1, missing cell measured: 32K/c=4 (2026-07-18) — gap NARROWS to 1.116x, no flag, near-linear-scaling trend confirmed
+
+Section 12.5 of `notes/2026-07-18-session-review-and-next-steps.md` had
+deliberately skipped this cell for safety (16K/c=4 was at 99.2% memory at
+the time). With the D3 grad-disable fix and the D1 vocab-logits fix both
+now landed, this cell was safe to measure: **29.522 accepted tok/s**
+(`--batched --cudagraph --fixture ctx32k --concurrency 4 --num-requests 4
+--max-tokens 256`, single rep), peak memory **82776/97887 MiB (84.6%)**
+sampled every 5s throughout the run (no near-OOM concern, no
+`--num-requests` reduction needed). Gap vs. native's known 32.941 tok/s:
+**1.116x — under this project's own 1.3x flag threshold**, unlike 16K/c=4
+(2.080x, flagged). Notably the gap *narrowed* going from 16K to 32K: our
+own throughput scaled almost exactly linearly with context (1.986x for a
+2x context increase, cleanly confirming §14's near-linear-scaling
+finding), while native's own throughput degraded *super*-linearly over
+the same range (3.702x) — so the ratio between them shrank even as both
+absolute numbers dropped. Flagged (not investigated) as a natural cheap
+follow-up: a 48K/64K spot-check to see if this runtime eventually
+overtakes native at long enough context. No production code touched —
+pure measurement. Full writeup: notes/2026-07-18-session-review-and-next-
+steps.md section 15.
+
 ### Phase D1 second follow-up, residual ~2.63x 16K/c=4 gap root-caused (2026-07-18) — no code bug, an asymmetric benchmark config (missing `--cudagraph`)
 
 The prior D1-followup entry below narrowed 16K/c=4 from 4.85x to 2.63x
