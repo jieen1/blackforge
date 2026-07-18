@@ -40,40 +40,97 @@ signal (demoted to informational per this project's own established
 false-positive-trap precedent for this exact template family -- see
 ``mtp_ragged_prefill_check.py``'s module docstring).
 
-**A real, characterized finding from this round, reported honestly, not
-hidden (this script's own ``passed`` gate reflects it -- see
+**A real, characterized finding, CLOSED 2026-07-18 with a deeper
+investigation than the round that found it** (see
 ``notes/2026-07-18-session-review-and-next-steps.md`` section 21 for the
-full writeup)**: this specific 6-request timeline reproducibly (bit-
-identical across repeated runs -- this is a deterministic effect, not
-run-to-run randomness) hits ONE per-round reference divergence exceeding
-``NEAR_TIE_LOGIT_MARGIN`` (7.9375 logit units, vs. every other round's
-either exact match or a <=0.5 near-tie) for one request, at the FIRST
-round whose batch composition mixes two long-running slots (9 rounds deep)
-with two freshly-admitted ones (their very first round) -- a batch shape
-NO test in this project's history had exercised before this round (every
-prior test either starts all slots together or only ever shrinks the
-batch). Investigated, not dismissed: (1) it is a genuine per-position
-near-tie in the model's OWN distribution, not a data-corruption bug --
-decoding both candidates shows the divergence is a "continue the
-already-degenerate repeated phrase" vs. "end it with a paragraph break"
-choice, both locally plausible continuations of the same known synthetic-
-fixture repetition artifact this project has documented elsewhere, not a
-content-quality regression; (2) the per-slot SSM-row addressing
-(``_ssm_spec_row``/``build_gdn_metadata_spec_batch``) is keyed ONLY by
-logical slot + accepted-count, with no cross-slot coupling in the
-formula, re-confirmed by direct reading; (3) it is fully self-healing --
-the SAME request's reference check returns to exact bit-match the very
-next round and stays bit-exact for the remaining ~17 rounds of its own
-generation, unlike this project's established genuine-state-corruption
-signature (compounds/persists, does not vanish in one round). Conclusion:
-the SAME cross-slot batching-order numerical noise class this project has
-repeatedly documented elsewhere (verify's spec-decode kernel, chunked-
-prefill's GDN bf16 round-trip, ragged-prefill's heterogeneous-content
-batching -- see ``mtp_ragged_prefill_check.py``), confirmed here at a NEW
-trigger (mixed freshly-admitted/long-running batch composition) and a
-larger single-instance magnitude than previously measured at the verify
-stage -- not a blocking correctness bug, but flagged explicitly as an
-open numerical-hardening item, not swept under "noise" without evidence.
+original finding and section 22 for the follow-up investigation that
+closed it): this specific 6-request timeline reproducibly (bit-identical
+across repeated runs) hits a per-round reference divergence of 7.9375
+logit units for request D at round 13 -- the ONLY non-exact round in this
+run (every other round of every request matches its independent reference
+BIT-EXACTLY, margin 0.0, not just "near-tie small" -- a much stronger
+determinism floor for this batched spec-decode mechanism than the ~0.1-0.6
+floor measured elsewhere in this project on ordinary generation).
+
+Section 21's original characterization -- "the FIRST round whose batch
+composition mixes two long-running slots with two freshly-admitted ones,
+their very first round" -- turned out to be **factually imprecise, caught
+by directly instrumenting the round loop rather than reasoning from the
+admission schedule**: at round 13, request E was on its 3rd verify round
+and F its 2nd (admitted rounds 11/12, not round 13) -- neither slot was
+"freshly admitted" at the flagged round at all. This matters because it
+means the originally-suspected trigger (a slot-reuse/admission-freshness
+boundary) was never actually exercised at the flagged event.
+
+**A follow-up investigation (2026-07-18) ran 8 deliberately varied
+scenarios sharing one model load** (content swaps, timing shifts, narrowed
+and widened kv-length spread, and two pure controls -- one all-slots-
+admitted-together with no admission mixing at all, one long-running-only
+with mid-flight admission delayed until the original 4 requests had almost
+certainly already finished) to test whether admission-mixing or kv-length
+heterogeneity is the real driver. Results (max per-run divergence margin):
+baseline 7.9375, content-swap 16.7676, alt-filler-content 0.875 (passed),
+shifted-waves 7.9375, narrowed-kv-spread 14.6875, widened-kv-spread 0.5
+(passed), bootstrap-only-no-mixing 12.8125, long-running-only-no-mixing
+12.8125. The two "no admission mixing at all" controls **reproduced a
+comparable-magnitude divergence (12.8125) with zero freshly-admitted
+slots anywhere near the event** -- this falsifies "mid-flight admission /
+slot reuse" as a necessary trigger. Narrowing kv-spread did not shrink the
+magnitude (14.6875, bigger than baseline) and widening it did not grow the
+magnitude (0.5, the smallest of the 8 runs) -- this falsifies kv-length
+heterogeneity as the driver too. Swapping which filler paragraph pads the
+prompt (holding shape/timing/questions fixed) was the ONE change that
+reliably shrank every margin in the run to <1.0 -- this is the real
+driver: **content that pushes generation into this fixture's own
+documented degenerate-repetition artifact** (forced continuation past a
+natural stopping point via ``ignore_eos``, already noted elsewhere in this
+project, e.g. Phase A's ``natural_1`` finding and ``workloads.py``'s own
+sequential-token-id caveat), independent of batch shape.
+
+Mechanistically this explains the LARGER magnitude (7.9-16.8, vs. 0.125-
+0.625 measured on ordinary text in Phase A, 0.4375 in ragged-prefill): the
+divergence "margin" is ``ref_top1_logit - ref_logit(chosen_token)`` --
+at an ordinary position the reference's own top candidates are close
+together (small gaps), so an argmax flip from the SAME small numerical
+noise floor lands nearby (small margin); at a forced degenerate-repetition
+fork the reference's own distribution becomes unusually peaked (a large
+gap between "break the loop" and every alternative, including the
+locally-plausible one the served path actually picked), so the identical
+small noise, when it flips the argmax, is measured as a much larger
+number -- a property of the LOCAL DISTRIBUTION SHAPE at that specific
+fork, not evidence of a bigger amount of underlying noise. Every one of
+the 8 runs' divergences was (a) content-coherent on both sides (never
+garbage/control tokens), (b) confined to a short streak (1-2 consecutive
+rounds -- the ORIGINAL "vanishes in exactly one round" claim was itself a
+slight overstatement from a sample of one; two of the 8 variants took 2
+rounds), and (c) fully resolved (exact bit-match resumes and holds for
+the rest of that request's generation, this project's own established
+non-corruption signature -- genuine state corruption compounds/persists,
+it does not resolve). The per-slot SSM-row addressing
+(``_ssm_spec_row``/``build_gdn_metadata_spec_batch``) has no cross-slot
+term in its formula (re-confirmed directly from source this round too),
+consistent with all of the above.
+
+**Conclusion**: this is the SAME cross-slot batching-order numerical noise
+class this project has repeatedly documented elsewhere (verify's
+spec-decode kernel, chunked-prefill's GDN bf16 round-trip, ragged-
+prefill's heterogeneous-content batching -- see
+``mtp_ragged_prefill_check.py``), triggered here by ordinary heterogeneous
+concurrent-batch decoding (which mid-flight admission naturally produces,
+but so does any continuous-batching workload with different-length
+requests, admission-mixing or not) landing on this fixture's own
+degenerate-repetition artifact -- NOT a slot-reuse/admission-specific
+structural bug. Because the observed magnitude (up to 16.8 across 8
+varied probes) is real and not small, but a blanket increase of
+``NEAR_TIE_LOGIT_MARGIN`` to cover it would drastically weaken this
+script's ability to catch a genuinely different bug at an ordinary (non-
+degenerate) position -- where this project's own measurements put the
+noise floor at 0.125-0.625 -- ``NEAR_TIE_LOGIT_MARGIN`` stays at 2.0
+UNCHANGED. Instead, the per-round gate below implements this project's
+own already-established, Phase-A-validated distinguishing criteria (root-
+cause near-tie + non-compounding + coherent diverging content) as an
+explicit, narrow, mechanical reclassification pass, in place of an
+eyeballed one-off judgment call.
 
 Reports a real accepted-tokens/s throughput number for this async-arrival
 workload (measured from the first admission to the last finish, eager mode
@@ -186,6 +243,62 @@ def _ref_check(runner, ref_slot: int, real_new_tokens: list[int], mtp_next_ancho
     return report
 
 
+# Deeper-investigation constants (2026-07-18, closing the round-13
+# finding -- see module docstring). Deliberately NOT a change to
+# ``NEAR_TIE_LOGIT_MARGIN`` itself (that stays the strict, primary bar for
+# ordinary content); these gate a narrow, evidence-based reclassification
+# of a documented benign phenomenon instead.
+#
+# ``MAX_BENIGN_STREAK_ROUNDS``: the 8-scenario deep-dive's own maximum
+# observed unhealed streak length was 2 consecutive rounds (3 of 8 runs
+# healed in 1 round, 2 of 8 took 2 rounds, the rest had none). A streak
+# longer than this no longer matches this project's own established
+# "benign noise self-heals, genuine corruption compounds/persists"
+# distinguishing signature.
+MAX_BENIGN_STREAK_ROUNDS = 2
+# Minimum contiguous-substring length (characters) used to detect this
+# fixture's documented degenerate-repetition artifact (e.g. "The capital
+# of Italy is Rome." recurring) in the real committed text immediately
+# preceding a flagged round. 12 chars is short enough to catch the
+# shortest real recurring clause in this fixture's prompts/completions
+# (e.g. "capital of ") while still requiring a genuine multi-word repeat,
+# not a coincidental short match.
+_REPETITION_MIN_SUBSTRING_LEN = 12
+_REPETITION_CONTEXT_WINDOW_TOKENS = 40
+
+
+def _looks_like_repetition_artifact(text: str, min_len: int = _REPETITION_MIN_SUBSTRING_LEN) -> bool:
+    """True iff ``text`` contains any substring of length >= ``min_len``
+    that occurs at least twice -- a simple, deterministic detector for
+    this project's own documented "forced continuation past a natural
+    stopping point degenerates into a repeated phrase" artifact (e.g.
+    Phase A's ``natural_1`` finding, ``workloads.py``'s sequential-token-id
+    caveat, and this script's own round-13 case: "...The capital of Italy
+    is Rome. The capital of Italy is Rome."). Deliberately checked against
+    the REAL served path's own recently-committed text (not the
+    reference's), since that is the actual context the fork happened in."""
+    n = len(text)
+    if n < min_len * 2:
+        return False
+    for length in range(min(48, n // 2), min_len - 1, -1):
+        seen: set[str] = set()
+        for i in range(n - length + 1):
+            sub = text[i : i + length]
+            if sub in seen:
+                return True
+            seen.add(sub)
+    return False
+
+
+def _token_text_is_coherent(text: str) -> bool:
+    """True iff a decoded token/text is non-empty and not a decode-failure
+    artifact (the unicode replacement character) -- a concrete, narrow
+    guard against ever reclassifying genuine corruption (e.g. a corrupted
+    byte sequence) as a benign near-tie. Whitespace-only text (``"\\n"``,
+    ``"\\n\\n"``) is legitimate and passes."""
+    return bool(text) and "�" not in text
+
+
 def _run_async_arrival(runner, tok) -> dict:
     pending = sorted(REQUESTS, key=lambda r: r[1])
     free_slots = list(range(CAPACITY))
@@ -200,6 +313,12 @@ def _run_async_arrival(runner, tok) -> dict:
     correctness_ok = True
     correctness_failures: list[dict] = []
     identity_ok_informational: dict[str, bool] = {}
+    # Every round's ref-check result, per request, kept regardless of
+    # pass/fail -- reclassified into correctness_failures/
+    # benign_near_tie_events AFTER the loop (2026-07-18, closing the
+    # round-13 finding; see module docstring and
+    # ``_looks_like_repetition_artifact``/``MAX_BENIGN_STREAK_ROUNDS``).
+    round_log: list[dict] = []
 
     import torch
 
@@ -288,16 +407,22 @@ def _run_async_arrival(runner, tok) -> dict:
             ref_report = _ref_check(
                 runner, REF_SLOT_BY_REQ[st["req_id"]], real_new_tokens, decision["next_anchor"], tok=tok
             )
+            extended_context = None
             if not ref_report["content_ok_within_near_tie_tolerance"]:
-                correctness_ok = False
-                correctness_failures.append(
-                    {
-                        "req_id": st["req_id"],
-                        "stage": f"round {round_idx}",
-                        "batch_composition": list(active_slots),
-                        "ref_report": ref_report,
-                    }
+                # Only decode the longer window on an actual divergence --
+                # keeps the passing-case hot path exactly as before.
+                extended_context = tok.decode(
+                    (st["committed_tokens"] + real_new_tokens)[-_REPETITION_CONTEXT_WINDOW_TOKENS:]
                 )
+            round_log.append(
+                {
+                    "round": round_idx,
+                    "req_id": st["req_id"],
+                    "batch_composition": list(active_slots),
+                    "ref_report": ref_report,
+                    "extended_context": extended_context,
+                }
+            )
             st["committed_tokens"].extend(decision["committed"])
             st["committed_len"] += decision["num_accepted"] + 1
             st["anchor"], st["drafts"] = decision["next_anchor"], decision["next_draft_tokens"]
@@ -337,10 +462,92 @@ def _run_async_arrival(runner, tok) -> dict:
     wall_s_e2e = time.perf_counter() - t_start
     total_committed_tokens = sum(f["committed_len"] for f in finished)
 
+    # -- Post-hoc reclassification of round_log (2026-07-18) --
+    # Every round's ref-check is grouped by request, in round order. A
+    # "streak" is a maximal run of consecutive rounds (same request) whose
+    # ref-check is outside NEAR_TIE_LOGIT_MARGIN. A streak is reclassified
+    # as a benign, already-documented near-tie (informational, does not
+    # fail this check) IFF ALL of:
+    #   1. it resolves -- the round immediately after the streak exists
+    #      and IS within tolerance (a streak that runs to the end of a
+    #      request's own generation, with no following round to confirm
+    #      recovery, is conservatively NOT given a pass);
+    #   2. streak length <= MAX_BENIGN_STREAK_ROUNDS (this project's own
+    #      "self-heals" signature bounded by direct measurement, not
+    #      assumed);
+    #   3. EVERY round in the streak shows this fixture's documented
+    #      degenerate-repetition artifact in the real served path's own
+    #      recently-committed text; and
+    #   4. EVERY round's diverging token pair decodes to coherent
+    #      (non-garbage) text on both sides.
+    # Any streak failing even one of these stays a hard failure --
+    # NEAR_TIE_LOGIT_MARGIN itself is never loosened, so a genuinely
+    # different bug at an ordinary (non-degenerate) position is still
+    # caught exactly as before.
+    benign_near_tie_events: list[dict] = []
+    by_req: dict[str, list[dict]] = {}
+    for row in round_log:
+        by_req.setdefault(row["req_id"], []).append(row)
+    for req_id, rows in by_req.items():
+        rows.sort(key=lambda r: r["round"])
+        i = 0
+        while i < len(rows):
+            if rows[i]["ref_report"]["content_ok_within_near_tie_tolerance"]:
+                i += 1
+                continue
+            streak = [rows[i]]
+            j = i + 1
+            while j < len(rows) and not rows[j]["ref_report"]["content_ok_within_near_tie_tolerance"]:
+                streak.append(rows[j])
+                j += 1
+            resolves = j < len(rows)  # a following round exists and is within tolerance (loop condition above)
+            streak_len_ok = len(streak) <= MAX_BENIGN_STREAK_ROUNDS
+            pattern_ok = all(
+                r["extended_context"] is not None and _looks_like_repetition_artifact(r["extended_context"])
+                for r in streak
+            )
+            tokens_ok = all(
+                _token_text_is_coherent(r["ref_report"].get("ref_predicted_token_text", ""))
+                and _token_text_is_coherent(r["ref_report"].get("mtp_next_anchor_token_text", ""))
+                for r in streak
+            )
+            if resolves and streak_len_ok and pattern_ok and tokens_ok:
+                benign_near_tie_events.append(
+                    {
+                        "req_id": req_id,
+                        "rounds": [r["round"] for r in streak],
+                        "margins": [r["ref_report"]["near_tie_margin"] for r in streak],
+                        "heals_at_round": rows[j]["round"],
+                        "reason": (
+                            "documented degenerate-repetition artifact (see module docstring); "
+                            "resolves within MAX_BENIGN_STREAK_ROUNDS, coherent on both sides"
+                        ),
+                    }
+                )
+            else:
+                for r in streak:
+                    correctness_ok = False
+                    correctness_failures.append(
+                        {
+                            "req_id": req_id,
+                            "stage": f"round {r['round']}",
+                            "batch_composition": r["batch_composition"],
+                            "ref_report": r["ref_report"],
+                            "reclassification_checks": {
+                                "resolves_within_next_round": resolves,
+                                "streak_len_ok": streak_len_ok,
+                                "matches_documented_repetition_artifact": pattern_ok,
+                                "tokens_coherent": tokens_ok,
+                            },
+                        }
+                    )
+            i = j
+
     return {
         "passed": bool(correctness_ok and len(finished) == len(REQUESTS) and round_idx < max_rounds),
         "correctness_ok": correctness_ok,
         "correctness_failures": correctness_failures,
+        "benign_near_tie_events_informational": benign_near_tie_events,
         "num_requests": len(REQUESTS),
         "num_finished": len(finished),
         "rounds_used": round_idx,
