@@ -535,3 +535,242 @@ specific *validations* open, and Phase A is the one that matters.
   "shape-specific" caveat downgrades to a non-issue and parity is general.
 - If either comes back the other way, the corresponding phase's falsifier
   fires and that work becomes load-bearing, not optional.
+
+---
+
+## 10. Phase A results: end-to-end generation-quality validation (executed 2026-07-18)
+
+**Verdict: PASS.** The Phase 2 spec-decode path's generated token sequences
+track the trusted reference within documented near-tie noise, and every
+diverging continuation (on both sides) remains fluent, on-topic text --
+no garbage, no repetition, no degeneration. This closes the §4/§8 Phase A
+gap: the 136.750-137.784 accepted tok/s headline is now backed by an actual
+token-sequence comparison, not just cosine similarity / signal-probe /
+acceptance-rate parity.
+
+### 10.1 Methodology
+
+**Reference chosen: native vLLM's own real engine, in-process, WITHOUT
+speculative decoding** (plain autoregressive greedy target-only decode) --
+this is the *strongest* option the review named, made tractable by using
+`vllm.LLM(...)` directly (same pattern `runtime/vllm_inprocess_baseline.py`
+already established: never had an HTTP layer to begin with; still a real
+`Scheduler`/`GPUModelRunner`/KV-cache-manager engine reached via a spawned
+`EngineCore` process over ZMQ, not a network call). No MTP/spec-decode
+config at all on the reference side -- deliberately: speculative decoding
+with greedy verification is *supposed* to be lossless against plain greedy
+decoding, so plain greedy is the least-assumption ground truth spec-decode
+(native's or ours) is meant to reproduce, rather than introducing a second
+spec-decode mechanism as an extra variable in the oracle itself.
+
+`attention_backend=CUSTOM` (this project's own `SM120GQABackend`, already
+independently validated in the sibling `sm120-flash-attention` project)
+and `kv_cache_dtype=fp8_e4m3` were used on **both** sides, deliberately --
+this keeps the attention *kernel* identical, so any divergence found is
+attributable to the thing actually in question (this runtime's own Phase 2
+GDN state-commit mechanism and orchestration), not a different attention
+implementation. `unsloth/Qwen3.6-27B-NVFP4`, `enforce_eager=True`,
+`language_model_only=True`, `max_model_len=8192` on both sides.
+
+**"Ours" = the real, unmodified Phase 2 mechanism**, verified faithful
+(not a re-implementation): the capture script inlines `mtp_prefill_batch`'s
+and `mtp_verify_and_commit_batch`'s bodies (calling the exact same
+underlying methods -- `_forward_batch`, `verify_batch_spec`,
+`determine_accept_reject_batch`, `_mtp_sync_and_propose_batch` -- in the
+same order with the same arguments) *only* so intermediate logit tensors
+could be retained for margin reporting, since neither public wrapper
+returns raw logits. **This was independently verified, not assumed**: a
+dedicated self-check (`verify_inlining_faithful.py`) re-ran two prompts
+(`natural_0`, `w1s_2`) through the real, completely unmodified
+`mtp_prefill_batch` + `mtp_verify_and_commit_batch` and confirmed the
+committed token stream is **bit-identical** to the inlined driver's output
+for both (`ALL_MATCH=True`). `enable_cudagraph=False` throughout (the
+eager path -- already established in §3.4 as byte-for-byte the same
+mechanism the CUDA-graph-enabled path falls back to).
+
+**Prompt set (8 total, greedy/temp=0, `ignore_eos=True`, 260 tokens
+generated, first 256 compared):**
+- 3 of the 16 frozen W1-S fixture prompts (`benchmarks/workloads.py`'s
+  `W1_S_FIXTURE`, sequential-ascending-token-id synthetic, 4096 tokens
+  each) -- `w1s_0`, `w1s_1`, `w1s_2`.
+- 5 natural-language/code prompts written for this task (real text, not
+  the synthetic fixture's atypically-predictable input): a quicksort
+  explanation, a palindrome-checker completion, a Flask 500-error
+  diagnosis, a Fibonacci function completion, and a SQL-injection review.
+
+Both capture scripts loaded prompt token ids from ONE frozen, pre-tokenized
+JSON (`build_prompts.py`, run once) -- eliminating any chance of a
+tokenization discrepancy being a confound. GPU/process hygiene: confirmed
+idle (baseline ~1.5-1.6 GB, 0% util, no stray processes) before the run and
+after each of the three GPU-heavy scripts (ours capture, reference capture,
+inlining self-check), verified via `pgrep`/`ps`/`nvidia-smi` directly, not
+assumed from a background-task notification alone. Ran strictly
+sequentially, never concurrently (peak observed 87 GB during the reference
+capture's model load/warmup -- well short of the review's flagged 97.3 GB
+near-OOM figure, because this test's config -- `num_slots=2`,
+`max_model_len=8192`, no CUDA-graph slot doubling -- is much smaller than
+the production `c=4`/`cudagraph`/`max_model_len=40960` benchmark config).
+
+### 10.2 Per-prompt agreement
+
+| prompt | kind | prompt_len | exact matches / compared | match rate | longest common prefix |
+|---|---|---:|---:|---:|---:|
+| w1s_0 | synthetic W1-S | 4096 | 256/256 | 100.0% | 256 |
+| w1s_1 | synthetic W1-S | 4096 | 256/256 | 100.0% | 256 |
+| w1s_2 | synthetic W1-S | 4096 | 5/256 | 2.0% | 5 |
+| natural_0 | natural (code-explain) | 107 | 16/256 | 6.2% | 14 |
+| natural_1 | natural (code-complete) | 37 | 66/256 | 25.8% | 64 |
+| natural_2 | natural (bug diagnosis) | 41 | 78/256 | 30.5% | 76 |
+| natural_3 | natural (code-complete) | 25 | 208/256 | 81.2% | 208 |
+| natural_4 | natural (security review) | 38 | 6/256 | 2.3% | 5 |
+| **overall** | | | **891/2048** | **43.5%** | -- |
+
+**The raw overall match-rate (43.5%) is NOT the right headline number and
+would be misleading read in isolation** -- see §10.4 for why. The real
+diagnostic is §10.3: every one of the 6 divergence *events* (not the raw
+per-position mismatch count) traces to a documented-class near-tie.
+
+### 10.3 Root-cause divergence analysis (the actual gate check)
+
+2 of 8 prompts (`w1s_0`, `w1s_1`) reproduce native's greedy output
+**bit-exactly for the full 256 compared tokens** -- zero divergence.
+
+The other 6 prompts each diverge from the reference at exactly one root
+position (after which, by construction, the two paths are conditioned on
+different prefixes and legitimately generate different-but-still-valid
+continuations -- see §10.4). For every one of these 6 root divergences,
+the margin was computed exactly matching this project's own established
+convention (`benchmarks/mtp_multiround_check.py`'s
+`near_tie_margin = ref_top1_logit - ref_logit_for_mtp_choice`; logprob
+differences equal raw logit differences exactly since log-softmax
+preserves differences, so vLLM's returned logprobs are used directly as
+logit margins) against `NEAR_TIE_LOGIT_MARGIN = 2.0` (the value actually
+in the code, confirmed by grep across `benchmarks/mtp_multiround_check.py`,
+`mtp_batch_verify_check.py`, `mtp_ragged_recompute_verify_check.py`,
+`mtp_verify_cudagraph_check.py` -- all define it identically):
+
+| prompt | pos | ours token | ref token | ref top-1 | margin (ref top1 − ref logprob(ours' token)) | ours' own top-2 margin |
+|---|---:|---|---|---|---:|---:|
+| w1s_2 | 5 | `271` (`"\n\n"`) | `198` (`"\n"`) | `198` | **0.125** | 0.75 |
+| natural_0 | 14 | `15771` (`"Under"`) | `2014` (`"An"`) | `2014` | **0.500** | 2.875 |
+| natural_1 | 64 | `10121` (`" usage"`) | `198` (`"\n"`) | `198` | **0.375** | 0.25 |
+| natural_2 | 76 | `1510` (`" \`"`) | `2407` (`" body"`) | `2407` | **0.375** | 0.25 |
+| natural_3 | 208 | `198` (`"\n"`) | `271` (`"\n\n"`) | `271` | **0.125** | 0.0 |
+| natural_4 | 5 | `550` (`"##"`) | `13962` (`"###"`) | `13962` | **0.625** | 0.125 |
+
+**Every single root divergence margin (0.125-0.625 logit units) is
+comfortably under `NEAR_TIE_LOGIT_MARGIN=2.0`** -- none is remotely close
+to the threshold. Notably, `w1s_2`'s divergence is the token pair
+`271`/`198` (`"\n\n"` vs `"\n"`) -- **literally the same near-tie example**
+this project's own `NEAR_TIE_LOGIT_MARGIN` docstring already cites from an
+earlier round's independent finding, an unplanned but strong corroboration
+that this is the same, already-characterized benign phenomenon, not a new
+one. In every case ours' chosen token was reference's own rank-2 (or, for
+`natural_4`, rank-3) candidate, at logprob within 0.5-1.6 nats of
+reference's own top pick -- i.e., reference's own model was genuinely
+near-torn between the two options at that exact position.
+
+### 10.4 Why the 43.5% raw match rate is not the headline metric
+
+Once a real (even if near-tie) divergence occurs at position *i*, position
+*i+1* onward compares two **different, unrelated continuations** (ours'
+own subsequent text vs. reference's own subsequent text, conditioned on
+different prefixes from that point on) -- there is no reason to expect
+these to coincide token-for-token, and the review's own gate framing
+explicitly anticipates this ("diverging tails... remain semantically
+equivalent," not "match the reference"). This is confirmed by the data
+itself: `w1s_2` and `natural_4` (earliest divergences, position 5) show
+essentially zero further coincidental matches for the remaining ~250
+positions (2.0%/2.3% match rate is just the 5-token shared prefix, nothing
+more) -- exactly the signature of "one clean fork, then two independent
+valid continuations," not cascading corruption. `natural_3` (latest
+divergence, position 208) correspondingly shows the highest match rate
+(81.2%) simply because most of its 256 compared tokens are pre-divergence.
+The right question is not "do post-divergence positions match" (they
+structurally can't be expected to) but "is the ROOT divergence a near-tie,
+and does the diverging tail stay coherent" -- both answered affirmatively
+in §10.3 and §10.5.
+
+### 10.5 Qualitative read of the diverging tails
+
+Read in full (not skimmed) for all 6 diverging prompts, both sides:
+
+- **`w1s_2`** (synthetic sequential-token-id prompt, not real language):
+  ours' continuation correctly identifies the input as "not meaningful
+  content... a corrupted data dump... gibberish/mojibake"; reference's
+  continuation goes into an extended step-by-step "thinking process"
+  reasoning about the same nonsensical input ("a massive, seemingly random
+  block of text... programming keywords, HTML/CSS/JS snippets, SQL
+  fragments"). **Both are correct, sensible reactions to a genuinely
+  nonsensical prompt** -- the stylistic difference (terse verdict vs.
+  extended reasoning) plausibly traces directly to the `"\n\n"` vs `"\n"`
+  fork (whether a `<think>`-style block closes early or continues).
+- **`natural_0`** (quicksort explain): both sides correctly begin
+  analyzing the `quicksort` function structurally, just with different
+  phrasing of the same first analysis step. Coherent on both sides.
+- **`natural_1`** (palindrome function): reference continues explaining
+  the function normally. **Ours shows one artifact worth flagging
+  honestly**: after finishing the function body, it emits an
+  `<|endoftext|><|im_start|>user...` sequence -- i.e., having reached what
+  the model considers a natural stopping point, forcing continuation past
+  it via `ignore_eos=True` (a deliberate, symmetric methodology choice on
+  BOTH sides, matching this project's own established `-S`-line convention
+  in `w1s_native_bench.py`) causes it to hallucinate a new simulated chat
+  turn. This is **fluent, grammatically well-formed text, not garbage or
+  repetition** -- a known, expected, and symmetric side effect of
+  forced-length generation past a real stopping point, not a Phase 2
+  mechanism bug.
+- **`natural_2`** (Flask bug diagnosis): both sides correctly diagnose the
+  same root cause (`request.get_json()`/`Content-Type` handling with an
+  empty body), just reordering which clause comes first. Coherent, both
+  substantively correct.
+- **`natural_3`** (Fibonacci completion): ours continues with example
+  `print()` calls; reference explains the function's recursion and base
+  cases. Both reasonable, on-topic continuations of the same completion
+  task.
+- **`natural_4`** (SQL injection review): both sides correctly identify
+  the vulnerability and give a correct example attack payload
+  (`' OR '1'='1`) -- differing only in heading style (`"## SQL Injection
+  Vulnerability Analysis"` vs `"### Vulnerability Analysis"`, directly
+  downstream of the `##`/`###` fork at position 5) and phrasing. Both
+  substantively correct security analyses.
+
+**No occurrence of repetition loops, gibberish, or broken/garbled output
+on either side, across any of the 6 diverging prompts.**
+
+### 10.6 Verdict
+
+**PASS**, per the review's own framing: divergences from the reference's
+greedy output occur *only* at positions that are documented near-ties
+(all 6 root-cause margins 0.125-0.625, versus the 2.0 threshold -- not
+close), at a rate consistent with this project's own previously-
+characterized bf16/kernel-order noise floor (the `271`/`198` example
+recurring verbatim is strong corroborating evidence this is the *same*
+already-understood phenomenon, not a new failure mode), and every
+diverging tail remains semantically reasonable, fluent text on both sides
+-- never degenerating into garbage or repetition. The §10.5 (prior doc)
+"~0.03 conv-side bf16 noise, compounded through 48 GDN layers" hypothesis
+is **not falsified** by this check; it is now backed by an actual
+token-sequence comparison rather than resting on cosine-similarity/
+signal-probe/acceptance-rate proxies alone. The 136.750-137.784 accepted
+tok/s headline is now supported by a real generation-quality validation,
+closing the §4/Phase-A gap this review opened.
+
+**Scope notes, stated honestly:** (1) 8 prompts is a modest sample --
+sufficient to *find and characterize* the divergence phenomenon (which it
+did, cleanly, 6 times) but not a large-N statistical bound on divergence
+*rate*; a larger sweep would sharpen the "consistent with the noise floor"
+claim from qualitative to quantitative. (2) This check ran at concurrency=1
+(batch size 1) throughout, not the production `c=4` cross-slot-batched
+shape -- deliberately, to keep the check simple/low-risk and because the
+GDN state-commit *mechanism* being validated does not itself depend on
+batch size (same functions, same kernels); cross-slot batching-order
+effects are a separate axis the review's own Phase D (D1) already covers.
+Neither scope note changes the verdict; both are natural candidates if a
+larger/production-shape re-run is ever wanted.
+
+**Artifacts** (kept in the session scratchpad, not committed --
+measurement scripts/outputs, not project source):
+`build_prompts.py`, `capture_ours.py`, `capture_reference.py`,
+`verify_inlining_faithful.py`, `compare.py`, `prompts.json`,
+`ours_result.json`, `reference_result.json`, `comparison_report.json`.

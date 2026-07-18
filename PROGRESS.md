@@ -1895,6 +1895,36 @@ single `cudaGraphLaunch()` replay eliminating the eager path's thousands
 of individually-dispatched kernels' inter-kernel CPU-dispatch gaps. Full
 derivation in the plan doc's new section 12.
 
+### Phase A — end-to-end generation-quality validation (2026-07-18) — PASS, closes the independent review's central open question
+
+An independent cold review (`notes/2026-07-18-session-review-and-next-steps.md`)
+found that Phase 2's output correctness had only ever been validated via
+kernel-level cosine similarity, signal-probe coherence, and acceptance-rate
+parity — never an actual end-to-end comparison of generated token
+sequences against a trusted reference (the exact check this project's own
+`PROGRESS.md:442-448` history shows signal-probe alone can miss). Executed
+the review's Phase A plan: greedy-decoded (temp=0, 256+ tokens) 8 prompts
+(3 frozen W1-S fixture prompts + 5 natural-language/code prompts) through
+both **ours** (the real, unmodified `mtp_prefill_batch`/
+`mtp_verify_and_commit_batch` Phase 2 mechanism — verified bit-identical
+to a logit-retaining instrumented driver before trusting its output) and
+**a trusted reference** (native vLLM's own real engine, in-process,
+*without* speculative decoding — the strongest reference option named,
+made tractable via `vllm.LLM(...)`, same `CUSTOM` attention backend and
+`kv_cache_dtype=fp8_e4m3` on both sides to isolate the actual variable
+under test). **Verdict: PASS.** 2/8 prompts reproduced native's greedy
+output bit-exactly for the full 256 compared tokens; the other 6 each
+diverged at exactly one root position, and **every one of those 6 root
+divergences was a genuine near-tie** (margins 0.125–0.625 logit units,
+all far under `NEAR_TIE_LOGIT_MARGIN=2.0` — one of them literally the same
+`"\n\n"`/`"\n"` (`271`/`198`) token pair this project's own
+`NEAR_TIE_LOGIT_MARGIN` docstring already cites as a known benign
+near-tie example). Every diverging continuation, read in full on both
+sides, remained fluent and on-topic — no repetition, no gibberish, no
+degeneration. Full methodology, per-prompt tables, and the qualitative
+read of every diverging tail: `notes/2026-07-18-session-review-and-next-steps.md`
+section 10.
+
 ### Phase 0 — Baseline contract
 
 - Frozen W1 (4K input / 1K output) and W2 (32K / 1K) workloads for
