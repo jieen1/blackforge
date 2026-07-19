@@ -243,6 +243,57 @@ D1_CTX64K_FIXTURE = PromptFixture(
     prompt_len=65536,
 )
 
+# 2026-07-19, multi-agent-coding-workload re-prioritization: the user's real
+# target workload (256K architectural context requirement, concurrency=4 as
+# the core scenario at 64K/128K/200K/256K) needs frozen fixtures beyond 64K.
+# SAME formula/seed as every fixture above -- deliberately NOT num_requests=16
+# like the D1 fixtures: the only concurrency this task's matrix actually needs
+# is 4, and a 16-request fixture at 200K/256K would be a ~4x larger frozen
+# JSON file (tens of MB) and ~4x more one-time tokenizer-formula compute for
+# rows this task never uses -- a deliberate, explicitly-flagged deviation from
+# the D1 convention, not an oversight. Still NOT the official W2/W2-S line
+# (see W1_S/W2_S's own docstring above).
+CTX128K_FIXTURE = PromptFixture(
+    path="ctx128k_prompts.json",
+    tokenizer="unsloth/Qwen3.6-27B-NVFP4",
+    generation_formula=_W1_S_FORMULA,
+    seed=12345,
+    num_requests=4,
+    prompt_len=131072,
+)
+
+CTX200K_FIXTURE = PromptFixture(
+    path="ctx200k_prompts.json",
+    tokenizer="unsloth/Qwen3.6-27B-NVFP4",
+    generation_formula=_W1_S_FORMULA,
+    seed=12345,
+    num_requests=4,
+    prompt_len=204800,
+)
+
+# ctx256k's prompt_len is deliberately NOT 262144 (the literal "256*1024").
+# Confirmed from unsloth/Qwen3.6-27B-NVFP4's real config.json
+# (text_config.max_position_embeddings): this model's own native RoPE
+# ("default" rope_type, no YaRN/NTK scaling configured) supports AT MOST
+# 262144 total positions -- 262144 IS the model's real architectural ceiling,
+# not a round-number choice by this project. A prompt_len of exactly 262144
+# would leave ZERO room for even one generated token before exceeding that
+# ceiling. This fixture's prompt_len=261888 (262144 - 256) is chosen so that
+# prompt_len + max_tokens(256, this whole doc's standard) lands EXACTLY at
+# the architectural limit -- the most honest way to test "does 256K context
+# actually work," at the real edge, not comfortably inside it with slack this
+# model does not actually have available. See mtp_w1s_our_runtime_perf.py's
+# _MODEL_MAX_POSITION_EMBEDDINGS constant, which caps max_model_len at this
+# same 262144 figure for the same reason.
+CTX256K_FIXTURE = PromptFixture(
+    path="ctx256k_prompts.json",
+    tokenizer="unsloth/Qwen3.6-27B-NVFP4",
+    generation_formula=_W1_S_FORMULA,
+    seed=12345,
+    num_requests=4,
+    prompt_len=261888,
+)
+
 
 def main() -> None:
     print(json.dumps({name: asdict(workload) for name, workload in WORKLOADS.items()}, indent=2))

@@ -34,6 +34,9 @@ import time
 import aiohttp
 
 from benchmarks.workloads import (
+    CTX128K_FIXTURE,
+    CTX200K_FIXTURE,
+    CTX256K_FIXTURE,
     D1_CTX16K_FIXTURE,
     D1_CTX32K_FIXTURE,
     D1_CTX64K_FIXTURE,
@@ -56,6 +59,12 @@ FIXTURES = {
     # here even though it is blocked for this runtime's own benchmark --
     # see workloads.py's D1_CTX64K_FIXTURE docstring.
     "ctx64k": D1_CTX64K_FIXTURE,
+    # 2026-07-19, multi-agent-coding 256K-feasibility task: same "native has
+    # no per-slot ceiling" reasoning applies; launch_test_server.py's own
+    # --max-model-len default (262144) already covers all three of these.
+    "ctx128k": CTX128K_FIXTURE,
+    "ctx200k": CTX200K_FIXTURE,
+    "ctx256k": CTX256K_FIXTURE,
 }
 
 
@@ -216,6 +225,7 @@ async def _run_once(
     fixture_key: str,
     stream: bool = False,
     num_requests: int | None = None,
+    timeout_s: float = 300.0,
 ) -> dict:
     base_url = f"http://127.0.0.1:{port}"
     fixture = FIXTURES[fixture_key]
@@ -226,7 +236,19 @@ async def _run_once(
         # project's own `mtp_w1s_our_runtime_perf.py --num-requests`).
         prompts = prompts[:num_requests]
 
-    async with aiohttp.ClientSession() as session:
+    # 2026-07-19, 256K-feasibility task: `aiohttp.ClientSession()` with no
+    # explicit timeout uses its own default `ClientTimeout(total=300)` (5
+    # minutes) -- a real, observed failure mode at this task's own ctx256k/
+    # c=4 leg (`TimeoutError` from `client_reqrep.py`'s `resp.start()`,
+    # confirmed via the server's own `/health` still returning 200
+    # immediately after -- the SERVER never crashed or hung, only this
+    # client-side default was too short for a real >300s completion at long
+    # context/full concurrency). `timeout_s=300.0` preserves every existing
+    # invocation's behavior byte-for-byte (aiohttp's own default, made
+    # explicit here rather than left implicit); long-context legs pass a
+    # larger value explicitly via `--timeout-s`.
+    timeout = aiohttp.ClientTimeout(total=timeout_s)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
         before = await _fetch_spec_decode_counters(base_url, session)
         if not before["found"]:
             return {"passed": False, "error": "no vllm:spec_decode* metrics found -- is --with-mtp enabled?"}
@@ -308,6 +330,16 @@ def main() -> int:
     parser.add_argument(
         "--num-requests", type=int, default=None, help="slice the frozen fixture down to this many requests"
     )
+    parser.add_argument(
+        "--timeout-s",
+        type=float,
+        default=300.0,
+        help="2026-07-19, 256K-feasibility task: aiohttp client total timeout per request "
+        "(default 300.0 matches aiohttp's own implicit default -- unaffected unless passed "
+        "explicitly). Long-context/high-concurrency legs (e.g. ctx200k/ctx256k at "
+        "concurrency=4) can genuinely take longer than 300s wall time to complete and need "
+        "this raised, e.g. --timeout-s 1200.",
+    )
     args = parser.parse_args()
 
     reps = []
@@ -323,6 +355,7 @@ def main() -> int:
                 args.fixture,
                 args.stream,
                 args.num_requests,
+                args.timeout_s,
             )
         )
         thermal_after = _gpu_thermal()

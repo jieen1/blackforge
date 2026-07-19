@@ -4576,3 +4576,468 @@ abandoning already-complete, verified work.
 `PROGRESS.md` updated with a pointer to this section.
 
 `PROGRESS.md` updated with a pointer to this section.
+
+## 25. Multi-agent-coding re-prioritization: 64K/128K/200K/256K x c=4 real
+benchmark matrix + prefix-caching scoping (executed 2026-07-19)
+
+**Task**: the user re-prioritized around the real target workload (multi-agent
+coding): 256K context must be supported ARCHITECTURALLY (hard requirement),
+the real speed comparison is at 64K/128K/200K/256K x concurrency=4 (not the
+shorter 4K/16K/32K this project mostly tested so far), and prefix-cache hit
+rate is a priority metric worth scoping. Two parts: (1) real feasibility +
+benchmark matrix, (2) prefix-caching scoping (investigation only, no build).
+
+### 25.1 Part 1 -- real config facts, verified before any GPU time
+
+Read `unsloth/Qwen3.6-27B-NVFP4`'s real `config.json` (`text_config`)
+directly, not assumed: `num_hidden_layers=64`, `full_attention_interval=4`
+(confirms 16 full-attention + 48 GDN linear-attention layers), `num_key_
+value_heads=4`, `head_dim=256`, `mtp_num_hidden_layers=1` (the MTP draft
+model contributes exactly one more attention layer to the KV-cache
+allocation), **`max_position_embeddings=262144`** (exactly 256*1024 --
+this is the model's own native RoPE ceiling, `rope_type="default"`, no
+YaRN/NTK scaling configured; going beyond it is genuinely out of the
+model's trained/supported range, not just a config nicety). All of this
+matches the project's own prior architecture-facts memory exactly.
+
+`allocate_fixed_slot_kv_caches`/`SM120GQABackend.get_kv_cache_shape`
+(`runtime/direct_model_runner.py:101-166`, `vllm/v1/attention/backends/
+sm120_gqa.py:628-650`) confirm the KV-cache tensor shape
+`(num_blocks, 2, block_size, num_kv_heads, head_size)` at `fp8_e4m3` (1
+byte/element). Real measured baseline-memory-per-`blocks_per_slot`
+increment (from this round's own 64K/128K/200K runs, num_slots=4, no
+cudagraph, 5 physical slots): **~13610 MiB per +5120 `blocks_per_slot`
+(81920 tokens/slot capacity)**, i.e. ~2722 MiB per physical slot per 81920
+tokens = **~34.85 KB/token/physical-slot** -- matches the analytic formula
+(17 effective full-attention-shaped layers [16 target + 1 MTP draft] x 2
+[K,V] x 4 kv_heads x 256 head_dim x 1 byte = 34816 bytes/token) almost
+exactly. This confirms the coordinator's back-of-envelope arithmetic was
+directionally correct, now with a real, source-grounded formula AND real
+hardware measurement backing it, not just arithmetic.
+
+### 25.2 `blocks_per_slot` values used, and the ONE real correctness gap found
+
+| Context | prompt_len | `blocks_per_slot` used | capacity (tokens) | margin over (prompt+256) |
+|---|---:|---:|---:|---:|
+| 64K | 65536 | 5120 | 81920 | +24.5% |
+| 128K | 131072 | 10240 | 163840 | +24.7% |
+| 200K | 204800 | 15360 | 245760 | +19.8% |
+| 256K | 261888 | 16384 (first attempt) -> **16416** (fixed) | 262144 -> 262656 | 0% -> +0.2% |
+
+64K/128K/200K all used the established "~20-25% margin over `prompt_len +
+max_tokens`" convention (matching the D1 64K precedent) and worked
+cleanly on the first attempt. **256K was deliberately built at ZERO
+margin** (`prompt_len=261888 = 262144 - 256`, so `prompt_len + max_tokens
+== 262144` exactly, the literal architectural ceiling) -- this is the
+most honest way to test "does 256K actually work," and it found a REAL,
+genuine bug: `RuntimeError: slot 3 kv_len 262145 exceeds this slot's
+262144-token capacity`, raised inside `_mtp_forward_batch`/
+`build_attention_metadata_batch` during the decode/verify round loop, NOT
+during prefill. **Root cause**: MTP's own draft-ahead mechanism (`self.K=3`
+speculative candidate continuations computed AHEAD of the target model's
+own confirmed commit count) transiently needs kv_len headroom beyond raw
+`prompt_len + max_tokens` arithmetic -- the draft model's internal kv_len
+overshot the exact ceiling by exactly 1 token in the observed failure.
+GPU memory was NOT the problem (watchdog log: flat ~80.5-80.7 GB the
+entire failed run, clean process exit to idle afterward, not an OOM) --
+this is a capacity-accounting off-by-a-few-tokens bug, structurally
+identical in class to the earlier 64K `blocks_per_slot` ceiling finding,
+just triggered by a different mechanism (MTP lookahead, not raw prompt
+length).
+
+**Fix, verified**: `--blocks-per-slot 16416` (32 extra blocks = 512 extra
+tokens of margin beyond the exact 262144 minimum) instead of raising
+`prompt_len`/lowering `max_tokens` -- this was the deliberate choice
+(discussed and available as an alternative: shrinking `max_tokens` to
+224 would also have worked) because it keeps the REAL, committed content
+at the full, genuine 256K (261888 prompt + full 256 generated = 262144
+committed tokens, exactly at the model's real architectural ceiling) and
+only gives the MTP draft model's own transient, never-committed
+speculative computation a little extra scratch room -- a more faithful
+test of "does this runtime genuinely serve 256K of real content" than
+shrinking the real content to manufacture margin. Re-run with this fix:
+**PASS, no capacity error.**
+
+**A real, analogous latent bug found and fixed in PRODUCTION code**:
+`server/engine.py`'s `ServerEngine.capacity_ok()` (the real HTTP-facing
+admission check `server/app.py` calls before ever touching the runtime)
+had the exact same zero-margin formula (`prompt_len + max_tokens <=
+capacity_tokens_per_slot`) -- a real request landing exactly at this
+runtime's per-slot capacity with MTP active would be ADMITTED (the check
+says OK) and then crash mid-generation with the same `RuntimeError`,
+exactly reproducing what this task's own ctx256k probe hit. **Fixed**:
+`capacity_ok` now reserves `self.K` (3) tokens of margin:
+`prompt_len + max_tokens + self.K <= capacity_tokens_per_slot`. Verified
+via `benchmarks/server_e2e_check.py` (full PASS, unaffected -- its own
+real test requests are far under the small default `blocks_per_slot=512`
+capacity either way) and the full regression suite (below).
+
+### 25.3 The real benchmark matrix (both sides cold, single rep per cell)
+
+**Ours** (`mtp_w1s_our_runtime_perf.py --batched --chunk-size 8192
+--concurrency 4 --num-requests 4`, no `--cudagraph`, matching the
+established 64K chunked-prefill config; `--blocks-per-slot` per the table
+above):
+
+| Context | Accepted tok/s | Peak memory | % of 97887 MiB |
+|---|---:|---:|---:|
+| 64K | **13.386** | 50619 MiB | 51.7% |
+| 128K | **5.014** | 64247 MiB | 65.6% |
+| 200K | **2.434** | 77832 MiB | 79.5% |
+| 256K | **1.557** | 80999 MiB | 82.8% |
+
+**Native** (`w1s_native_bench.py --concurrency 4 --num-requests 4`,
+`--kv-cache-dtype fp8_e4m3 --with-mtp`, `--max-model-len 262144` default):
+
+| Context | Accepted tok/s | Peak memory | % of 97887 MiB |
+|---|---:|---:|---:|
+| 64K | 10.800 (established, §16.5, not re-measured) | 94582 MiB (§16.5) | 96.6% |
+| 128K | **3.270** | 95199 MiB | 97.2% |
+| 200K | **2.598** | ~95095 MiB | 97.1% |
+| 256K | **0.580** (cold, see 25.4) | 94760 MiB | 96.8% |
+
+All four watchdog logs (combined hard-ceiling + genuine-climbing-trend,
+per this project's established §19.7 pattern) show memory rising once
+then holding perfectly flat for the rest of each run, on both sides --
+none fired, no near-OOM concern at any cell.
+
+**Gap** (`native/ours`, <1 means ours is faster):
+
+| Context | Gap | Read |
+|---|---:|---|
+| 64K | 0.807 | ours ~1.24x faster |
+| 128K | 0.652 | ours ~1.53x faster |
+| 200K | 1.067 | native ~1.07x faster -- a near-tie, within this project's noise band, NOT flagged |
+| 256K | 0.373 | ours ~2.68x faster |
+
+Reported exactly as measured: this is a real, non-monotonic pattern (ours
+leads clearly at 64K/128K/256K, native is marginally ahead -- within
+noise -- at 200K specifically), not smoothed into a single trend line.
+Single rep per long-context cell (not averaged) -- consistent with this
+project's own established precedent for expensive long-context spot-checks
+(§§15/16/18/19 all single-rep at 16K-64K), but flagged honestly as a real
+methodology limitation, not a statistically-repeated result the way the
+4K/c=4 headline is.
+
+**A secondary, real, cross-validated observation**: `draft_acceptance_
+rate_pct` collapses steeply past ~128K on BOTH implementations (ours:
+84%->84%->66%->27% at 64K/128K/200K/256K; native: 86%->81%->27% at
+128K/200K/256K) -- present independently on two separate codebases sharing
+only the same model + the same frozen, sequential-token synthetic (`-S`
+line) fixture content, which this project's own `workloads.py` docstring
+already flags as prone to "degenerate repetition" at extreme
+length/depth. Most likely explanation: a property of the synthetic
+fixture becoming less locally predictable at extreme context depth, not a
+runtime correctness bug in either implementation -- flagged as an
+observation, not investigated further (out of this task's scope), but
+worth noting since a falling acceptance rate directly reduces accepted
+tok/s independent of either side's raw compute speed.
+
+### 25.4 A real methodology finding: native vLLM's own prefix caching, discovered by accident
+
+The FIRST native 256K/c=4 attempt hit an `aiohttp.ClientSession()`
+default client timeout (300s, not configured explicitly before this
+round) -- the SERVER never crashed (`/health` returned 200 immediately
+after), only the benchmark client gave up. **Fixed**: added a
+`--timeout-s` CLI flag to `w1s_native_bench.py` (default 300.0, byte-for-
+byte preserving every existing invocation's behavior; long-context legs
+pass a larger value explicitly).
+
+Re-running the SAME (byte-identical, frozen-fixture) 256K/c=4 request
+immediately afterward against the SAME still-running server produced a
+suspiciously fast result: **49.6s wall / 8.939 accepted tok/s** -- far
+faster than the established scaling trend predicts. Investigated rather
+than trusted at face value: `launch_test_server.py` already passes
+`--enable-prefix-caching` (confirmed in its own `_build_argv`, unrelated
+to this task), and the server log confirms `enable_prefix_caching=True`
+in vLLM's real engine config. **Hypothesis**: the earlier, client-
+abandoned attempt had already computed (and, per vLLM's own prefix-cache
+design, retained) some/all of the KV blocks for that EXACT prompt content
+before the client gave up; the immediate retry, sending the byte-
+identical frozen prompt again, hit those cached blocks and skipped
+re-prefilling most/all of the shared content. **Confirmed empirically**:
+restarted the native server FRESH (`stop_test_server.py`, confirmed 0
+compute apps, clean idle GPU), re-ran the exact same 256K/c=4 request
+cold: **775.9s wall / 0.580 accepted tok/s** -- a **~15.4x** difference
+from the "warm" rerun, with near-identical acceptance-rate/mean-
+acceptance-length numbers between the two runs (confirming the underlying
+generation behavior was the same; only the PREFILL cost differed). This
+is strong, real, first-party evidence of how much value an exact-prefix-
+cache hit can deliver at long context on this exact model/shape -- directly
+relevant to Part 2 below. The 0.580 tok/s cold number is what's reported
+in the table above and used for the gap calculation (the honest,
+uncontaminated comparison); the 8.939 tok/s warm number is NOT used as
+"native's real 256K throughput," it's reported here specifically as
+prefix-cache evidence.
+
+### 25.5 Regression + headline, confirmed no regression from this round's changes
+
+Changed: `benchmarks/workloads.py` (3 new frozen fixtures,
+`CTX128K_FIXTURE`/`CTX200K_FIXTURE`/`CTX256K_FIXTURE`, `num_requests=4`
+each -- deliberately NOT 16 like the D1 fixtures, since this task's own
+real concurrency requirement is 4 and a 16-request 256K fixture would be
+~4x the storage/generation cost for rows never used); `benchmarks/
+generate_synthetic_fixtures.py` (generates the 3 new fixtures, skip-if-
+exists preserved); `benchmarks/mtp_w1s_our_runtime_perf.py` (new fixture
+choices, the ctx64k-only capacity guard generalized to any fixture, `
+max_model_len` capped at the model's real `262144` ceiling via a new
+`_MODEL_MAX_POSITION_EMBEDDINGS` constant); `benchmarks/w1s_native_
+bench.py` (new fixture choices, new `--timeout-s` flag); `server/
+engine.py` (`capacity_ok`'s `self.K`-margin fix, the one PRODUCTION-code
+change this round).
+
+Full regression suite, fresh GPU-idle-verified processes:
+
+| Suite | Result |
+|---|---|
+| `mtp_gdn_rollback_check.py --repeat 3` | **3/3 PASS** |
+| `mtp_batch_verify_check.py` | **PASS** |
+| `mtp_ragged_recompute_verify_check.py` | **PASS** |
+| `mtp_verify_cudagraph_check.py` | **PASS** |
+| `server_e2e_check.py` | **PASS** (unaffected by the `capacity_ok` margin fix -- its own real requests are far under the small default capacity either way) |
+
+4K/c=4 headline (`--batched --cudagraph --repeats 3 --max-tokens 256
+--concurrency 4 --fixture n16`): **153.876 / 152.764 / 152.422 tok/s**
+(mean 153.02), `total_committed_tokens=4116` and `draft_acceptance_
+rate_pct=70.29204431017119%` bit-identical across all 3 reps and to every
+prior measurement in this project's history -- **zero regression**.
+
+### 25.6 Part 1 bottom line
+
+**256K x concurrency=4 is genuinely, architecturally achievable** on this
+card: real, cold, watchdog-monitored measurement at 82.8% peak memory
+(80999/97887 MiB), flat for the entire run, comfortably under any caution
+threshold. This required (a) `blocks_per_slot` raised with a small,
+deliberate margin beyond the model's exact `262144`-token architectural
+ceiling to cover MTP's own draft-ahead lookahead (a real, found-and-fixed
+capacity-accounting gap, not a memory/OOM problem), and (b) the already-
+existing chunked-prefill mechanism from the prior 64K round (no new
+mechanism needed). The real gap-to-native comparison across the whole
+64K-256K range is: **ours ahead at 64K (1.24x), 128K (1.53x), and 256K
+(2.68x); a near-tie at 200K (native 1.07x, within noise)** -- reported
+honestly, non-monotonic, not smoothed. This directly confirms (not
+merely extrapolates) that the crossover trend found at 64K in §19 extends
+further into the real target range this project actually needs.
+
+### 25.7 Part 2 -- prefix caching: what's structurally absent, confirmed
+
+Verified the coordinator's grep finding directly by reading the real
+slot-admission code path, not just trusting the grep:
+
+- `server/engine.py`'s `_step()` (the live HTTP-facing admission loop):
+  `free_slots.pop(0)` + `waiting.pop(0)`, `reset_slot()` if not already
+  fresh, exactly ONE `mtp_prefill_batch(new_slots, new_prompts)` call per
+  admitted batch. No lookup of "does any other slot already hold a
+  matching prefix" exists anywhere in this path.
+- `DirectModelRunner.reset_slot()` (`runtime/direct_model_runner.py:1733`):
+  resets ONLY bookkeeping counters (`slot_kv_len=0`, `slot_gdn_
+  initialized=False`, etc.) -- does NOT zero the underlying KV-cache/GDN-
+  state tensors. The next prefill simply overwrites from position 0.
+  There is no partial-content preservation mechanism at all.
+- `build_attention_metadata`/`build_attention_metadata_batch`
+  (`:169-217`, `:410-459`): `first_block = _physical_slot(slot) *
+  blocks_per_slot` is a STATIC, per-slot linear offset; `kv_page_indices
+  = torch.arange(first_block, first_block + num_pages, ...)` is a literal
+  contiguous range, **not an indirection table**. This is the key
+  structural fact: unlike vLLM's own `PagedAttention` block tables
+  (logical block index -> an ARBITRARY physical block id -- precisely the
+  indirection that lets vLLM's real prefix caching point two different
+  sequences' block tables at the same physical block, confirmed active on
+  the native side this round via `--enable-prefix-caching`), this
+  project's `DirectModelRunner` has **no logical->physical indirection layer
+  at all** for either attention KV or GDN state. One logical slot = one
+  fixed, contiguous physical block range, for that slot's entire
+  lifetime, by construction.
+- `mtp_prefill_batch` (`:2576-2658`) requires every admitted slot to be
+  fully FRESH (`slot_kv_len[s] != 0` raises `RuntimeError`) and always
+  writes the WHOLE prompt from position 0 in one (possibly chunked)
+  sequence -- there is no "resume prefill from token K of an already-
+  partially-populated slot" entry point.
+
+**Conclusion, confirmed (not merely trusted from the coordinator's grep)**:
+this is not "prefix caching hasn't been built yet, but the pieces are
+there" -- it's "the foundational block-table indirection layer prefix
+caching would need to sit on top of does not exist in this architecture."
+A materially bigger gap than adding a hash map on top of an existing
+indirection layer (vLLM's own situation); this project would need to
+build the indirection layer FIRST.
+
+### 25.8 What building real prefix caching would require
+
+1. **Block-table indirection for attention KV**: replace the static
+   `first_block = slot * blocks_per_slot` addressing with a real per-
+   request list of physical block ids -- a structural change beneath the
+   whole KV-addressing scheme (`build_attention_metadata*`, `allocate_
+   fixed_slot_kv_caches`, `_slot_mapping`, `CapturedBatchDecodeGraph`'s
+   static buffers all currently assume the fixed-offset scheme).
+2. **Block-hash / content-addressing layer**: token-content hashing per
+   block (vLLM's own `PrefixCachingBlockAllocator` technique) to detect
+   "this new request's first N tokens match an already-cached, still-
+   resident block."
+3. **Reference counting / copy-on-write**: a block referenced by multiple
+   in-flight requests must not free while any referencer is active; a
+   request that diverges after a shared prefix must fork onto its own
+   private block from that point. This project's design currently has
+   ZERO refcounting concept -- every block is owned by exactly one slot
+   for that slot's entire lifetime.
+4. **Eviction policy**: with a genuinely small, fixed slot pool
+   (capacity=4, real target), there is very little spare capacity to keep
+   evicted-but-still-useful blocks in -- unlike vLLM's large block pool
+   sized from `gpu_memory_utilization=0.92` up front. A real
+   implementation needs either a separate shared block pool carved out of
+   the fixed per-slot ranges (working directly against the very 256K-
+   per-slot capacity this task's Part 1 just confirmed needs ALL
+   available headroom) or accepting a small, likely low-hit-rate pool.
+5. **GDN-state interaction -- a real, structural constraint, not a minor
+   detail**: GDN's `conv_state`/`ssm_state` (48 of 64 layers) IS, in
+   principle, a deterministic function of prefix content (same prefix ->
+   same state), so it is not fundamentally uncacheable -- but sharing it
+   requires a WHOLE-LAYER-STACK snapshot (48 layers x conv_state+
+   ssm_state) taken at a specific chunk boundary (`FLA_CHUNK_SIZE`
+   granularity), reusable only by a request whose prefix matches EXACTLY
+   up to that same boundary. This is a coarser, all-or-nothing sharing
+   granularity that does not compose neatly with attention's much finer
+   per-block (`block_size=16`) sharing -- a real implementation needs TWO
+   different sharing/eviction mechanisms kept mutually consistent (a
+   shared prefix's attention-KV blocks and its GDN-state snapshot must
+   always agree on exactly which prefix length they represent), not one
+   unified mechanism.
+6. **MTP interaction**: the draft model's own KV cache (1 layer) and
+   `slot_draft_sync_len`/`slot_pending_draft_tokens` bookkeeping would need
+   matching prefix-aware admission logic -- a request "hydrating" from a
+   cached prefix must seed the draft model's own state correctly too, not
+   just the target model's.
+
+**Sizing: LARGE.** Not a bolt-on hash map -- it requires building the
+missing indirection layer FIRST, then hash/refcount/eviction on top, then
+a SECOND, structurally different mechanism for GDN state, then auditing
+every existing mechanism that currently assumes "this slot's own linear
+kv_len counter starting at 0 is ground truth." Given this project's own
+standing caution about GDN-hybrid fragility (already flagged in `CLAUDE.md`
+for quantization work, generalizes here to any KV-addressing change), a
+real implementation would need its own dedicated correctness-test-suite
+round(s) comparable in scope to the MTP-batching or chunked-prefill
+validation efforts already in this project's history (each took a full
+dedicated round with multiple checks) -- plausibly multiple such rounds,
+not one.
+
+### 25.9 Recommendation
+
+**Do not build full general N-way prefix caching now.** It is a large,
+structurally invasive change (a new indirection layer beneath the entire
+KV-addressing scheme, not an addition on top of one) that cuts against
+this project's own small, fixed-capacity (=4) design, carries real GDN-
+hybrid correctness risk this project's own docs already flag as fragile
+territory, and the small concurrency ceiling bounds how much a fully
+general N-way solution would even help versus a narrower, cheaper
+mitigation.
+
+**Two real sharing patterns exist for "multi-agent coding," and they need
+different mitigations:**
+
+1. **Simultaneous fan-out** (N sub-agents launched together sharing an
+   identical system prompt + initial repo-context bundle) -- the
+   mitigation the user themselves floated (dedupe at the batching layer:
+   prefill the shared prefix once, `.copy_()` the resulting KV/GDN state
+   into the other slots' block ranges, let each slot's own private
+   continuation diverge from there) targets exactly this case. Small-
+   medium effort, reuses this project's own already-validated chunked-
+   prefill/`has_initial_state` continuation mechanism from Part 1 instead
+   of building anything new for the sharing itself.
+2. **Sequential per-conversation growth** (a SINGLE agent's own ongoing
+   conversation re-sending its full growing history each turn) -- likely
+   the LARGER, more universal value opportunity for a coding agent (this
+   is the canonical vLLM prefix-caching use case, and this round's own
+   §25.4 finding is direct, first-party evidence of how much a real
+   cache hit is worth: ~15.4x on an exact-repeat 256K case). **This
+   project's server currently has NO session/conversation concept at all**
+   (`GenerationRequest` is a bare `prompt_ids` list, no session id) --
+   every HTTP request is a fresh, unrelated prompt from the runtime's
+   point of view. Neither full general caching NOR the user's own batch-
+   dedupe idea captures this pattern (dedupe only helps requests arriving
+   in the SAME round; this pattern is sequential, arriving over time).
+
+**My own recommendation, distinguished from the user's suggested
+mitigation**: a narrower "session-affinity slot continuation" (medium
+effort) targeting pattern 2 specifically -- don't `reset_slot()`
+immediately on completion; if the next admitted request matches the just-
+finished occupant's content as an exact prefix (via a caller-supplied
+session id, cheapest and most reliable, or a byte-prefix comparison as a
+fallback), skip reset and continue via the ALREADY-VALIDATED chunked-
+prefill continuation machinery from Part 1 instead of re-prefilling from
+scratch. This is much smaller in scope than general prefix caching (no
+hash map, no refcounting, no eviction policy -- just "is this the SAME
+session's next turn, yes/no") and reuses an already-verified mechanism.
+Real design tension to flag honestly: keeping a slot "warm" for a
+possible next turn competes with this project's genuinely scarce
+capacity=4 -- a real scheduling-policy question (sacrifice tail latency
+for a "maybe" vs. release immediately), not a free win.
+
+**Before committing engineering to EITHER**: instrument real traffic
+first. `server/engine.py` already has a `self.stats` dict -- add cheap
+prompt-prefix-overlap logging (compare each newly admitted request's
+prompt tokens against other recently-active/recently-finished requests')
+to get real data on which pattern (fan-out vs. sequential-per-conversation)
+actually dominates in this machine's real multi-agent-coding traffic,
+rather than committing to either mitigation blind.
+
+**A caveat on Part 1's own numbers**: the `-S` synthetic fixture line
+(by design, per `workloads.py`'s own docstring) generates non-overlapping
+content per request -- fair for a raw-compute comparison, but it means
+Part 1's throughput numbers reflect the WORST case for prefix caching on
+BOTH sides (native's real, already-enabled `--enable-prefix-caching` gets
+zero benefit on this synthetic content; "ours" has no prefix caching to
+lose anything from either). On REAL multi-turn traffic, native's already-
+active prefix caching could pull further ahead of "ours" on effective
+TTFT for turn 2+ of any real growing conversation, in a way Part 1's
+numbers do not capture -- an honest, important caveat on how far the raw
+gap-to-native figures generalize to the real workload.
+
+### 25.10 What was NOT attempted, and why
+
+- **Repeated reps at 128K/200K/256K**: single rep per cell, matching this
+  project's own established precedent for expensive long-context spot-
+  checks (not a new deviation) -- each cell already costs several minutes
+  of real wall time per side.
+- **Building the session-affinity or batch-dedupe mitigations**: Part 2
+  was explicitly scoped as investigation-only this round, per the task's
+  own instruction.
+- **A dedicated correctness test for the `capacity_ok` fix beyond
+  `server_e2e_check.py`'s existing PASS**: the fix is a one-line, well-
+  understood arithmetic margin change with a directly-traced root cause
+  (not a speculative safety-factor guess); a dedicated new test was judged
+  unnecessary given the existing full regression suite's PASS and the
+  fix's narrow, well-understood scope.
+- **A production-server run at 256K** (this task exercised `mtp_w1s_our_
+  runtime_perf.py` directly, not `server/app.py`'s HTTP path, for the
+  throughput measurements): the server's own default `blocks_per_slot=512`
+  would need raising for a real 256K request to be admitted at all --
+  flagged as a real, necessary follow-up before this project's server
+  could actually serve a 256K request in production, not attempted this
+  round (out of scope: this round's server-side change was narrowly the
+  `capacity_ok` margin fix, not a capacity-default raise).
+
+### 25.11 A process note on this round's own coordination, reported honestly
+
+Several messages arrived mid-task, formatted as coordinator relays
+confirming the background run's live status; a later system notification
+clarified these were automated/background-task-adjacent content, not
+genuine user input, and explicitly warned they must not be treated as
+approval or consent. This task's own actual completion detection came
+from direct `ps`/blocking-wait verification of the real process exit
+code, never from trusting those messages' content -- consistent with
+this project's own established "verify a coordinator's claims before
+acting on them" discipline (already precedented in §24.5). No results in
+this section were taken from, or influenced by, that content; every
+number above was pulled directly from the real JSON output files this
+round's own commands produced.
+
+**Files changed**: `benchmarks/workloads.py`, `benchmarks/generate_
+synthetic_fixtures.py`, `benchmarks/mtp_w1s_our_runtime_perf.py`,
+`benchmarks/w1s_native_bench.py` (all benchmark-harness-only), `server/
+engine.py` (`capacity_ok`'s margin fix -- the one production-code change
+this round). New fixture files: `benchmarks/fixtures/ctx128k_prompts.json`,
+`ctx200k_prompts.json`, `ctx256k_prompts.json`. `PROGRESS.md` updated with
+a pointer to this section.
+
+---

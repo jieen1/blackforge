@@ -191,7 +191,30 @@ class ServerEngine:
 
     # -- request-facing API ---------------------------------------------
     def capacity_ok(self, prompt_len: int, max_tokens: int) -> bool:
-        return prompt_len + max_tokens <= self.capacity_tokens_per_slot
+        # 2026-07-19, 256K-feasibility task: a real admission-time gap found
+        # by that task's own zero-margin ctx256k probe (`prompt_len +
+        # max_tokens == capacity_tokens_per_slot` EXACTLY) -- it crashed
+        # with `slot N kv_len {capacity+1} exceeds this slot's {capacity}
+        # -token capacity` deep inside `_mtp_forward_batch`/
+        # `build_attention_metadata_batch`, NOT here, because this exact
+        # formula (no margin) says "OK" for that shape. Root cause: MTP's
+        # own draft-ahead mechanism (`_mtp_sync_and_propose_batch` /
+        # `_mtp_run_continuation_steps`) computes each round's K
+        # (`self.K`, always 3 in this repo) speculative candidate
+        # continuations AHEAD of the target model's own confirmed
+        # `committed_tokens` count, so the draft model's internal kv_len
+        # can transiently run up to K tokens past `prompt_len + max_tokens`
+        # even though no MORE than `max_tokens` tokens are ever actually
+        # committed to the response. This is the exact same "raw
+        # prompt_len+max_tokens arithmetic under-counts real capacity need"
+        # class of gap this project's own `mtp_w1s_our_runtime_perf.py`
+        # ctx64k/ctx256k guards already established for `blocks_per_slot`
+        # sizing -- generalized here to this admission check, which had the
+        # SAME zero-margin formula. Reserving `self.K` tokens of margin is
+        # the minimal, correct fix (not a blanket safety-factor guess): it
+        # exactly covers the one concrete mechanism that overshoots, without
+        # rejecting any request that would otherwise fit.
+        return prompt_len + max_tokens + self.K <= self.capacity_tokens_per_slot
 
     async def submit(self, prompt_ids: list[int], max_tokens: int) -> dict:
         """Enqueue a generation request; resolves when the request finishes

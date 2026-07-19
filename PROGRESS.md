@@ -4,6 +4,69 @@ Updated: 2026-07-19
 
 ## Completed
 
+### 256K/c=4 feasibility confirmed real and achievable; prefix-caching scoped (not built) (2026-07-19)
+
+Re-prioritization around the real target workload (multi-agent coding):
+256K context must work architecturally, the real speed comparison is at
+64K/128K/200K/256K x concurrency=4, and prefix-cache hit rate was scoped
+as a priority metric. **Real, cold, watchdog-monitored measurements,
+both sides**: ours 13.386/5.014/2.434/1.557 accepted tok/s at
+64K/128K/200K/256K (peak memory 51.7%/65.6%/79.5%/82.8%, flat throughout,
+no near-OOM); native (cold) 10.800/3.270/2.598/0.580 at the same shapes.
+**Gap (native/ours)**: ours ~1.24x faster at 64K, ~1.53x at 128K, a near-
+tie at 200K (native ~1.07x, within noise), and ours ~2.68x faster at
+256K -- reported honestly, non-monotonic, not smoothed into one trend.
+**256K is genuinely achievable**: confirmed via real config.json facts
+(`max_position_embeddings=262144` exactly = 256*1024, the model's own
+literal architectural ceiling) plus real hardware measurement (82.8% peak
+memory, flat, no OOM) -- not just the coordinator's back-of-envelope
+arithmetic, which this task's own real KV-cache-formula derivation and
+measurement now confirms directionally.
+
+One real bug found (not merely a benchmark-config tweak) and fixed: a
+zero-margin `blocks_per_slot` sizing at the literal 256K ceiling crashed
+with `slot N kv_len {capacity+1} exceeds capacity` -- MTP's own K=3
+draft-ahead lookahead transiently needs capacity headroom beyond raw
+`prompt_len + max_tokens` arithmetic. Fixed for the benchmark via a small
+`blocks_per_slot` margin (262656 vs. the exact 262144-token minimum), and
+-- more importantly -- found and fixed the SAME latent gap in PRODUCTION
+code: `server/engine.py`'s `capacity_ok()` admission check had the
+identical zero-margin formula, meaning a real HTTP request landing exactly
+at capacity would be admitted and then crash mid-generation. Fixed with a
+`self.K`-token margin. Verified via `server_e2e_check.py` (PASS,
+unaffected) plus the full regression suite (4/4 PASS) and the 4K/c=4
+headline (153.02 tok/s mean, `total_committed_tokens`/`draft_acceptance_
+rate_pct` bit-identical to every prior measurement -- zero regression).
+
+A second real finding, discovered by accident: native vLLM's own
+already-enabled `--enable-prefix-caching` turned an accidental re-run of
+the byte-identical 256K prompt into a **~15.4x** speedup (775.9s cold ->
+49.6s warm) -- confirmed by restarting the server fresh and re-measuring
+cold to rule out contamination. Direct, first-party evidence for the
+prefix-caching scoping below, not a hypothetical.
+
+**Part 2 (scoping only, not built)**: confirmed this project's fixed-slot
+architecture has NO logical->physical block-table indirection at all
+(unlike vLLM's own `PagedAttention`, whose block tables are precisely what
+makes ITS prefix caching possible) -- a materially bigger gap than "add a
+hash map," since the indirection layer itself doesn't exist yet. GDN state
+is, in principle, cacheable (deterministic function of prefix content) but
+only at whole-layer-stack, chunk-boundary granularity, a structurally
+different and coarser mechanism than attention KV's per-block sharing --
+two different sharing mechanisms would be needed, not one. **Sizing:
+LARGE** (not recommended now). **Recommendation**: two real sharing
+patterns exist for multi-agent coding -- simultaneous fan-out (small-medium
+effort: the user's own suggested batch-level dedupe) and sequential
+per-conversation growth (likely the larger, more universal value
+opportunity, matching vLLM's own canonical use case -- neither general
+caching nor the dedupe idea captures this; a narrower "session-affinity
+slot continuation," medium effort, reusing this project's own already-
+validated chunked-prefill continuation mechanism, targets it specifically).
+Recommend instrumenting real traffic (prompt-prefix-overlap logging) before
+committing engineering to either, rather than guessing which pattern
+dominates. Full writeup: `notes/2026-07-18-session-review-and-next-steps.md`
+section 25.
+
 ### First working `server/`: real OpenAI-compatible HTTP server over `DirectModelRunner`, two real bugs found and fixed by its own E2E validation (2026-07-19)
 
 Closes the single highest-leverage gap an independent audit flagged this

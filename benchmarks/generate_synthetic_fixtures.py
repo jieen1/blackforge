@@ -29,6 +29,9 @@ import random
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
 from benchmarks.workloads import (
+    CTX128K_FIXTURE,
+    CTX200K_FIXTURE,
+    CTX256K_FIXTURE,
     D1_CTX16K_FIXTURE,
     D1_CTX32K_FIXTURE,
     D1_CTX64K_FIXTURE,
@@ -68,7 +71,16 @@ def _generate(fixture) -> dict:
 
 def main() -> int:
     FIXTURES_DIR.mkdir(parents=True, exist_ok=True)
-    for fixture in (W1_S_FIXTURE, W1_S_FIXTURE_N128, D1_CTX16K_FIXTURE, D1_CTX32K_FIXTURE, D1_CTX64K_FIXTURE):
+    for fixture in (
+        W1_S_FIXTURE,
+        W1_S_FIXTURE_N128,
+        D1_CTX16K_FIXTURE,
+        D1_CTX32K_FIXTURE,
+        D1_CTX64K_FIXTURE,
+        CTX128K_FIXTURE,
+        CTX200K_FIXTURE,
+        CTX256K_FIXTURE,
+    ):
         out_path = FIXTURES_DIR / fixture.path
         if out_path.exists():
             print(f"skip (already exists, frozen): {out_path}")

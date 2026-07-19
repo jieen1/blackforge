@@ -56,6 +56,18 @@ SM120_VLLM_INTEGRATION = "/home/bot/project/sm120-flash-attention/vllm_integrati
 MODEL = "unsloth/Qwen3.6-27B-NVFP4"
 K = 3
 
+# 2026-07-19, 256K-feasibility task: confirmed from the real checkpoint's
+# config.json (text_config.max_position_embeddings) -- this model's own
+# native RoPE ("default" rope_type, no YaRN/NTK scaling configured) supports
+# AT MOST this many total positions. Capping max_model_len here (rather than
+# letting the max(40960, prompt_len+max_tokens+1024) formula below exceed it
+# for the ctx256k fixture) avoids passing vLLM an out-of-architectural-range
+# max_model_len -- not merely a config nicety, since going beyond this figure
+# would be genuinely out-of-distribution for the model's trained/supported
+# context, not just an engineering inconvenience. Never binds for any
+# existing (<=64K) fixture.
+_MODEL_MAX_POSITION_EMBEDDINGS = 262144
+
 
 def _gpu_thermal() -> dict:
     out = subprocess.run(
@@ -353,6 +365,9 @@ def _run_once(
     import register_sm120_backend  # noqa: F401
 
     from benchmarks.workloads import (
+        CTX128K_FIXTURE,
+        CTX200K_FIXTURE,
+        CTX256K_FIXTURE,
         D1_CTX16K_FIXTURE,
         D1_CTX32K_FIXTURE,
         D1_CTX64K_FIXTURE,
@@ -371,29 +386,29 @@ def _run_once(
         # these two.
         "ctx16k": D1_CTX16K_FIXTURE,
         "ctx32k": D1_CTX32K_FIXTURE,
-        # 2026-07-18, D1 sweep continuation: wired for completeness, but see
-        # workloads.py's D1_CTX64K_FIXTURE docstring -- this runtime's fixed
-        # blocks_per_slot=2560 (40960-token/slot capacity, hardcoded just
-        # below) is SMALLER than a single 65536-token prompt, so a real run
-        # against this fixture will raise a capacity RuntimeError during
-        # prefill, at ANY concurrency, until blocks_per_slot is deliberately
-        # raised (a real, structurally bigger config change, not made here --
-        # see notes/2026-07-18-session-review-and-next-steps.md §16).
         "ctx64k": D1_CTX64K_FIXTURE,
+        # 2026-07-19, multi-agent-coding 256K-feasibility task: see
+        # workloads.py's own docstring on these three (num_requests=4, not
+        # 16, deliberately).
+        "ctx128k": CTX128K_FIXTURE,
+        "ctx200k": CTX200K_FIXTURE,
+        "ctx256k": CTX256K_FIXTURE,
     }[fixture_key]
-    if fixture_key == "ctx64k" and blocks_per_slot * 16 < fixture.prompt_len + max_tokens:
-        # 2026-07-18/19, D1 64K-capacity-raise task (notes/2026-07-18-
-        # session-review-and-next-steps.md section 16): a 65536-token prompt
-        # exceeds the default 40960-token/slot capacity (blocks_per_slot=2560
-        # * block_size=16) during prefill alone, at ANY concurrency -- fail
-        # fast with a clear message instead of the generic capacity
-        # RuntimeError from deep inside build_attention_metadata_batch.
+    # 2026-07-18/19, D1 64K-capacity-raise task (notes/2026-07-18-
+    # session-review-and-next-steps.md section 16), generalized 2026-07-19
+    # from a ctx64k-only special case to ANY fixture: this runtime's
+    # per-slot KV-cache capacity ceiling is blocks_per_slot*block_size
+    # tokens -- a prompt that exceeds it fails during prefill alone, at ANY
+    # concurrency (the check is per-slot, not per-batch). Fail fast with a
+    # clear, actionable message instead of the generic RuntimeError from
+    # deep inside build_attention_metadata_batch mid-prefill.
+    if blocks_per_slot * 16 < fixture.prompt_len + max_tokens:
         raise SystemExit(
-            f"--fixture ctx64k needs --blocks-per-slot >= "
+            f"--fixture {fixture_key} needs --blocks-per-slot >= "
             f"{-(-(fixture.prompt_len + max_tokens) // 16)} (current "
             f"blocks_per_slot={blocks_per_slot} only covers "
             f"{blocks_per_slot * 16} tokens/slot); pass --blocks-per-slot "
-            f"explicitly (e.g. 5120) for this fixture."
+            f"explicitly for this fixture."
         )
     prompts = load_prompt_token_ids(fixture)
     if num_requests is not None:
@@ -404,7 +419,9 @@ def _run_once(
     vllm_config = build_vllm_config(
         model=MODEL,
         kv_cache_dtype="fp8_e4m3",
-        max_model_len=max(40960, fixture.prompt_len + max_tokens + 1024),
+        max_model_len=min(
+            max(40960, fixture.prompt_len + max_tokens + 1024), _MODEL_MAX_POSITION_EMBEDDINGS
+        ),
         gpu_memory_utilization=0.85,
         speculative_config={"method": "mtp", "num_speculative_tokens": K, "attention_backend": "CUSTOM"},
     )
@@ -460,7 +477,11 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--concurrency", type=int, default=4)
-    parser.add_argument("--fixture", choices=["n16", "n128", "ctx16k", "ctx32k", "ctx64k"], default="n16")
+    parser.add_argument(
+        "--fixture",
+        choices=["n16", "n128", "ctx16k", "ctx32k", "ctx64k", "ctx128k", "ctx200k", "ctx256k"],
+        default="n16",
+    )
     parser.add_argument("--num-requests", type=int, default=None)
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument(
