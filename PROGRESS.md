@@ -2,6 +2,18 @@
 
 Updated: 2026-07-19
 
+## Handoff note (read this first if you're a new session in this repo)
+
+`notes/2026-07-19-prefix-cache-p2-codex-handoff.md` — P0/P1 of the prefix-
+cache build are done (below); P2 (fan-out fork) is next, to be implemented
+by Codex per the user's explicit directive. A prior dispatch attempt from a
+*different* coordinating session (rooted in a sibling repo) hit two real,
+root-caused bugs: a workspace-root mismatch (fixed by running from this
+directory directly, which you're presumably already doing) and a
+**hardcoded, non-fixable lack of GPU access in the Codex sandbox** (verify
+this doesn't recur before trusting any Codex-authored GPU test results —
+see the handoff doc for the fallback plan if it does).
+
 ## Completed
 
 ### Prefix-cache P1 — dynamic free-list allocator + reference counting (2026-07-19)
