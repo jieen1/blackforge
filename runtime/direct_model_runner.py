@@ -55,6 +55,24 @@ def _physical_slot(logical_slot: int) -> int:
     return logical_slot + RESERVED_PHYSICAL_SLOTS
 
 
+def _initial_block_table(logical_slot: int, blocks_per_slot: int) -> list[int]:
+    """P0 "thin allocator" (``notes/prefix-cache-design.md`` sec 5, P0 --
+    block-table indirection substrate): hands out the SAME contiguous
+    physical block ids the arange-based addressing has always used --
+    ``[first_block, first_block + blocks_per_slot)`` where ``first_block =
+    _physical_slot(logical_slot) * blocks_per_slot``. This is the only
+    thing P1's dynamic free-list allocator will change; every downstream
+    consumer (``build_attention_metadata``/``_batch``, ``_slot_mapping``/
+    ``_batch``, ``CapturedBatchDecodeGraph``/``CapturedMTPDraftStepGraph``
+    ``._fill_buffers``) reads ``block_table[slot]`` without caring how it
+    was populated -- behavior-identical by construction, since the values
+    returned here are byte-identical to what the old formula computed
+    inline.
+    """
+    first_block = _physical_slot(logical_slot) * blocks_per_slot
+    return list(range(first_block, first_block + blocks_per_slot))
+
+
 def _ssm_spec_row(logical_slot: int, col: int, total_physical_slots: int, num_spec: int) -> int:
     """Physical SSM-state row for MTP verify's K+1 candidate positions
     (Phase 2, 2026-07-18 -- ``notes/2026-07-17-post-ragged-round-next-steps.md``
@@ -175,6 +193,7 @@ def build_attention_metadata(
     block_size: int,
     blocks_per_slot: int,
     device: torch.device,
+    block_table: list[int] | None = None,
 ) -> SM120GQAMetadata:
     """Hand-built SM120GQAMetadata for one request in one fixed slot. Shared
     between ``DirectModelRunner`` (which tracks ``prior_kv_len`` itself via
@@ -184,6 +203,15 @@ def build_attention_metadata(
     ``CommonAttentionMetadata`` instead) -- this is deliberately the exact
     same field-construction logic in both cases, so Stage C tests whether
     *this logic* is correct, not a second, independently-written copy of it.
+
+    ``block_table`` (P0, 2026-07-19, ``notes/prefix-cache-design.md`` sec
+    5): optional per-slot list of physical block ids, indexed by LOGICAL
+    page position. ``None`` (the default) preserves the exact prior
+    arange-based addressing byte-for-byte -- required for
+    ``runtime/vllm_stage_c_baseline.py``, which does not pass this
+    parameter and must remain untouched. ``DirectModelRunner`` passes its
+    own ``self.block_table[slot]`` here only when constructed with
+    ``enable_block_table=True``.
     """
     new_kv_len = prior_kv_len + num_new_tokens
     page_size = block_size
@@ -196,9 +224,14 @@ def build_attention_metadata(
         )
     qo_indptr = torch.tensor([0, num_new_tokens], dtype=torch.int32, device=device)
     kv_page_indptr = torch.tensor([0, num_pages], dtype=torch.int32, device=device)
-    kv_page_indices = torch.arange(
-        first_block, first_block + num_pages, dtype=torch.int32, device=device
-    )
+    if block_table is not None:
+        kv_page_indices = torch.tensor(
+            block_table[:num_pages], dtype=torch.int32, device=device
+        )
+    else:
+        kv_page_indices = torch.arange(
+            first_block, first_block + num_pages, dtype=torch.int32, device=device
+        )
     last_page_len = new_kv_len - (num_pages - 1) * page_size
     kv_last_page_len = torch.tensor([last_page_len], dtype=torch.int32, device=device)
     return SM120GQAMetadata(
@@ -306,6 +339,7 @@ def build_attention_metadata_batch(
     is_decode: bool = True,
     fixed_kv_split_size: int | None = None,
     fixed_max_num_splits: int | None = None,
+    block_tables: list[list[int]] | None = None,
 ) -> SM120GQAMetadata:
     """Hand-built SM120GQAMetadata for a real batch of requests spanning
     multiple fixed physical slots in a SINGLE metadata object, each
@@ -423,6 +457,13 @@ def build_attention_metadata_batch(
     query lengths within one batched call are exactly its designed use
     case, not new territory for the kernel itself, only for how THIS
     project's Python-side metadata construction reaches it.
+
+    ``block_tables`` (P0, 2026-07-19, ``notes/prefix-cache-design.md`` sec
+    5): optional list of per-slot physical block-id lists, ONE per entry in
+    ``slots`` (same order), each indexed by LOGICAL page position. ``None``
+    (the default) preserves the exact prior arange-based addressing
+    byte-for-byte. Passed by ``DirectModelRunner`` only when constructed
+    with ``enable_block_table=True``.
     """
     num_reqs = len(slots)
     if len(prior_kv_lens) != num_reqs:
@@ -452,15 +493,23 @@ def build_attention_metadata_batch(
         kv_page_indptr_list.append(kv_page_indptr_list[-1] + num_pages)
     kv_page_indptr = torch.tensor(kv_page_indptr_list, dtype=torch.int32, device=device)
 
-    page_index_chunks = [
-        torch.arange(
-            _physical_slot(slot) * blocks_per_slot,
-            _physical_slot(slot) * blocks_per_slot + num_pages,
-            dtype=torch.int32,
-            device=device,
-        )
-        for slot, num_pages in zip(slots, num_pages_per_req)
-    ]
+    if block_tables is not None:
+        if len(block_tables) != num_reqs:
+            raise ValueError("block_tables must have exactly one entry per slot")
+        page_index_chunks = [
+            torch.tensor(table[:num_pages], dtype=torch.int32, device=device)
+            for table, num_pages in zip(block_tables, num_pages_per_req)
+        ]
+    else:
+        page_index_chunks = [
+            torch.arange(
+                _physical_slot(slot) * blocks_per_slot,
+                _physical_slot(slot) * blocks_per_slot + num_pages,
+                dtype=torch.int32,
+                device=device,
+            )
+            for slot, num_pages in zip(slots, num_pages_per_req)
+        ]
     kv_page_indices = (
         torch.cat(page_index_chunks) if page_index_chunks else torch.empty(0, dtype=torch.int32, device=device)
     )
@@ -843,6 +892,7 @@ class DirectModelRunner:
         block_size: int = 16,
         blocks_per_slot: int = 128,
         enable_cudagraph: bool = False,
+        enable_block_table: bool = False,
     ) -> None:
         # 2026-07-18, D3 memory-growth fix: this whole class is a pure
         # inference runtime (never computes a backward pass) but, unlike
@@ -877,6 +927,26 @@ class DirectModelRunner:
         self.blocks_per_slot = blocks_per_slot
         self.device = torch.device("cuda:0")
         torch.cuda.set_device(self.device)
+
+        # P0 (2026-07-19, notes/prefix-cache-design.md sec 5 -- "P0 --
+        # block-table indirection substrate"): block_table[slot] is a
+        # per-logical-slot list of physical block ids, indexed by logical
+        # page position. Initialized here to the SAME contiguous range the
+        # old arange-based formula always computed (_initial_block_table
+        # is the "thin allocator" this phase introduces -- P1 replaces its
+        # body with a real dynamic free-list allocator, nothing else).
+        # Built unconditionally (cheap: num_slots small Python lists) so
+        # the dedicated equivalence test can check it regardless of
+        # enable_block_table; only CONSULTED by the metadata/slot-mapping/
+        # CUDA-graph-fill code paths below when enable_block_table=True.
+        # Default False preserves every existing caller's behavior
+        # byte-for-byte (this project's established feature-flag
+        # convention -- see enable_cudagraph above) -- P0 is a pure
+        # indirection substrate, not yet a behavior change either way.
+        self.enable_block_table = enable_block_table
+        self.block_table: list[list[int]] = [
+            _initial_block_table(slot, blocks_per_slot) for slot in range(num_slots)
+        ]
 
         # 2026-07-17, Phase 3 (notes/2026-07-17-post-ragged-round-next-steps.md):
         # OPT-IN, default False -- preserves every existing caller's
@@ -1248,6 +1318,7 @@ class DirectModelRunner:
             block_size=self.block_size,
             blocks_per_slot=self.blocks_per_slot,
             device=self.device,
+            block_table=self.block_table[slot] if self.enable_block_table else None,
         )
 
     def _gdn_metadata(
@@ -1268,11 +1339,19 @@ class DirectModelRunner:
         ``forward_context.slot_mapping[layer_name]``, NOT from
         ``attn_metadata`` -- easy to miss, and missing it means K/V are never
         written into the cache at all)."""
-        first_block = _physical_slot(slot) * self.blocks_per_slot
         positions = torch.arange(
             start_pos, start_pos + num_new_tokens, dtype=torch.long, device=self.device
         )
-        block_ids = first_block + positions // self.block_size
+        if self.enable_block_table:
+            table = self.block_table[slot]
+            block_ids = torch.tensor(
+                [table[p // self.block_size] for p in range(start_pos, start_pos + num_new_tokens)],
+                dtype=torch.long,
+                device=self.device,
+            )
+        else:
+            first_block = _physical_slot(slot) * self.blocks_per_slot
+            block_ids = first_block + positions // self.block_size
         offsets = positions % self.block_size
         return (block_ids * self.block_size + offsets).to(torch.long)
 
@@ -1362,14 +1441,24 @@ class DirectModelRunner:
         qo_lens = [qo_len] * num_reqs if isinstance(qo_len, int) else list(qo_len)
         positions = [kv_len + j for kv_len, qo in zip(kv_lengths, qo_lens) for j in range(qo)]
         slots_per_token = [slot for slot, qo in zip(slots, qo_lens) for _ in range(qo)]
-        block_ids = torch.tensor(
-            [
-                _physical_slot(slot) * self.blocks_per_slot + pos // self.block_size
-                for slot, pos in zip(slots_per_token, positions)
-            ],
-            dtype=torch.long,
-            device=self.device,
-        )
+        if self.enable_block_table:
+            block_ids = torch.tensor(
+                [
+                    self.block_table[slot][pos // self.block_size]
+                    for slot, pos in zip(slots_per_token, positions)
+                ],
+                dtype=torch.long,
+                device=self.device,
+            )
+        else:
+            block_ids = torch.tensor(
+                [
+                    _physical_slot(slot) * self.blocks_per_slot + pos // self.block_size
+                    for slot, pos in zip(slots_per_token, positions)
+                ],
+                dtype=torch.long,
+                device=self.device,
+            )
         offsets = torch.tensor(
             [pos % self.block_size for pos in positions], dtype=torch.long, device=self.device
         )
@@ -1570,6 +1659,9 @@ class DirectModelRunner:
             is_decode=is_decode,
             fixed_kv_split_size=fixed_kv_split_size,
             fixed_max_num_splits=fixed_max_num_splits,
+            block_tables=(
+                [self.block_table[s] for s in slot_ids] if self.enable_block_table else None
+            ),
         )
         if gdn_spec_num_accepted_tokens_prev is not None:
             if not isinstance(qo_len, int):
@@ -1988,6 +2080,7 @@ class DirectModelRunner:
             block_size=self.block_size,
             blocks_per_slot=self.blocks_per_slot,
             device=self.device,
+            block_table=self.block_table[slot] if self.enable_block_table else None,
         )
         attn_metadata_dict = {name: attn_meta for name in self.mtp_attn_layer_names}
         slot_mapping = self._slot_mapping(slot, start_pos, num_new_tokens)
@@ -2330,6 +2423,9 @@ class DirectModelRunner:
             # max_num_splits=1.
             fixed_kv_split_size=self.decode_fixed_kv_split_size,
             fixed_max_num_splits=self.decode_fixed_max_num_splits,
+            block_tables=(
+                [self.block_table[s] for s in slots] if self.enable_block_table else None
+            ),
         )
         attn_metadata_dict = {name: attn_meta for name in self.mtp_attn_layer_names}
         # Reuses ``_slot_mapping_batch`` (built for the target model's own
@@ -3412,8 +3508,11 @@ class CapturedBatchDecodeGraph:
 
         page_indices_list: list[int] = []
         for slot, num_pages in zip(slot_ids, num_pages_per_req):
-            first_block = _physical_slot(slot) * blocks_per_slot
-            page_indices_list.extend(range(first_block, first_block + num_pages))
+            if runner.enable_block_table:
+                page_indices_list.extend(runner.block_table[slot][:num_pages])
+            else:
+                first_block = _physical_slot(slot) * blocks_per_slot
+                page_indices_list.extend(range(first_block, first_block + num_pages))
 
         last_page_len_list = [
             kv_len - (num_pages - 1) * block_size
@@ -3424,10 +3523,11 @@ class CapturedBatchDecodeGraph:
 
         slot_mapping_list: list[int] = []
         for slot, kv_len in zip(slot_ids, kv_lengths):
+            table = runner.block_table[slot] if runner.enable_block_table else None
             first_block = _physical_slot(slot) * blocks_per_slot
             for j in range(qo_len):
                 pos = kv_len + j
-                block_id = first_block + pos // block_size
+                block_id = table[pos // block_size] if table is not None else first_block + pos // block_size
                 offset = pos % block_size
                 slot_mapping_list.append(block_id * block_size + offset)
 
@@ -3826,18 +3926,22 @@ class CapturedMTPDraftStepGraph:
             kv_page_indptr_list.append(kv_page_indptr_list[-1] + num_pages)
         page_indices_list: list[int] = []
         for slot, num_pages in zip(slot_ids, num_pages_per_req):
-            first_block = _physical_slot(slot) * blocks_per_slot
-            page_indices_list.extend(range(first_block, first_block + num_pages))
+            if runner.enable_block_table:
+                page_indices_list.extend(runner.block_table[slot][:num_pages])
+            else:
+                first_block = _physical_slot(slot) * blocks_per_slot
+                page_indices_list.extend(range(first_block, first_block + num_pages))
         last_page_len_list = [
             kv_len - (num_pages - 1) * block_size for kv_len, num_pages in zip(new_kv_lens, num_pages_per_req)
         ]
         positions_list = [kv_len + j for kv_len in kv_lengths for j in range(qo_len)]
         slot_mapping_list = []
         for slot, kv_len in zip(slot_ids, kv_lengths):
+            table = runner.block_table[slot] if runner.enable_block_table else None
             first_block = _physical_slot(slot) * blocks_per_slot
             for j in range(qo_len):
                 pos = kv_len + j
-                block_id = first_block + pos // block_size
+                block_id = table[pos // block_size] if table is not None else first_block + pos // block_size
                 offset = pos % block_size
                 slot_mapping_list.append(block_id * block_size + offset)
 

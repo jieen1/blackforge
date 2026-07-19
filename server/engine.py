@@ -52,6 +52,7 @@ import os
 import sys
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -62,6 +63,29 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 SM120_VLLM_INTEGRATION = "/home/bot/project/sm120-flash-attention/vllm_integration"
 
 logger = logging.getLogger("qwen_sm120_server.engine")
+
+# P0 (2026-07-19, notes/prefix-cache-design.md sec 5 -- instrumentation
+# only, no caching logic): bounded window sizes for the prompt-prefix-
+# overlap logging §25.9 recommended building BEFORE committing to P2/P3
+# engineering, so real traffic can tell us which sharing pattern (§1.1's
+# fan-out vs. sequential-growth vs. incidental cross-request) actually
+# dominates on this machine.
+_PREFIX_OVERLAP_HISTORY = 64
+_PREFIX_OVERLAP_SAMPLES_KEPT = 200
+
+
+def _longest_common_prefix_len(a: list[int], b: list[int]) -> int:
+    """Exact token-id longest-common-prefix length -- the same notion of
+    "shared prefix" the eventual chained-block-hash cache (P3) will use,
+    just without the hashing/blocking machinery this early. O(min(len(a),
+    len(b))) worst case, O(1) in the common no-overlap case (stops at the
+    first mismatch)."""
+    n = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        n += 1
+    return n
 
 
 @dataclass
@@ -167,6 +191,15 @@ class ServerEngine:
         self._stop = False
         self._task: asyncio.Task | None = None
 
+        # P0 (2026-07-19, notes/prefix-cache-design.md sec 5 --
+        # instrumentation only, no caching logic): bounded rolling window of
+        # recently-admitted requests' own prompt token ids, consulted by
+        # _log_prefix_overlap to measure real prompt-prefix overlap against
+        # requests admitted in EARLIER rounds (pattern B / incidental
+        # cross-request sharing). Same-round fan-out (pattern A) is
+        # measured directly from admit_now, no history needed for that case.
+        self._recent_prompts: deque[tuple[str, list[int]]] = deque(maxlen=_PREFIX_OVERLAP_HISTORY)
+
         # Observability only -- proves real batching happened (item 4 of
         # this task), not a correctness signal by itself.
         self.stats: dict[str, Any] = {
@@ -178,6 +211,16 @@ class ServerEngine:
             "bootstrap_checks_failed": 0,
             "bootstrap_failures": [],
             "requests_completed": 0,
+            # P0 prompt-prefix-overlap logging (§25.9's cheap recommendation
+            # -- instrumentation only, never consulted by admission/
+            # scheduling/generation logic in this phase): a bounded log of
+            # per-admitted-request overlap samples, plus running counts of
+            # how many admissions had at least one full block_size worth of
+            # overlap against another same-round request (pattern A) or a
+            # recently-admitted earlier request (pattern B / incidental).
+            "prefix_overlap_samples": [],
+            "prefix_overlap_same_round_events": 0,
+            "prefix_overlap_history_events": 0,
         }
 
     # -- lifecycle -----------------------------------------------------
@@ -260,6 +303,55 @@ class ServerEngine:
             )
             logger.warning("admission bootstrap check FAILED for request %s: %s", req.request_id, diag)
 
+    def _log_prefix_overlap(self, admit_now: list[tuple[int, GenerationRequest]]) -> None:
+        """P0 instrumentation (2026-07-19, notes/prefix-cache-design.md sec
+        5 -- §25.9's cheap recommendation): for each request in THIS
+        round's admission batch, measure its longest-common-token-prefix
+        overlap against (a) every OTHER request admitted in the same round
+        (pattern A -- simultaneous fan-out, §1.1) and (b) every recently-
+        admitted request from an EARLIER round still held in
+        ``self._recent_prompts`` (pattern B -- sequential per-conversation
+        growth, and incidental cross-request sharing, §1.1). Purely
+        additive to ``self.stats``; reads no cache, writes no cache, and
+        never affects admission/scheduling/generation behavior -- the
+        whole point is to gather real hit-rate/pattern data on THIS
+        machine's actual traffic before committing engineering to P2/P3.
+        """
+        new_prompts = [(req.request_id, req.prompt_ids) for _, req in admit_now]
+        for i, (rid, prompt) in enumerate(new_prompts):
+            same_round_best = 0
+            for j, (_other_rid, other_prompt) in enumerate(new_prompts):
+                if j == i:
+                    continue
+                same_round_best = max(same_round_best, _longest_common_prefix_len(prompt, other_prompt))
+
+            history_best = 0
+            history_best_rid: str | None = None
+            for other_rid, other_prompt in self._recent_prompts:
+                overlap = _longest_common_prefix_len(prompt, other_prompt)
+                if overlap > history_best:
+                    history_best = overlap
+                    history_best_rid = other_rid
+
+            self.stats["prefix_overlap_samples"].append(
+                {
+                    "request_id": rid,
+                    "prompt_tokens": len(prompt),
+                    "same_round_overlap_tokens": same_round_best,
+                    "history_overlap_tokens": history_best,
+                    "history_overlap_source": history_best_rid,
+                }
+            )
+            if len(self.stats["prefix_overlap_samples"]) > _PREFIX_OVERLAP_SAMPLES_KEPT:
+                self.stats["prefix_overlap_samples"].pop(0)
+            if same_round_best >= self.block_size:
+                self.stats["prefix_overlap_same_round_events"] += 1
+            if history_best >= self.block_size:
+                self.stats["prefix_overlap_history_events"] += 1
+
+        for rid, prompt in new_prompts:
+            self._recent_prompts.append((rid, prompt))
+
     def _finish_request(self, slot: int, req: GenerationRequest, committed_tokens: list[int], finish_reason: str) -> None:
         """Resolve ``req``'s future and release ``slot`` back to the free
         pool. Shared by both the admission-time immediate-finish edge cases
@@ -333,6 +425,7 @@ class ServerEngine:
             else:
                 self.stats["admissions"] += 1
                 self.stats["admission_batch_sizes"].append(len(admit_now))
+                self._log_prefix_overlap(admit_now)
 
                 for slot, req in admit_now:
                     anchor = prefill_result[slot]["anchor"]

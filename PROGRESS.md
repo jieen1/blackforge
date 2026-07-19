@@ -4,6 +4,35 @@ Updated: 2026-07-19
 
 ## Completed
 
+### Prefix-cache P0 — block-table indirection substrate, behavior-identical (2026-07-19)
+
+Full design at `notes/prefix-cache-design.md` (P0-P4 phased plan); this
+round implements **P0 only**. Introduced `DirectModelRunner.block_table
+[slot]`, a per-slot physical-block-id list initialized by a new thin
+allocator (`_initial_block_table`) to the SAME contiguous range the old
+`arange`-based formula always computed, routed through the design doc's
+four named touch-points (`build_attention_metadata`/`_batch` read path,
+`_slot_mapping`/`_batch` write path, `CapturedBatchDecodeGraph
+._fill_buffers` CUDA-graph path, plus `CapturedMTPDraftStepGraph
+._fill_buffers` fixed with the same pattern for consistency) behind a new
+`enable_block_table` flag (default `False`, this project's established
+feature-flag convention). Also added prompt-prefix-overlap logging to
+`server/engine.py`'s `self.stats` (§25.9's cheap recommendation) to start
+gathering real fan-out-vs-sequential-growth hit-rate data. GDN,
+`_physical_slot`, and reserved-slot-0 untouched, per the design doc.
+
+**Verified bit-identical, zero regression**: new dedicated
+`benchmarks/prefix_cache_block_table_check.py` (arange-equivalence + 8
+real-GPU bytewise-equal checks across single-request/batched/CUDA-graph
+paths with the flag on vs. off) PASS; full `mtp_*_check.py` battery (all
+11) + `cudagraph_eager_parity_check.py` PASS; 4K/c=4 headline 3 reps —
+`total_committed_tokens=4116`/`draft_acceptance_rate_pct=70.29204431017119`
+bit-identical to the established baseline across all 3 reps;
+`mtp_verify_cudagraph_check.py` re-confirmed; bonus
+`cudagraph_decode_regression.py` (real capture+replay) PASS. Full detail:
+`notes/prefix-cache-implementation-log.md`'s "P0" section. Ready for P1
+(dynamic free-list allocator + refcounting).
+
 ### 256K/c=4 feasibility confirmed real and achievable; prefix-caching scoped (not built) (2026-07-19)
 
 Re-prioritization around the real target workload (multi-agent coding):
