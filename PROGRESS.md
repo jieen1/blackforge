@@ -1,8 +1,48 @@
 # Implementation Progress
 
-Updated: 2026-07-18
+Updated: 2026-07-19
 
 ## Completed
+
+### First working `server/`: real OpenAI-compatible HTTP server over `DirectModelRunner`, two real bugs found and fixed by its own E2E validation (2026-07-19)
+
+Closes the single highest-leverage gap an independent audit flagged this
+round: `server/` was an empty README -- 100% of this project's validated
+work was benchmark-harness-driven, never actually deployed anywhere.
+New: `server/engine.py` (`ServerEngine`, a continuous-batching wrapper
+around `DirectModelRunner`, directly adapted from
+`mtp_sustained_realistic_workload_check.py`'s `_run_sustained` admission/
+scheduling loop, driven by real HTTP requests instead of a synthetic
+schedule), `server/app.py` (FastAPI: non-streaming `POST /v1/chat/
+completions` + `POST /v1/completions`, greedy-only, defensive rejection
+of non-default temperature/top_p/n/stream and oversized prompts with
+clean 400s), and `benchmarks/server_e2e_check.py` (real end-to-end proof:
+a genuine loopback-HTTP round trip via `httpx` against a real uvicorn/
+ASGI server, independent single-slot-reference-replay correctness
+verification using this project's own established `NEAR_TIE_LOGIT_
+MARGIN=2.0` methodology, and a concurrent-batching proof showing
+`round_batch_sizes` reaching 4 -- full-capacity joint decode). Two real
+bugs found and fixed by this task's own E2E validation, not by code
+review: (1) `apply_chat_template(tokenize=True)` defaults to returning a
+`BatchEncoding`, not a plain token-id list, crashing the very first
+request -- fixed with `return_dict=False`; (2) `committed_tokens` never
+included each request's prefill-derived anchor token (the actual first
+generated token) -- a latent, byte-for-byte-identical gap already present
+in this project's own established benchmark scripts' bookkeeping, which
+never surfaced there since nothing before this task treated that
+content as load-bearing; this server is the first place it became the
+actual served response, turning a dormant quirk into a real, user-visible
+bug (completions missing their first token). Fixed by seeding
+`committed_tokens=[anchor]` at admission. Zero changes to
+`direct_model_runner.py`. Full regression battery: all 11 `benchmarks/
+mtp_*_check.py` scripts PASS; the 12th (`mtp_sustained_realistic_
+workload_check`) reproduced the already-documented §23.2 pool_size/
+capacity queueing-mismatch finding at smaller scale (not a new
+regression -- correctness/memory signals stayed healthy throughout its
+truncated run). 4K/c=4 headline re-confirmed: 154.870/143.580/145.914
+accepted tok/s across 3 reps, within this project's established
+measurement variance. Full writeup: `notes/2026-07-18-session-review-
+and-next-steps.md` section 24.
 
 ### The audit's P1 realistic-workload E2E test, run for real: 63.5 minutes / 7720 rounds with `enable_cudagraph=True` (2026-07-18)
 
