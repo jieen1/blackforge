@@ -17,6 +17,9 @@ multi-request batching -- this round's scope does not need).
 
 from __future__ import annotations
 
+from collections import deque
+from dataclasses import dataclass
+
 import torch
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.engine.arg_utils import EngineArgs
@@ -108,6 +111,125 @@ def _ssm_spec_row(logical_slot: int, col: int, total_physical_slots: int, num_sp
     if col == 0:
         return physical
     return total_physical_slots + physical * num_spec + (col - 1)
+
+
+@dataclass
+class Block:
+    """One physical attention-KV block. ``ref_cnt``/``block_hash`` are the
+    same fields ``notes/prefix-cache-design.md`` sec 3.2 specifies for
+    vLLM-v1-style block-pool bookkeeping -- ``block_hash`` is unused this
+    phase (P1 has no content-addressing/sharing yet; P3 populates it) but
+    kept on the dataclass now so P3 does not need to touch this class's
+    shape, only start writing the field."""
+
+    block_id: int
+    ref_cnt: int = 0
+    block_hash: object | None = None
+
+
+class BlockPool:
+    """Dynamic free-list allocator + reference counting over the shared
+    physical attention-KV block pool (``notes/prefix-cache-design.md`` sec
+    5, "P1 -- Dynamic free-list allocator + reference counting").
+
+    Replaces P0's ``_initial_block_table`` static per-slot partition (which
+    just handed every logical slot the SAME contiguous
+    ``[_physical_slot(slot) * blocks_per_slot, ...)`` range P0 was proven
+    behavior-identical with the old arange addressing): blocks are now
+    handed out from ONE shared free queue, on demand, to whichever slot
+    asks next -- so a single slot's own block ids may end up non-contiguous
+    over time (this is the intended, exercised behavior this phase proves
+    safe, not a defect).
+
+    **P1 scope, explicitly**: no content hashing, no sharing, no LRU
+    eviction of a still-hashed block -- those are P2/P3 (fan-out fork,
+    persistent content-addressed cache). Every block, once allocated, has
+    exactly ONE referencer for the whole of this phase (``ref_cnt`` is
+    always exactly 0 or 1) -- this is why P1's own behavior is still
+    identical to P0/pre-P0: nothing is ever shared. The plain FIFO free
+    queue (``collections.deque``, O(1) ``popleft``/``append``) is
+    sufficient for this phase's needs; P3's LRU-with-O(1)-middle-removal
+    ("revive an evictable block on a late hit") requirement is a superset
+    this class's external ``allocate``/``free`` API can grow into without
+    changing any caller.
+
+    **INV7 (reserved physical slot 0)**: physical block ids
+    ``[0, reserved)`` (``reserved=RESERVED_PHYSICAL_SLOTS`` by default,
+    i.e. just block 0) are carved out at construction and NEVER enter the
+    free queue via any path -- ``allocate``/``free`` both refuse to
+    hand out or accept a reserved id, so a caller bug cannot leak block 0
+    into real use, and neither can this class's own logic.
+    """
+
+    def __init__(self, num_blocks: int, reserved: int = RESERVED_PHYSICAL_SLOTS) -> None:
+        if reserved < 1:
+            raise ValueError("must reserve at least physical block 0 (INV7)")
+        if num_blocks <= reserved:
+            raise ValueError(f"num_blocks={num_blocks} must exceed reserved={reserved}")
+        self.num_blocks = num_blocks
+        self.reserved = reserved
+        self.blocks: list[Block] = [Block(block_id=i) for i in range(num_blocks)]
+        # Free queue: FIFO. Front (index 0, ``popleft()``) = allocate-next;
+        # tail (``append()``) = most-recently-freed. Excludes every
+        # reserved id by construction -- reserved ids are never appended by
+        # ``free`` either (guarded there too, defense in depth).
+        self._free_queue: deque[int] = deque(range(reserved, num_blocks))
+
+    def num_free_blocks(self) -> int:
+        return len(self._free_queue)
+
+    def allocate(self, n: int) -> list[int]:
+        """Pop ``n`` blocks from the free-queue front, set ``ref_cnt = 1``
+        on each, return their ids in pop order (oldest-free-first). Raises
+        if the pool cannot satisfy the request -- callers (``DirectModelRunner
+        ._ensure_blocks``) are expected to size the pool generously (this
+        project's existing ``num_blocks = (num_slots + RESERVED_PHYSICAL_SLOTS)
+        * blocks_per_slot`` sizing, unchanged from P0, already gives more
+        headroom than P0's static partition ever used, since P0 permanently
+        reserved a full ``blocks_per_slot``-sized region for physical slot
+        0 while this pool only excludes the single id ``reserved`` and
+        beyond)."""
+        if n < 0:
+            raise ValueError(f"cannot allocate a negative count ({n})")
+        if n > len(self._free_queue):
+            raise RuntimeError(
+                f"block pool exhausted: requested {n}, only "
+                f"{len(self._free_queue)} free (of {self.num_blocks - self.reserved} total, "
+                f"excluding {self.reserved} reserved)"
+            )
+        ids: list[int] = []
+        for _ in range(n):
+            block_id = self._free_queue.popleft()
+            if block_id < self.reserved:
+                raise RuntimeError(f"INV7 violation: reserved block {block_id} was in the free queue")
+            block = self.blocks[block_id]
+            if block.ref_cnt != 0:
+                raise RuntimeError(
+                    f"block {block_id} was in the free queue with ref_cnt={block.ref_cnt} != 0"
+                )
+            block.ref_cnt = 1
+            ids.append(block_id)
+        return ids
+
+    def free(self, block_ids: list[int]) -> None:
+        """Release blocks back to the pool: ``ref_cnt -= 1``; at 0,
+        append to the free-queue tail. P1 never shares a block (``ref_cnt``
+        is always exactly 1 before a free call here), so this always
+        drops straight to 0 and re-enters the queue -- written as a
+        decrement (not a hard reset to 0) so a future P2/P3 caller that
+        legitimately holds ``ref_cnt > 1`` is not silently masked by this
+        phase's code path."""
+        for block_id in block_ids:
+            if block_id < self.reserved:
+                raise RuntimeError(f"INV7 violation: attempted to free reserved block {block_id}")
+            if block_id >= self.num_blocks:
+                raise RuntimeError(f"block {block_id} is out of range (num_blocks={self.num_blocks})")
+            block = self.blocks[block_id]
+            if block.ref_cnt <= 0:
+                raise RuntimeError(f"double-free of block {block_id} (ref_cnt={block.ref_cnt})")
+            block.ref_cnt -= 1
+            if block.ref_cnt == 0:
+                self._free_queue.append(block_id)
 
 
 def _ensure_sm120_backend_registered() -> None:
@@ -931,22 +1053,48 @@ class DirectModelRunner:
         # P0 (2026-07-19, notes/prefix-cache-design.md sec 5 -- "P0 --
         # block-table indirection substrate"): block_table[slot] is a
         # per-logical-slot list of physical block ids, indexed by logical
-        # page position. Initialized here to the SAME contiguous range the
-        # old arange-based formula always computed (_initial_block_table
-        # is the "thin allocator" this phase introduces -- P1 replaces its
-        # body with a real dynamic free-list allocator, nothing else).
-        # Built unconditionally (cheap: num_slots small Python lists) so
-        # the dedicated equivalence test can check it regardless of
-        # enable_block_table; only CONSULTED by the metadata/slot-mapping/
-        # CUDA-graph-fill code paths below when enable_block_table=True.
-        # Default False preserves every existing caller's behavior
-        # byte-for-byte (this project's established feature-flag
-        # convention -- see enable_cudagraph above) -- P0 is a pure
-        # indirection substrate, not yet a behavior change either way.
+        # page position. Built unconditionally (cheap: num_slots small
+        # Python lists) so the dedicated equivalence tests can check it
+        # regardless of enable_block_table; only CONSULTED by the
+        # metadata/slot-mapping/CUDA-graph-fill code paths below when
+        # enable_block_table=True. Default False preserves every existing
+        # caller's behavior byte-for-byte (this project's established
+        # feature-flag convention -- see enable_cudagraph above).
+        #
+        # P1 (2026-07-19, notes/prefix-cache-design.md sec 5 -- "P1 --
+        # Dynamic free-list allocator + reference counting"): P0's
+        # ``_initial_block_table`` static per-slot partition (every slot
+        # pre-populated with its own fixed contiguous blocks_per_slot-sized
+        # range, byte-identical to the old arange addressing) is REPLACED
+        # here by a real ``BlockPool`` -- a free queue + ref-counting
+        # allocator over the shared pool of physical blocks, excluding
+        # reserved physical block 0 (INV7). Every slot now starts with an
+        # EMPTY block_table and grows it ON DEMAND (see ``_ensure_blocks``,
+        # called from every attention-metadata/slot-mapping/CUDA-graph-fill
+        # call site that used to just read ``self.block_table[slot]``
+        # as-is) as its kv_len actually grows, instead of every slot
+        # permanently reserving its whole blocks_per_slot capacity
+        # up front. ``_initial_block_table`` itself is kept, UNCHANGED, as
+        # a standalone function -- ``benchmarks/prefix_cache_block_table_
+        # check.py``'s arange-equivalence check still imports and calls it
+        # directly (it never was, and still isn't, about what
+        # DirectModelRunner's own initial state looks like) -- it is simply
+        # no longer what populates ``self.block_table`` here.
+        #
+        # Still NO cross-slot sharing this phase: every block, once
+        # allocated, has exactly one referencer (``Block.ref_cnt`` is
+        # always 0 or 1) -- see ``BlockPool``'s docstring. This is what
+        # keeps end-to-end *behavior* identical to P0/pre-P0 while making
+        # *placement* genuinely dynamic (a single slot's own blocks may be
+        # non-contiguous after any churn of allocate/free cycles -- the
+        # thing this phase's own dedicated tests prove the block-table +
+        # CUDA-graph path tolerates, not just P0's trivial contiguous case).
         self.enable_block_table = enable_block_table
-        self.block_table: list[list[int]] = [
-            _initial_block_table(slot, blocks_per_slot) for slot in range(num_slots)
-        ]
+        self.block_table: list[list[int]] = [[] for _ in range(num_slots)]
+        self.block_pool = BlockPool(
+            num_blocks=(num_slots + RESERVED_PHYSICAL_SLOTS) * blocks_per_slot,
+            reserved=RESERVED_PHYSICAL_SLOTS,
+        )
 
         # 2026-07-17, Phase 3 (notes/2026-07-17-post-ragged-round-next-steps.md):
         # OPT-IN, default False -- preserves every existing caller's
@@ -1307,9 +1455,47 @@ class DirectModelRunner:
                 device=self.device,
             )
 
+    def _ensure_blocks(self, slot: int, kv_len_needed: int) -> None:
+        """P1 (notes/prefix-cache-design.md sec 5): grow
+        ``self.block_table[slot]`` on demand from ``self.block_pool`` so it
+        holds at least ``ceil(kv_len_needed / self.block_size)`` physical
+        block ids -- called from every code path that is about to build
+        attention metadata / a slot-mapping / a CUDA-graph fill for a write
+        or read up to position ``kv_len_needed`` (single-request and
+        batched target-model forward, single-request and batched MTP
+        draft-model forward, both captured-graph ``_fill_buffers``
+        methods). A no-op when the table already covers the request -- the
+        common per-token-decode-step case, which only needs a fresh
+        physical block once every ``block_size`` tokens, not every call.
+
+        Every call site gates on ``self.enable_block_table`` before calling
+        this (matching this file's existing per-call-site flag-branch
+        convention) -- this method itself always consults ``self
+        .block_pool`` unconditionally once called, it does not re-check the
+        flag.
+
+        Raises the same ``RuntimeError`` message shape as
+        ``build_attention_metadata``/``_batch``'s own capacity check when
+        ``kv_len_needed`` would need more than ``self.blocks_per_slot``
+        pages -- checked here too (not just left to the metadata builder to
+        catch after the fact) so a request that will be rejected anyway
+        never consumes a block from the shared pool first."""
+        num_pages_needed = (kv_len_needed + self.block_size - 1) // self.block_size
+        if num_pages_needed > self.blocks_per_slot:
+            raise RuntimeError(
+                f"slot {slot} kv_len {kv_len_needed} exceeds this slot's "
+                f"{self.blocks_per_slot * self.block_size}-token capacity"
+            )
+        table = self.block_table[slot]
+        grow_by = num_pages_needed - len(table)
+        if grow_by > 0:
+            table.extend(self.block_pool.allocate(grow_by))
+
     def _attention_metadata(
         self, slot: int, *, num_new_tokens: int, is_decode: bool
     ) -> SM120GQAMetadata:
+        if self.enable_block_table:
+            self._ensure_blocks(slot, self.slot_kv_len[slot] + num_new_tokens)
         return build_attention_metadata(
             prior_kv_len=self.slot_kv_len[slot],
             num_new_tokens=num_new_tokens,
@@ -1649,6 +1835,14 @@ class DirectModelRunner:
             if not self.slot_gdn_initialized[slot] and kv_len != 0:
                 raise RuntimeError(f"slot {slot} has no GDN state yet (needs a prior prefill)")
 
+        # P1 (notes/prefix-cache-design.md sec 5): grow every listed slot's
+        # block_table to cover this call's own new_kv_len (kv_len + qo)
+        # BEFORE building metadata/slot-mapping below, which both read
+        # self.block_table[slot] as-is.
+        if self.enable_block_table:
+            for slot, kv_len, qo in zip(slot_ids, kv_lengths, qo_lens):
+                self._ensure_blocks(slot, kv_len + qo)
+
         attn_meta = build_attention_metadata_batch(
             slots=slot_ids,
             prior_kv_lens=kv_lengths,
@@ -1840,7 +2034,22 @@ class DirectModelRunner:
         ever reused (which is this project's whole fixed-slot-generation
         premise). Now cleared alongside the pre-existing fields, matching
         the same "every persistent per-slot MTP field must be reset on
-        reuse" discipline."""
+        reuse" discipline.
+
+        **P1 (2026-07-19, notes/prefix-cache-design.md sec 5, design doc's
+        risk R10)**: also releases this slot's own physical attention
+        blocks back to ``self.block_pool`` (``ref_cnt -= 1``, re-enters the
+        free queue at 0) and clears ``self.block_table[slot]`` to ``[]`` --
+        without this, P1's on-demand allocator would leak a block every
+        time a slot is reused (``_ensure_blocks`` only ever grows, it never
+        shrinks). Driven by ``self.block_table[slot]``'s own CONTENTS, not
+        ``self.enable_block_table``'s current value -- correct regardless
+        of whether the flag was on when these blocks were allocated (a
+        slot that never grew any blocks, because the flag was off the
+        whole time, has an empty list here and this is a no-op)."""
+        if self.block_table[slot]:
+            self.block_pool.free(self.block_table[slot])
+            self.block_table[slot] = []
         self.slot_kv_len[slot] = 0
         self.slot_gdn_initialized[slot] = False
         self.slot_draft_sync_len[slot] = 0
@@ -2072,6 +2281,14 @@ class DirectModelRunner:
                 "no MTP draft model loaded -- build_vllm_config(speculative_config=...) first"
             )
         num_new_tokens = len(token_ids)
+        # P1 (notes/prefix-cache-design.md sec 5): the draft layer shares
+        # the SAME block-id namespace as the target's attention group (sec
+        # 3.1), so its own forward must grow self.block_table[slot] too --
+        # using prior_kv_len (== start_pos at every real call site, see
+        # this method's docstring) + num_new_tokens, exactly what
+        # build_attention_metadata below uses as its own new_kv_len.
+        if self.enable_block_table:
+            self._ensure_blocks(slot, prior_kv_len + num_new_tokens)
         attn_meta = build_attention_metadata(
             prior_kv_len=prior_kv_len,
             num_new_tokens=num_new_tokens,
@@ -2405,6 +2622,14 @@ class DirectModelRunner:
             if not (len(token_ids) == num_reqs and all(len(t) == qo for t, qo in zip(token_ids, qo_lens))):
                 raise ValueError("every slot's token_ids must have exactly qo_len[i] entries")
             flat_token_ids = [tok for slot_tokens in token_ids for tok in slot_tokens]
+
+        # P1 (notes/prefix-cache-design.md sec 5): same shared block-id
+        # namespace reasoning as ``_mtp_forward`` -- grow every listed
+        # slot's block_table to cover prior_kv_lens[i] + qo_lens[i] before
+        # building metadata/slot-mapping below.
+        if self.enable_block_table:
+            for s, kv_len, qo in zip(slots, prior_kv_lens, qo_lens):
+                self._ensure_blocks(s, kv_len + qo)
 
         attn_meta = build_attention_metadata_batch(
             slots=slots,
@@ -3502,6 +3727,15 @@ class CapturedBatchDecodeGraph:
                     f"{blocks_per_slot * block_size}-token capacity"
                 )
 
+        # P1 (notes/prefix-cache-design.md sec 5): grow every replayed
+        # slot's block_table to cover this replay's own new_kv_len BEFORE
+        # reading it below (INV5 -- the captured launch itself never bakes
+        # in a physical block id, only this Python-side refill does, every
+        # replay).
+        if runner.enable_block_table:
+            for slot, kv_len in zip(slot_ids, new_kv_lens):
+                runner._ensure_blocks(slot, kv_len)
+
         kv_page_indptr_list = [0]
         for num_pages in num_pages_per_req:
             kv_page_indptr_list.append(kv_page_indptr_list[-1] + num_pages)
@@ -3920,6 +4154,12 @@ class CapturedMTPDraftStepGraph:
         for slot, kv_len, num_pages in zip(slot_ids, new_kv_lens, num_pages_per_req):
             if num_pages > blocks_per_slot:
                 raise RuntimeError(f"slot {slot} kv_len {kv_len} exceeds this slot's {blocks_per_slot * block_size}-token capacity")
+
+        # P1 (notes/prefix-cache-design.md sec 5): same reasoning as
+        # CapturedBatchDecodeGraph._fill_buffers -- grow before reading.
+        if runner.enable_block_table:
+            for slot, kv_len in zip(slot_ids, new_kv_lens):
+                runner._ensure_blocks(slot, kv_len)
 
         kv_page_indptr_list = [0]
         for num_pages in num_pages_per_req:

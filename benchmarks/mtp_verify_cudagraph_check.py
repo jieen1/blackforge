@@ -129,6 +129,43 @@ def _reset_if_needed(runner, slots):
             runner.reset_slot(slot)
 
 
+def _rotate_pool(runner, scratch_slots: list[int], tok, sponge_reserve: int, rotations: int = 15) -> list[int]:
+    """P1 (notes/prefix-cache-design.md sec 5) fragmentation recipe for this
+    test: shrink the shared ``BlockPool``'s immediately-available working
+    set down to ``sponge_reserve`` blocks (sponging up -- allocating and
+    holding, returned here for the caller to free back once the real
+    traffic below has completed -- everything else), then rotate that
+    small working set via real allocate/reset/reallocate cycles
+    (``DirectModelRunner.prefill``/``reset_slot``) on ``scratch_slots``
+    (never the real ``mtp_slots``/``ref_slots`` this test drives) BEFORE
+    any real slot touches the pool. Every real slot's subsequent growth
+    (``mtp_prefill_batch``'s initial allocation, each round's further
+    growth, ``ref_slots``' own independent single-slot growth) then draws
+    from this already-rotated small set instead of this test's
+    generously-sized, otherwise-untouched ascending virgin supply -- the
+    real scenario this phase exists to prove the block-table + CUDA-graph
+    path (verify graph AND draft-step graph) tolerates, not just P0's
+    trivial always-contiguous case. See
+    ``benchmarks/cudagraph_decode_regression.py``'s identically-motivated
+    ``_fragment_pool_via_churn`` for the same recipe applied to a single
+    big allocation instead of a whole multi-slot test's worth of organic
+    growth."""
+    pool = runner.block_pool
+    free_now = pool.num_free_blocks()
+    sponge_n = max(0, free_now - sponge_reserve)
+    sponge = pool.allocate(sponge_n) if sponge_n > 0 else []
+    tiny_ids = tok.encode("Q", add_special_tokens=False)
+    for _ in range(rotations):
+        for s in scratch_slots:
+            runner.prefill(s, tiny_ids)
+            runner.reset_slot(s)
+    return sponge
+
+
+def _is_contiguous(table: list[int]) -> bool:
+    return all(table[i + 1] - table[i] == 1 for i in range(len(table) - 1))
+
+
 def _decoy_at(drafts: list[int], position: int) -> list[int]:
     """Corrupt drafts[position] with a value guaranteed to differ from the
     real draft (and from itself across positions) so
@@ -162,7 +199,7 @@ def _ref_check(runner, ref_slot, real_new_tokens, mtp_next_anchor) -> dict:
     }
 
 
-def _run_once() -> dict:
+def _run_once(enable_block_table: bool = False) -> dict:
     sys.path.insert(0, SM120_VLLM_INTEGRATION)
     import register_sm120_backend  # noqa: F401
     from transformers import AutoTokenizer
@@ -183,18 +220,41 @@ def _run_once() -> dict:
     # (batch_size up to 4 -> 4 slots) = 3*4 = 12. block_size/blocks_per_slot
     # kept small (matches cudagraph_mtp_regression.py's own convention) --
     # this test only needs correctness, not production capacity.
+    #
+    # P1 (notes/prefix-cache-design.md sec 5): when enable_block_table, TWO
+    # extra scratch slots (12, 13) are reserved purely for this test's own
+    # deliberate pool-fragmentation churn (_rotate_pool) -- placed BETWEEN
+    # the real slots [0-7] and CapturedBatchDecodeGraph's/
+    # CapturedMTPDraftStepGraph's own warmup range (which shifts to stay
+    # the LAST 4 slots of num_slots either way), so they never collide.
+    num_slots = 12 + (2 if enable_block_table else 0)
     runner = DirectModelRunner(
         vllm_config,
-        num_slots=12,
+        num_slots=num_slots,
         block_size=16,
         blocks_per_slot=128,
         enable_cudagraph=True,
+        enable_block_table=enable_block_table,
     )
 
     mtp_slots = [0, 1, 2, 3]
     ref_slots = [4, 5, 6, 7]
+    scratch_slots = [8, 9] if enable_block_table else []
     prompt_ids_per_slot = [tok.encode(p, add_special_tokens=False) for p in FOUR_PROMPTS]
     _reset_if_needed(runner, mtp_slots + ref_slots)
+
+    # P1: fragment the shared BlockPool BEFORE any real slot (mtp_slots/
+    # ref_slots) ever touches it, so their entire real-traffic growth below
+    # (initial prefill, every round's further growth, the shrunk-batch
+    # tail) draws from an already-rotated small working set instead of
+    # this test's generously-sized, otherwise-untouched ascending virgin
+    # supply -- see _rotate_pool's docstring. sponge_reserve is sized
+    # generously above this test's real total demand (8 real slots x up to
+    # ~3 blocks each over the whole run, plus headroom) so nothing runs out
+    # mid-test; freed back at the very end.
+    pool_sponge: list[int] = []
+    if enable_block_table:
+        pool_sponge = _rotate_pool(runner, scratch_slots=scratch_slots, tok=tok, sponge_reserve=48)
 
     # mtp_prefill_batch's own step-0 resync call uses num_new_tokens=
     # prompt_len (a large, uniform value) -- the direct regression check
@@ -326,11 +386,34 @@ def _run_once() -> dict:
         "draft_continuation_graph_replayed": bool(draft_cont_graph_b4 and draft_cont_graph_b4.replay_count > 0),
     }
 
+    fragmentation_proof: dict | None = None
+    if enable_block_table:
+        # P1: release the sponge held by _rotate_pool now that every real
+        # slot's growth this test drives is done, then confirm the
+        # deliberate pre-fragmentation actually left at least one real
+        # slot's own block_table non-contiguous -- the concrete proof this
+        # phase's fragmented-CUDA-graph re-run must produce, not just a
+        # claim. (The graph-replay CORRECTNESS proof under that
+        # fragmentation is everything above -- per_slot_ok/coverage --
+        # already having passed while those slots' block_tables held
+        # these non-contiguous ids the whole time.)
+        runner.block_pool.free(pool_sponge)
+        real_tables = {s: list(runner.block_table[s]) for s in mtp_slots + ref_slots}
+        non_contiguous_slots = [s for s, t in real_tables.items() if len(t) > 1 and not _is_contiguous(t)]
+        fragmentation_proof = {
+            "real_block_tables": real_tables,
+            "non_contiguous_slots": non_contiguous_slots,
+            "ok": len(non_contiguous_slots) > 0,
+        }
+
     passed = bool(all(per_slot_ok.values()) and all(coverage.values()))
+    if fragmentation_proof is not None:
+        passed = passed and fragmentation_proof["ok"]
     return {
         "passed": passed,
         "per_slot_ok": per_slot_ok,
         "coverage": coverage,
+        "fragmentation_proof": fragmentation_proof,
         "verify_graph_cache_keys": sorted(str(k) for k in runner._verify_graphs.keys()),
         "draft_step_graph_cache_keys": sorted(str(k) for k in runner._draft_step_graphs.keys()),
         "per_slot_rounds": per_slot_rounds,
@@ -338,13 +421,30 @@ def _run_once() -> dict:
 
 
 def main() -> int:
+    import argparse
     import json
 
-    result = _run_once()
+    parser = argparse.ArgumentParser()
+    # P1 (notes/prefix-cache-design.md sec 5): default False preserves this
+    # script's original behavior byte-for-byte. When passed, constructs the
+    # runner with enable_block_table=True and deliberately fragments the
+    # shared BlockPool (_rotate_pool) before any real slot touches it, so
+    # the whole real-traffic round battery above -- verify-graph AND
+    # draft-step-graph replay alike -- runs against provably non-contiguous
+    # block tables (INV5), not just P0's trivial always-contiguous case.
+    parser.add_argument("--enable-block-table", action="store_true")
+    args = parser.parse_args()
+
+    result = _run_once(enable_block_table=args.enable_block_table)
     summary = {
         "passed": result["passed"],
         "per_slot_ok": result.get("per_slot_ok"),
         "coverage": result.get("coverage"),
+        "fragmentation_proof": (
+            {k: v for k, v in result["fragmentation_proof"].items() if k != "real_block_tables"}
+            if result.get("fragmentation_proof")
+            else None
+        ),
         "verify_graph_cache_keys": result.get("verify_graph_cache_keys"),
         "draft_step_graph_cache_keys": result.get("draft_step_graph_cache_keys"),
     }

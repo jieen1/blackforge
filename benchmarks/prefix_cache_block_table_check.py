@@ -54,6 +54,33 @@ worth the extra weight-load time for this round; the full regression
 battery (which does load MTP, with the flag at its default ``False``)
 still confirms zero-regression production behavior.
 
+**P1 update (2026-07-19, notes/prefix-cache-design.md sec 5, "P1 --
+Dynamic free-list allocator + reference counting")**: P0's
+``_initial_block_table`` static per-slot partition (every slot
+pre-populated with the SAME contiguous range the old arange formula
+always computed) is now replaced by a real ``BlockPool`` dynamic
+allocator -- ``enable_block_table=True`` no longer hands out the same
+raw physical block ids as the arange path (by design: blocks are now
+placed dynamically, non-contiguously, from a shared pool). The two
+sub-checks that used to assert the raw ids were BYTEWISE IDENTICAL
+between the off/on paths (``graph_fill_buffers_page_indices_equal``/
+``graph_fill_buffers_slot_mapping_equal``) tested a P0-specific
+incidental fact (P0's allocator was a pure relabeling), not a durable
+correctness invariant -- real correctness never depended on WHICH
+physical id underlies a logical position, only on read/write consistency
+at whatever id is assigned. They are replaced below by validity checks
+appropriate to a dynamic allocator (in-range, excludes reserved block 0,
+no duplicate assignment within one call) plus ``graph_fill_buffers_
+kv_page_indptr_equal``, which stays a bytewise-identical check unchanged
+(page COUNTS per request never depended on allocator identity). The
+LOGITS-equality checks above are unaffected and remain the load-bearing
+correctness signal -- P1's own dedicated allocator-invariant test is
+``benchmarks/prefix_cache_allocator_check.py``, and its dedicated
+non-contiguous/fragmented-CUDA-graph proof is the fragmentation additions
+to ``benchmarks/cudagraph_decode_regression.py``/``mtp_verify_cudagraph_
+check.py`` -- see ``notes/prefix-cache-implementation-log.md``'s P1
+section.
+
 Usage:
     python -m benchmarks.prefix_cache_block_table_check
 """
@@ -178,8 +205,10 @@ def _run_numeric_equivalence() -> dict:
 
     runner.enable_block_table = False
     graph._fill_buffers(fill_slots, fill_tokens, fill_kv_lengths)
-    page_indices_off = graph.static_kv_page_indices.clone()
-    slot_mapping_off = graph.static_slot_mapping.clone()
+    # Only kv_page_indptr (page COUNTS per request) is still compared
+    # against the "on" pass below -- raw page_indices/slot_mapping id
+    # VALUES are no longer expected to match once P1's dynamic BlockPool
+    # is live (see this file's "P1 update" docstring note).
     kv_page_indptr_off = graph.static_kv_page_indptr.clone()
 
     runner.enable_block_table = True
@@ -188,9 +217,28 @@ def _run_numeric_equivalence() -> dict:
     slot_mapping_on = graph.static_slot_mapping.clone()
     kv_page_indptr_on = graph.static_kv_page_indptr.clone()
 
-    checks["graph_fill_buffers_page_indices_equal"] = bool(torch.equal(page_indices_off, page_indices_on))
-    checks["graph_fill_buffers_slot_mapping_equal"] = bool(torch.equal(slot_mapping_off, slot_mapping_on))
+    # P1 (see this file's docstring "P1 update" note): raw block ids are no
+    # longer expected to match between the arange path and the dynamic
+    # BlockPool path -- kv_page_indptr (page COUNTS per request) still is,
+    # since that never depended on which physical ids were assigned.
     checks["graph_fill_buffers_kv_page_indptr_equal"] = bool(torch.equal(kv_page_indptr_off, kv_page_indptr_on))
+
+    from runtime.direct_model_runner import RESERVED_PHYSICAL_SLOTS
+
+    num_pages_per_req = [
+        (kv_len + 1 + runner.block_size - 1) // runner.block_size for kv_len in fill_kv_lengths
+    ]
+    total_pages = sum(num_pages_per_req)
+    page_ids_on = page_indices_on[:total_pages].tolist()
+    num_blocks_total = runner.blocks_per_slot * (runner.num_slots + RESERVED_PHYSICAL_SLOTS)
+    checks["graph_fill_buffers_page_indices_valid_on"] = (
+        len(page_ids_on) == total_pages
+        and len(set(page_ids_on)) == len(page_ids_on)  # no accidental sharing -- P1 has none yet
+        and all(RESERVED_PHYSICAL_SLOTS <= i < num_blocks_total for i in page_ids_on)  # INV7 + in-range
+    )
+    checks["graph_fill_buffers_slot_mapping_valid_on"] = bool(
+        torch.all(slot_mapping_on[: len(fill_slots)] >= RESERVED_PHYSICAL_SLOTS * runner.block_size).item()
+    )
 
     passed = all(checks.values())
     return {"passed": passed, "checks": checks, "details": details}

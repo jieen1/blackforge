@@ -4,6 +4,50 @@ Updated: 2026-07-19
 
 ## Completed
 
+### Prefix-cache P1 — dynamic free-list allocator + reference counting (2026-07-19)
+
+Full design at `notes/prefix-cache-design.md` (P0-P4 phased plan); this
+round implements **P1 only**, directly on top of P0's block-table
+substrate. Replaced P0's `_initial_block_table` static per-slot partition
+(every slot pre-populated with its own fixed contiguous `blocks_per_slot`
+range) with a real `BlockPool`: a FIFO free-list allocator + `ref_cnt`
+bookkeeping over the shared physical attention-KV block pool, excluding
+reserved physical block 0 (INV7). Slots now allocate blocks ON DEMAND as
+`kv_len` grows (`DirectModelRunner._ensure_blocks`, wired into all 6
+existing `enable_block_table`-gated call sites: single/batched target
+forward, single/batched MTP draft forward, both captured-graph
+`_fill_buffers` methods) and release them back to the pool on
+`reset_slot` (closing the design doc's R10 risk). Still **zero
+cross-slot sharing** this phase (`ref_cnt` never exceeds 1) — behavior
+stays identical to P0, but block *placement* is now genuinely dynamic: a
+single slot's own blocks can end up non-contiguous over time, which is
+this phase's real point (proving the block-table + CUDA-graph path
+tolerates that, not just P0's trivial contiguous case).
+
+**Verified, zero regression**: new dedicated `benchmarks/prefix_cache_
+allocator_check.py` (7 pure-Python checks against the real, unmodified
+`BlockPool`/`_ensure_blocks`/`reset_slot` — alloc/free correctness,
+ref_cnt bookkeeping, FIFO free-queue ordering, INV7 block-0-never-handed-
+out, INV6 append-only growth, reset_slot frees blocks, and an explicit
+churn recipe proving real fragmentation e.g. `[1, 5, 7]`) all **PASS**;
+`prefix_cache_block_table_check.py` (P0's own test) re-run and updated
+(two P0-specific bytewise-id-equality sub-checks, no longer a valid
+invariant once placement is dynamic by design, replaced with validity
+checks; everything else, including all logits-equality checks, unchanged)
+**PASS**; two dedicated fragmented-CUDA-graph re-runs with new
+`--enable-block-table` flags (default off, original behavior untouched) —
+`cudagraph_decode_regression.py` (slot 3's block_table came back
+`[1289..1407, 1, 8, 9, 1280, 1284]`, provably non-contiguous, graph replay
+still correct) and `mtp_verify_cudagraph_check.py` (all 8 real slots ended
+up non-contiguous, full 8-round verify+draft-step graph battery still
+**PASS**) — both **PASS**; full `benchmarks/mtp_*_check.py` battery (all
+11 fast scripts) + `cudagraph_eager_parity_check.py` **PASS**; 4K/c=4
+headline 3 reps — `total_committed_tokens=4116`/`draft_acceptance_rate_
+pct=70.29204431017119` bit-identical to the established baseline (also
+P0's own confirmed number). Full detail: `notes/prefix-cache-
+implementation-log.md`'s "P1" section. Ready for P2 (fan-out fork,
+Pattern A same-round sharing).
+
 ### Prefix-cache P0 — block-table indirection substrate, behavior-identical (2026-07-19)
 
 Full design at `notes/prefix-cache-design.md` (P0-P4 phased plan); this
