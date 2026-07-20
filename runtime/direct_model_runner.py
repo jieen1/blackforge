@@ -5322,6 +5322,7 @@ class CapturedBatchDecodeGraph:
 
         self._warmup_slots = warmup_slots
         self._last_num_pages_per_req: list[int] | None = None
+        self._last_state_slot_ids: list[int] | None = None
 
         num_reqs = batch_size
         n_tokens = num_reqs * qo_len
@@ -5507,7 +5508,6 @@ class CapturedBatchDecodeGraph:
             kv_len - (num_pages - 1) * block_size
             for kv_len, num_pages in zip(new_kv_lens, num_pages_per_req)
         ]
-        state_indices_list = [_physical_slot(slot) for slot in slot_ids]
         positions_list = [kv_len + j for kv_len in kv_lengths for j in range(qo_len)]
 
         slot_mapping_list: list[int] = []
@@ -5522,8 +5522,12 @@ class CapturedBatchDecodeGraph:
         n_reqs = len(last_page_len_list)
         self._np_kv_last_page_len[:n_reqs] = last_page_len_list
         self.static_kv_last_page_len.copy_(self._cpu_kv_last_page_len, non_blocking=True)
-        self._np_state_indices[:n_reqs] = state_indices_list
-        self.static_state_indices.copy_(self._cpu_state_indices, non_blocking=True)
+        slots_changed = (slot_ids != self._last_state_slot_ids)
+        if slots_changed:
+            state_indices_list = [_physical_slot(slot) for slot in slot_ids]
+            self._np_state_indices[:n_reqs] = state_indices_list
+            self.static_state_indices.copy_(self._cpu_state_indices, non_blocking=True)
+            self._last_state_slot_ids = list(slot_ids)
         n_tok = len(flat_token_ids)
         self._np_input_ids[:n_tok] = flat_token_ids
         self.static_input_ids.copy_(self._cpu_input_ids, non_blocking=True)
@@ -5538,12 +5542,14 @@ class CapturedBatchDecodeGraph:
                     "num_accepted_tokens_prev is required when qo_len > 1 "
                     "(this shape only ever means spec-decode verify)"
                 )
-            spec_indices_list = [
-                [_ssm_spec_row(slot, col, self.total_physical_slots, self.num_spec) for col in range(qo_len)]
-                for slot in slot_ids
-            ]
-            self._cpu_spec_state_indices[:n_reqs] = torch.tensor(spec_indices_list, dtype=torch.int32)
-            self.static_spec_state_indices.copy_(self._cpu_spec_state_indices, non_blocking=True)
+            if slots_changed or not hasattr(self, '_spec_cached'):
+                spec_indices_list = [
+                    [_ssm_spec_row(slot, col, self.total_physical_slots, self.num_spec) for col in range(qo_len)]
+                    for slot in slot_ids
+                ]
+                self._cpu_spec_state_indices[:n_reqs] = torch.tensor(spec_indices_list, dtype=torch.int32)
+                self.static_spec_state_indices.copy_(self._cpu_spec_state_indices, non_blocking=True)
+                self._spec_cached = True
             self._cpu_num_accepted_tokens[:n_reqs] = torch.tensor(num_accepted_tokens_prev, dtype=torch.int32)
             self.static_num_accepted_tokens.copy_(self._cpu_num_accepted_tokens, non_blocking=True)
 
