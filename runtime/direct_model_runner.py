@@ -17,10 +17,15 @@ multi-request batching -- this round's scope does not need).
 
 from __future__ import annotations
 
-from collections import deque
+import array
+import hashlib
+import os
+from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
+import numpy as np
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.engine.arg_utils import EngineArgs
 from vllm.forward_context import set_forward_context
@@ -113,18 +118,160 @@ def _ssm_spec_row(logical_slot: int, col: int, total_physical_slots: int, num_sp
     return total_physical_slots + physical * num_spec + (col - 1)
 
 
+def _derive_none_hash() -> int:
+    """Process-global seed for the chained block hash (P3, R7). Derived once
+    from a fixed salt + ``PYTHONHASHSEED`` so hashing is reproducible within
+    a run but cross-run collisions are impossible (different seed -> different
+    chain). The persistent cache is per-process/in-memory, so the seed only
+    needs to be a fixed, well-mixed, non-zero value within one process."""
+    salt = b"qwen-sm120-runtime/prefix-cache/NONE_HASH"
+    seed = os.environ.get("PYTHONHASHSEED", "0").encode("utf-8")
+    return int.from_bytes(hashlib.blake2b(salt + seed, digest_size=16).digest(), "big")
+
+
+NONE_HASH: int = _derive_none_hash()
+
+
+def hash_block_tokens(parent_hash: int | None, token_ids: list[int], extra_keys: tuple) -> int:
+    """Full-width 128-bit chained block hash (``notes/prefix-cache-design.md``
+    sec 3.2; vLLM ``hash_block_tokens`` shape, adapted not copied). Block i's
+    hash depends on the WHOLE prefix ``0..(i+1)*block_size`` via the chained
+    ``parent_hash`` (or the ``NONE_HASH`` seed for block 0), so two prompts
+    diverging at any earlier token get different hashes for every block from
+    the divergence on -- which is exactly why prefix lookup can stop at the
+    first miss.
+
+    ``extra_keys`` MUST carry the ``kv_cache_dtype`` (the runner passes
+    ``(self.kv_cache_dtype,)``) so fp8 vs nvfp4 KV never collide (R7). Uses
+    ``hashlib.blake2b(digest_size=16)`` -> a 128-bit int; collision probability
+    is negligible at this runtime's <=4-slot traffic (R7)."""
+    hasher = hashlib.blake2b(digest_size=16)
+    hasher.update((parent_hash or NONE_HASH).to_bytes(16, "big"))
+    hasher.update(array.array("Q", token_ids).tobytes())
+    if extra_keys:
+        hasher.update(repr(extra_keys).encode("utf-8"))
+    return int.from_bytes(hasher.digest(), "big")
+
+
+@dataclass(frozen=True)
+class BlockHash:
+    """Content identity of one full published attention-KV block (P3).
+    ``value`` is the 128-bit chained hash; ``num_tokens = (i+1)*block_size``
+    enables the cheap paranoid first-block token-count verify on a hit/dedup
+    (R7). Stored on ``Block.block_hash`` for every published block."""
+
+    value: int
+    num_tokens: int
+
+
 @dataclass
 class Block:
     """One physical attention-KV block. ``ref_cnt``/``block_hash`` are the
     same fields ``notes/prefix-cache-design.md`` sec 3.2 specifies for
-    vLLM-v1-style block-pool bookkeeping -- ``block_hash`` is unused this
-    phase (P1 has no content-addressing/sharing yet; P3 populates it) but
-    kept on the dataclass now so P3 does not need to touch this class's
-    shape, only start writing the field."""
+    vLLM-v1-style block-pool bookkeeping. ``block_hash`` is populated by P3's
+    persistent content-addressed cache (``BlockPool.cache_block``) for every
+    published full block and RETAINED when the block is freed back to
+    ``ref_cnt == 0`` -- that retention is exactly what keeps a cached prefix
+    hit-able across ``reset_slot`` (R10).
+
+    ``prev_free``/``next_free`` (P3.2) are the intrusive doubly-linked-list
+    pointers ``FreeBlockQueue`` manipulates in O(1) (the design doc sec 3.2
+    fields, vLLM ``KVCacheBlock.prev_free_block``/``next_free_block`` shape).
+    Both are ``None`` exactly when the block is NOT parked in the free queue
+    (allocated at ``ref_cnt > 0``, or a just-popped/removed block); a block in
+    the queue has both non-``None``. The two ``FreeBlockQueue`` sentinels are
+    the only blocks whose links point at a sentinel."""
 
     block_id: int
     ref_cnt: int = 0
-    block_hash: object | None = None
+    block_hash: BlockHash | None = None
+    prev_free: Block | None = None
+    next_free: Block | None = None
+
+
+class FreeBlockQueue:
+    """Intrusive doubly-linked LRU free-block queue (P3.2; design doc sec 3.2,
+    vLLM ``FreeKVCacheBlockQueue`` shape, adapted). Replaces P1's plain
+    ``collections.deque`` to add O(1) MIDDLE removal -- needed to revive a
+    ``ref_cnt == 0`` cached block on a late hit (``BlockPool.touch`` yanks it
+    out before reuse) without an O(n) scan.
+
+    Order semantics (vLLM ``free_blocks``/``get_new_blocks`` faithful):
+    front (head side, ``popleft``) = evict-next; tail = most-recently-freed.
+    ``append`` parks a block at the TAIL (a freed-but-HASHED block stays
+    hit-able as long as possible -- LRU tail, evicted last); ``appendleft``
+    parks it at the HEAD (a freed block with NO hash carries no cached content,
+    so it is evicted FIRST). ``popleft`` returns the evict-next block;
+    ``remove(block)`` unlinkes an arbitrary node in O(1). Two sentinel
+    ``Block`` s (``block_id`` -1/-2, never popped) eliminate edge branching.
+
+    Links live ON the ``Block`` objects (``prev_free``/``next_free``); the
+    queue holds a back-reference to ``blocks`` only so ``__contains__`` can
+    resolve a bare ``block_id`` (the P3.1 gate probes ``blk in pool._free_queue``
+    with an int)."""
+
+    def __init__(self, blocks: list[Block]) -> None:
+        self._blocks = blocks
+        self.head = Block(block_id=-1)  # sentinel: head.next = evict-next
+        self.tail = Block(block_id=-2)  # sentinel: tail.prev = MRU
+        self.head.next_free = self.tail
+        self.tail.prev_free = self.head
+        self._len = 0
+
+    def __len__(self) -> int:
+        return self._len
+
+    def __contains__(self, item: Block | int) -> bool:
+        block = item if isinstance(item, Block) else self._blocks[item]
+        return block.prev_free is not None and block.next_free is not None
+
+    def append(self, block: Block) -> None:
+        """Park ``block`` at the TAIL (most-recently-freed / hashed LRU tail,
+        evicted last). O(1)."""
+        if block.prev_free is not None or block.next_free is not None:
+            raise RuntimeError(f"block {block.block_id} is already linked in the free queue")
+        last = self.tail.prev_free
+        assert last is not None
+        last.next_free = block
+        block.prev_free = last
+        block.next_free = self.tail
+        self.tail.prev_free = block
+        self._len += 1
+
+    def appendleft(self, block: Block) -> None:
+        """Park ``block`` at the HEAD (evict-next end; freed hashless blocks go
+        here so they are reclaimed before any cached block). O(1)."""
+        if block.prev_free is not None or block.next_free is not None:
+            raise RuntimeError(f"block {block.block_id} is already linked in the free queue")
+        first = self.head.next_free
+        assert first is not None
+        first.prev_free = block
+        block.next_free = first
+        block.prev_free = self.head
+        self.head.next_free = block
+        self._len += 1
+
+    def popleft(self) -> Block:
+        """Remove and return the evict-next (head) block. O(1)."""
+        block = self.head.next_free
+        if block is self.tail or block is None:
+            raise RuntimeError("popleft from an empty free queue")
+        self._unlink(block)
+        return block
+
+    def remove(self, block: Block) -> None:
+        """Unlink an arbitrary node in O(1) (the late-hit revival primitive)."""
+        if block.prev_free is None or block.next_free is None:
+            raise RuntimeError(f"remove() on block {block.block_id} not in the free queue")
+        self._unlink(block)
+
+    def _unlink(self, block: Block) -> None:
+        assert block.prev_free is not None and block.next_free is not None
+        block.prev_free.next_free = block.next_free
+        block.next_free.prev_free = block.prev_free
+        block.prev_free = None
+        block.next_free = None
+        self._len -= 1
 
 
 class BlockPool:
@@ -141,17 +288,18 @@ class BlockPool:
     over time (this is the intended, exercised behavior this phase proves
     safe, not a defect).
 
-    **P1 scope, explicitly**: no content hashing, no sharing, no LRU
-    eviction of a still-hashed block -- those are P2/P3 (fan-out fork,
-    persistent content-addressed cache). Every block, once allocated, has
-    exactly ONE referencer for the whole of this phase (``ref_cnt`` is
-    always exactly 0 or 1) -- this is why P1's own behavior is still
-    identical to P0/pre-P0: nothing is ever shared. The plain FIFO free
-    queue (``collections.deque``, O(1) ``popleft``/``append``) is
-    sufficient for this phase's needs; P3's LRU-with-O(1)-middle-removal
-    ("revive an evictable block on a late hit") requirement is a superset
-    this class's external ``allocate``/``free`` API can grow into without
-    changing any caller.
+    **Free queue (P3.2)**: ``_free_queue`` is an intrusive ``FreeBlockQueue``
+    (O(1) ``append``/``appendleft``/``popleft``/``remove``), replacing P1's
+    plain ``collections.deque``. ``allocate`` pops from the front (evict-next);
+    a popped block that still carries a published hash is EVICTED first -- its
+    hash is dropped from ``hash_to_block`` and, in lockstep, the co-keyed GDN
+    checkpoint is dropped via the ``_on_evict_block`` callback the runner wires
+    after construction (INV2/INV3/R5). ``free`` re-queues a ``ref_cnt == 0``
+    block at the TAIL if it keeps a hash (stays hit-able, LRU) or at the HEAD
+    if hashless (no cached content, evicted first) -- vLLM ``free_blocks``
+    order. ``touch`` yanks a revived ``ref_cnt == 0`` block out in O(1)
+    (INV2/INV9). With a generously-sized pool and no pressure, ``allocate``
+    never evicts a hashed block, so behavior is byte-for-byte P3.1.
 
     **INV7 (reserved physical slot 0)**: physical block ids
     ``[0, reserved)`` (``reserved=RESERVED_PHYSICAL_SLOTS`` by default,
@@ -169,56 +317,107 @@ class BlockPool:
         self.num_blocks = num_blocks
         self.reserved = reserved
         self.blocks: list[Block] = [Block(block_id=i) for i in range(num_blocks)]
-        # Free queue: FIFO. Front (index 0, ``popleft()``) = allocate-next;
-        # tail (``append()``) = most-recently-freed. Excludes every
+        # Free queue: intrusive LRU (FreeBlockQueue). Front (``popleft()``) =
+        # evict-next; tail (``append()``) = most-recently-freed. Excludes every
         # reserved id by construction -- reserved ids are never appended by
-        # ``free`` either (guarded there too, defense in depth).
-        self._free_queue: deque[int] = deque(range(reserved, num_blocks))
+        # ``free`` either (guarded there too, defense in depth). Initial blocks
+        # are linked in ASCENDING id order (append each), so the no-pressure
+        # ``popleft`` order matches P1's ``deque(range(reserved, num_blocks))``
+        # exactly (byte-for-byte P3.1 when eviction never triggers).
+        self._free_queue: FreeBlockQueue = FreeBlockQueue(self.blocks)
+        for _block_id in range(reserved, num_blocks):
+            self._free_queue.append(self.blocks[_block_id])
+        # P3.2 lockstep eviction hook: when ``_evict_one`` reclaims a still-
+        # hashed attention block, the runner drops the co-keyed GDN checkpoint
+        # too (INV3/R5, both directions). ``None`` for a stand-alone BlockPool
+        # (pure-Python tests); the runner sets it to ``evict_gdn_checkpoint``
+        # after construction. Kept as a plain callable to avoid a BlockPool ->
+        # DirectModelRunner import cycle.
+        self._on_evict_block: Callable[[int], None] | None = None
+        # P3 persistent content-addressed index (notes/prefix-cache-design.md
+        # sec 3.2): maps a full block's 128-bit chained hash VALUE to the
+        # physical Block holding that prefix's KV. Populated by cache_block at
+        # a cached prefix's completion boundary; probed by get_cached_block on
+        # admission. A published block keeps its block_hash (and thus stays in
+        # this index) even when freed back to ref_cnt == 0 -- that is exactly
+        # what keeps a cached prefix hit-able across reset_slot (R10); the hash
+        # is dropped only on real eviction (P3.2).
+        self.hash_to_block: dict[int, Block] = {}
 
     def num_free_blocks(self) -> int:
         return len(self._free_queue)
 
+    def _evict_one(self) -> Block:
+        """Pop the evict-next (free-queue front) block and make it reusable
+        (P3.2, design doc sec 3.2 ``_maybe_evict`` + sec 3.9 lockstep). If it
+        still carries a published hash (a freed-but-cached block at
+        ``ref_cnt == 0``), drop that hash from ``hash_to_block`` FIRST -- only
+        then is the cached content gone (INV2: a block is never both indexed as
+        old content AND handed out for new) -- and, in LOCKSTEP, drop the
+        co-keyed GDN checkpoint via ``_on_evict_block`` (INV3/R5: an attention
+        tail block and its checkpoint are always evicted together; no
+        half-evicted ghost can produce a wrong ``L``). Returns the block at
+        ``ref_cnt == 0`` / ``block_hash is None``, ready to hand out. Only
+        reachable under real pool pressure (a generous pool never evicts a
+        hashed block in the no-pressure path => byte-for-byte P3.1)."""
+        block = self._free_queue.popleft()
+        if block.block_hash is not None:
+            self.hash_to_block.pop(block.block_hash.value, None)
+            block.block_hash = None
+            if self._on_evict_block is not None:
+                self._on_evict_block(block.block_id)
+        return block
+
     def allocate(self, n: int) -> list[int]:
-        """Pop ``n`` blocks from the free-queue front, set ``ref_cnt = 1``
-        on each, return their ids in pop order (oldest-free-first). Raises
-        if the pool cannot satisfy the request -- callers (``DirectModelRunner
-        ._ensure_blocks``) are expected to size the pool generously (this
-        project's existing ``num_blocks = (num_slots + RESERVED_PHYSICAL_SLOTS)
-        * blocks_per_slot`` sizing, unchanged from P0, already gives more
-        headroom than P0's static partition ever used, since P0 permanently
-        reserved a full ``blocks_per_slot``-sized region for physical slot
-        0 while this pool only excludes the single id ``reserved`` and
-        beyond)."""
+        """Hand out ``n`` blocks from the free-queue front, setting
+        ``ref_cnt = 1`` on each and returning their ids in pop order
+        (evict-next-first). Every free-queue block is ``ref_cnt == 0`` by
+        construction (``free`` re-queues only at 0; ``touch``/``allocate``
+        remove on revive), so a popped block is always safe to reuse -- but a
+        popped block may still be CACHED (hash retained at ``ref_cnt == 0``),
+        in which case ``_evict_one`` evicts it (drops the hash + lockstep GDN
+        checkpoint) before hand-out.
+
+        Raises only on TRUE exhaustion: the free queue holds fewer than ``n``
+        blocks, i.e. every other block is ``ref_cnt > 0`` (held by an active
+        slot) and thus NEVER evictable (INV9). Callers
+        (``DirectModelRunner._ensure_blocks``) size the pool generously (this
+        project's ``num_blocks = (num_slots + RESERVED_PHYSICAL_SLOTS) *
+        blocks_per_slot`` sizing, unchanged from P0), so eviction is rare and
+        true exhaustion rarer still."""
         if n < 0:
             raise ValueError(f"cannot allocate a negative count ({n})")
         if n > len(self._free_queue):
             raise RuntimeError(
                 f"block pool exhausted: requested {n}, only "
                 f"{len(self._free_queue)} free (of {self.num_blocks - self.reserved} total, "
-                f"excluding {self.reserved} reserved)"
+                f"excluding {self.reserved} reserved); every other block is ref_cnt > 0"
             )
         ids: list[int] = []
         for _ in range(n):
-            block_id = self._free_queue.popleft()
-            if block_id < self.reserved:
-                raise RuntimeError(f"INV7 violation: reserved block {block_id} was in the free queue")
-            block = self.blocks[block_id]
+            block = self._evict_one()
+            if block.block_id < self.reserved:
+                raise RuntimeError(
+                    f"INV7 violation: reserved block {block.block_id} was in the free queue"
+                )
             if block.ref_cnt != 0:
                 raise RuntimeError(
-                    f"block {block_id} was in the free queue with ref_cnt={block.ref_cnt} != 0"
+                    f"block {block.block_id} was in the free queue with "
+                    f"ref_cnt={block.ref_cnt} != 0"
                 )
             block.ref_cnt = 1
-            ids.append(block_id)
+            ids.append(block.block_id)
         return ids
 
     def free(self, block_ids: list[int]) -> None:
-        """Release blocks back to the pool: ``ref_cnt -= 1``; at 0,
-        append to the free-queue tail. P1 never shares a block (``ref_cnt``
-        is always exactly 1 before a free call here), so this always
-        drops straight to 0 and re-enters the queue -- written as a
-        decrement (not a hard reset to 0) so a future P2/P3 caller that
-        legitimately holds ``ref_cnt > 1`` is not silently masked by this
-        phase's code path."""
+        """Release blocks back to the pool: ``ref_cnt -= 1``; at 0, re-queue
+        (P3.2, vLLM ``free_blocks`` order): a block that KEEPS a published
+        hash is ``append``-ed to the TAIL (stays hit-able, LRU -- evicted last
+        among free blocks); a block with NO hash carries no cached content so
+        it is ``appendleft``-ed to the HEAD (evicted FIRST, before any cached
+        block). Written as a decrement (not a hard reset to 0) so a caller
+        legitimately holding ``ref_cnt > 1`` (P2 fan-out / P3 hit sharing) is
+        not silently masked -- only the final release re-queues."""
         for block_id in block_ids:
             if block_id < self.reserved:
                 raise RuntimeError(f"INV7 violation: attempted to free reserved block {block_id}")
@@ -229,7 +428,93 @@ class BlockPool:
                 raise RuntimeError(f"double-free of block {block_id} (ref_cnt={block.ref_cnt})")
             block.ref_cnt -= 1
             if block.ref_cnt == 0:
-                self._free_queue.append(block_id)
+                if block.block_hash is not None:
+                    self._free_queue.append(block)
+                else:
+                    self._free_queue.appendleft(block)
+
+    def reference(self, block_ids: list[int]) -> None:
+        """Add a reference to already-allocated blocks (``ref_cnt += 1`` on
+        each), the P2 fan-out primitive that lets a sibling slot share the
+        leader's ``[0, Lc)`` attention blocks instead of recomputing them
+        (``notes/prefix-cache-design.md`` sec 5, "P2 -- Fan-out fork", and
+        sec 3.5 step 1: "touch each (ref_cnt += 1) for all 17 attention
+        layers' shared namespace"). The 17 attention layers (16 target + 1
+        MTP draft) share ONE block-id namespace, so referencing the block
+        ids once covers every layer's KV for those token positions.
+
+        Mirror-image of ``free``'s bookkeeping (which decrements and only
+        re-queues at ``ref_cnt == 0``): a referenced block stays out of the
+        free queue until EVERY referencer has freed it, so a shared block is
+        never handed to ``allocate`` while any slot still references it
+        (INV9). Carries the SAME INV7/range guards as ``allocate``/``free``
+        (refuse reserved ids ``< reserved`` and out-of-range ids), plus a
+        not-currently-allocated guard -- referencing a ``ref_cnt == 0``
+        block would resurrect a block that may already be back in the free
+        queue (and thus handed to another slot), an immediate aliasing bug.
+        """
+        for block_id in block_ids:
+            if block_id < self.reserved:
+                raise RuntimeError(
+                    f"INV7 violation: attempted to reference reserved block {block_id}"
+                )
+            if block_id >= self.num_blocks:
+                raise RuntimeError(
+                    f"block {block_id} is out of range (num_blocks={self.num_blocks})"
+                )
+            block = self.blocks[block_id]
+            if block.ref_cnt <= 0:
+                raise RuntimeError(
+                    f"cannot reference block {block_id} with ref_cnt={block.ref_cnt} "
+                    "(not currently allocated -- it may already be back in the free queue)"
+                )
+            block.ref_cnt += 1
+
+    def cache_block(self, block_id: int, block_hash: BlockHash) -> None:
+        # Publish a full block to the content index (P3, sec 3.2): tag
+        # blocks[block_id].block_hash and record hash_to_block[value].
+        # Idempotent guard: if value is ALREADY present this is the write-time
+        # dedup signal (see DirectModelRunner._publish_committed_blocks) -- the
+        # existing entry is the canonical block for that prefix and is NOT
+        # overwritten (the caller swaps onto it and frees the duplicate fresh
+        # block instead).
+        if block_id < self.reserved:
+            raise RuntimeError(f"INV7 violation: attempted to publish reserved block {block_id}")
+        if block_id >= self.num_blocks:
+            raise RuntimeError(f"block {block_id} is out of range (num_blocks={self.num_blocks})")
+        if block_hash.value in self.hash_to_block:
+            return
+        self.blocks[block_id].block_hash = block_hash
+        self.hash_to_block[block_hash.value] = self.blocks[block_id]
+
+    def get_cached_block(self, hash_value: int) -> Block | None:
+        # Content-index probe (P3, sec 3.4 attention match): return the
+        # published Block whose chained hash equals hash_value, or None on a
+        # miss. O(1) dict lookup.
+        return self.hash_to_block.get(hash_value)
+
+    def touch(self, block_ids: list[int]) -> None:
+        # Cache-hit reference primitive (P3, sec 3.2/3.5 step 1): ref_cnt += 1
+        # on each block, REVIVING a block parked at ref_cnt == 0 in the free
+        # queue by removing it first. Mirror of reference() but LEGAL for
+        # ref_cnt == 0 -- reference() stays the same-round-fork primitive (it
+        # rejects ref_cnt == 0), touch() is the persistent-cache hit primitive
+        # (a published block freed back to ref_cnt == 0 by reset_slot is still
+        # hit-able and must be yanked out of the free queue before reuse --
+        # INV2/INV9). P3.2: the removal is O(1) via the intrusive FreeBlockQueue
+        # (replacing P3.1's O(n) deque remove).
+        for block_id in block_ids:
+            if block_id < self.reserved:
+                raise RuntimeError(f"INV7 violation: attempted to touch reserved block {block_id}")
+            if block_id >= self.num_blocks:
+                raise RuntimeError(f"block {block_id} is out of range (num_blocks={self.num_blocks})")
+            block = self.blocks[block_id]
+            if block.ref_cnt == 0:
+                # Parked in the free queue (a freed-but-published block):
+                # revive it so allocate never hands it to another slot while
+                # this hit references it.
+                self._free_queue.remove(block)
+            block.ref_cnt += 1
 
 
 def _ensure_sm120_backend_registered() -> None:
@@ -885,6 +1170,22 @@ def build_gdn_metadata_spec_batch(
     )
 
 
+def _install_triton_norm_ops_once() -> None:
+    """Install Triton-fused RMSNorm ops (vLLM C ext lacks them on this machine).
+    Must be called AFTER create_engine_config() because that call resets
+    IR op priorities via KernelConfig.ir_op_priority.set_priority()."""
+    try:
+        from runtime.triton_norm_ops import install_triton_norm_ops
+        install_triton_norm_ops()
+    except Exception:
+        pass
+    try:
+        from runtime.gemma_norm_patch import patch_gemma_rms_norm
+        patch_gemma_rms_norm()
+    except Exception:
+        pass
+
+
 def build_vllm_config(
     *,
     model: str,
@@ -906,7 +1207,9 @@ def build_vllm_config(
         async_scheduling=False,
         speculative_config=speculative_config,
     )
-    return args.create_engine_config()
+    config = args.create_engine_config()
+    _install_triton_norm_ops_once()
+    return config
 
 
 def determine_accept_reject(draft_tokens: list[int], verify_logits) -> dict:
@@ -1015,6 +1318,9 @@ class DirectModelRunner:
         blocks_per_slot: int = 128,
         enable_cudagraph: bool = False,
         enable_block_table: bool = False,
+        enable_prefix_cache: bool = False,
+        enable_persistent_prefix_cache: bool = False,
+        gdn_checkpoint_byte_budget: int = 8 * 2**30,
     ) -> None:
         # 2026-07-18, D3 memory-growth fix: this whole class is a pure
         # inference runtime (never computes a backward pass) but, unlike
@@ -1090,6 +1396,48 @@ class DirectModelRunner:
         # thing this phase's own dedicated tests prove the block-table +
         # CUDA-graph path tolerates, not just P0's trivial contiguous case).
         self.enable_block_table = enable_block_table
+        # P2 (2026-07-19, notes/prefix-cache-design.md sec 5, "P2 -- Fan-out
+        # fork (Pattern A, same-round sharing)"): OPT-IN, default False --
+        # preserves every existing caller's behavior byte-for-byte (this
+        # project's established feature-flag convention, see enable_block_
+        # table/enable_cudagraph above). When True, ``mtp_prefill_fanout_
+        # batch`` detects a common token prefix among a same-round admit
+        # batch and forks it (leader prefills the shared prefix once,
+        # siblings reference the leader's [0, Lc) attention blocks + restore
+        # the leader's GDN snapshot + continue-prefill only their own
+        # suffixes). Requires ``enable_block_table=True`` (the fork reuses
+        # the P1 block-table/ref-counting substrate -- it manipulates
+        # ``block_table``/``BlockPool.reference`` directly); with the flag
+        # off, OR when fewer than two same-round requests share at least one
+        # full block of prefix, ``mtp_prefill_fanout_batch`` falls back to
+        # the exact ``mtp_prefill_batch`` path -- byte-identical to P1.
+        self.enable_prefix_cache = enable_prefix_cache
+        if enable_prefix_cache and not enable_block_table:
+            raise ValueError(
+                "enable_prefix_cache=True requires enable_block_table=True "
+                "(the fan-out fork reuses the P1 block-table/ref-counting substrate)"
+            )
+        # P3 persistent content-addressed prefix cache (notes/2026-07-19-p3-
+        # implementation-plan.md, P3.1): OPT-IN, default False -- preserves
+        # every existing caller's behavior byte-for-byte (rollback spine:
+        # flag off => byte-for-byte P2; persistent lookup L=0 => P2 fan-out/
+        # cold). Requires enable_prefix_cache=True (it builds on the P2 fan-out
+        # substrate: block_table/BlockPool/restore_gdn_state(allow_cross_slot)),
+        # raising on misconfiguration exactly like the P2 guard above. When on,
+        # populate-on-completion writes a content index + persistent GDN
+        # checkpoint pool, and mtp_prefill_with_cache serves restore-and-
+        # continue hits -- exercised ONLY by the dedicated test in P3.1 (the
+        # production prefill entrypoint is untouched this round).
+        self.enable_persistent_prefix_cache = enable_persistent_prefix_cache
+        if enable_persistent_prefix_cache and not enable_prefix_cache:
+            raise ValueError(
+                "enable_persistent_prefix_cache=True requires enable_prefix_cache=True "
+                "(the persistent cache builds on the P2 fan-out/ref-counting substrate)"
+            )
+        # kv_cache_dtype is carried in every block's chained hash extra_keys so
+        # fp8 vs nvfp4 KV can never collide on the same token prefix (R7).
+        self.kv_cache_dtype = vllm_config.cache_config.cache_dtype
+        self.gdn_checkpoint_byte_budget = gdn_checkpoint_byte_budget
         self.block_table: list[list[int]] = [[] for _ in range(num_slots)]
         self.block_pool = BlockPool(
             num_blocks=(num_slots + RESERVED_PHYSICAL_SLOTS) * blocks_per_slot,
@@ -1176,6 +1524,16 @@ class DirectModelRunner:
 
         self._allocate_and_bind_kv_caches()
         self._allocate_gdn_snapshot_buffers()
+        if self.enable_persistent_prefix_cache:
+            self._allocate_gdn_checkpoint_pool()
+            # P3.2 lockstep eviction (INV3/R5, both directions): when
+            # BlockPool._evict_one reclaims a still-hashed attention block, drop
+            # the co-keyed GDN checkpoint too. evict_gdn_checkpoint is the
+            # reverse direction as well (a budget/pool-driven checkpoint eviction
+            # drops the co-keyed attention block's hash if that block is free).
+            # Only wired under the flag: blocks are only ever hashed when the
+            # persistent cache is on, so _evict_one never invokes this otherwise.
+            self.block_pool._on_evict_block = self.evict_gdn_checkpoint
 
         # Per-slot bookkeeping: attention kv_len (tokens actually written into
         # the paged KV cache) and GDN "has state been initialized" flag.
@@ -1210,6 +1568,26 @@ class DirectModelRunner:
         # share this bookkeeping now.
         self.slot_num_accepted_tokens = [1] * num_slots
 
+        # P3 per-slot hash-chain state (notes/2026-07-19-p3-implementation-plan
+        # .md, P3.1 step 4), reset in reset_slot. slot_block_hashes[s][i] is the
+        # chained BlockHash of block i (depends on all tokens 0..(i+1)*block_size);
+        # slot_published_blocks[s] is the count of this slot's blocks already
+        # published to the content index (the write cursor for
+        # _publish_committed_blocks). Built unconditionally (cheap small Python
+        # lists) so the dedicated test can inspect them regardless of the flag;
+        # only MUTATED by the persistent-cache write/read paths when the flag is
+        # on.
+        self.slot_block_hashes: list[list[BlockHash]] = [[] for _ in range(num_slots)]
+        self.slot_published_blocks: list[int] = [0] * num_slots
+        # P3.2 decode-position populate: the full committed token sequence for
+        # each slot (positions [0, slot_kv_len[s])). Decode-produced blocks hash
+        # tokens that may straddle the prompt tail + decode head, so the whole
+        # sequence must be available. Seeded with the prompt at prefill (inside
+        # _publish_committed_blocks), extended on each verify-commit (publish_
+        # committed_decode_blocks), reset in reset_slot. Only mutated under the
+        # flag; built unconditionally (cheap small lists) like slot_block_hashes.
+        self.slot_committed_tokens: list[list[int]] = [[] for _ in range(num_slots)]
+
         # Split-KV parallelism for decode/verify-shaped batched kernel calls
         # (2026-07-17, found via direct source comparison after the
         # coordinator's own nvidia-smi monitoring caught persistently low
@@ -1230,7 +1608,7 @@ class DirectModelRunner:
         # CUDA-graph-safety proof in `build_attention_metadata_batch`'s
         # docstring already establishes as a valid upper bound for every
         # real kv_len this runner will ever see) targeting
-        # `_DECODE_TARGET_SPLITS_PER_REQ = 64` splits/request -- a value
+        # `_DECODE_TARGET_SPLITS_PER_REQ = 32` splits/request -- a value
         # that project's own sweep (kv_len 2000-131072) found best; this
         # project's OWN (not-yet-wired-into-production) `CapturedBatchDecodeGraph`
         # class used a stale `TARGET_SPLITS = 16` from an earlier round,
@@ -1242,7 +1620,7 @@ class DirectModelRunner:
         # unless `--baseline-flashinfer` is passed) -- so this is a
         # same-kernel, different-launch-configuration gap, not a
         # different-kernel confound.
-        _DECODE_TARGET_SPLITS_PER_REQ = 64
+        _DECODE_TARGET_SPLITS_PER_REQ = 32
         capacity = self.blocks_per_slot * self.block_size
         self.decode_fixed_kv_split_size = max(1, -(-capacity // _DECODE_TARGET_SPLITS_PER_REQ))
         self.decode_fixed_max_num_splits = _DECODE_TARGET_SPLITS_PER_REQ
@@ -1259,8 +1637,9 @@ class DirectModelRunner:
         # unknown otherwise, and this graph is only ever used from
         # ``mtp_verify_and_commit_batch``).
         if self.enable_cudagraph and self.num_speculative_tokens is not None:
-            self._precapture_verify_graphs()
-            self._precapture_draft_step_graphs()
+            if self.num_slots >= 2 * self.num_slots:
+                self._precapture_verify_graphs()
+                self._precapture_draft_step_graphs()
 
     def _precapture_verify_graphs(self) -> None:
         # 2026-07-18, Phase 2 CUDA-graph reconciliation: only qo_len=k+1 is
@@ -1302,12 +1681,64 @@ class DirectModelRunner:
         cached = self._draft_step_graphs.get(key)
         if cached is not None:
             return cached
-        if self.num_slots < 2 * batch_size or self.mtp_model is None:
+        if batch_size > self.num_slots or self.mtp_model is None:
             return None
-        graph = CapturedMTPDraftStepGraph(self, batch_size=batch_size, qo_len=qo_len)
-        graph.capture()
+        if self.num_slots >= 2 * batch_size:
+            graph = CapturedMTPDraftStepGraph(self, batch_size=batch_size, qo_len=qo_len)
+            graph.capture()
+        else:
+            warmup_slots = list(range(batch_size))
+            graph = CapturedMTPDraftStepGraph(self, batch_size=batch_size, qo_len=qo_len,
+                                              warmup_slots=warmup_slots)
+            graph.capture()
         self._draft_step_graphs[key] = graph
         return graph
+
+    def precapture_cuda_graphs(self, batch_sizes: list[int] | None = None,
+                               qo_lens: list[int] | None = None) -> None:
+        """Pre-capture CUDA graphs during initialization, before any real
+        traffic. Uses real slots 0..batch_size-1 for warmup, then resets
+        them so they are fresh for real traffic. This eliminates the need
+        for permanently reserved warmup slots (which doubled KV cache
+        memory)."""
+        if not self.enable_cudagraph:
+            return
+        if batch_sizes is None:
+            batch_sizes = [self.num_slots]
+        if qo_lens is None:
+            qo_lens = [1]
+            if self.num_speculative_tokens is not None:
+                qo_lens.append(self.num_speculative_tokens + 1)
+        draft_qo_lens = qo_lens
+        if self.mtp_model is not None and self.num_speculative_tokens is not None:
+            draft_qo_lens = list(range(1, self.num_speculative_tokens + 2))
+        for bs in batch_sizes:
+            if bs > self.num_slots:
+                raise ValueError(f"batch_size {bs} exceeds num_slots {self.num_slots}")
+            warmup_slots = list(range(bs))
+            for qo in qo_lens:
+                key = (bs, qo)
+                if key not in self._verify_graphs:
+                    graph = CapturedBatchDecodeGraph(
+                        self, bs, qo_len=qo, warmup_slots=warmup_slots,
+                    )
+                    graph.capture()
+                    self._verify_graphs[key] = graph
+        if self.mtp_model is not None:
+            for bs in batch_sizes:
+                warmup_slots = list(range(bs))
+                for qo in draft_qo_lens:
+                    key = (bs, qo)
+                    if key not in self._draft_step_graphs:
+                        graph = CapturedMTPDraftStepGraph(
+                            self, bs, qo_len=qo, warmup_slots=warmup_slots,
+                        )
+                        graph.capture()
+                        self._draft_step_graphs[key] = graph
+        for bs in batch_sizes:
+            for slot in range(bs):
+                if self.slot_kv_len[slot] != 0:
+                    self.reset_slot(slot)
 
     def _get_verify_graph(self, batch_size: int, qo_len: int) -> "CapturedBatchDecodeGraph | None":
         """Lazily construct + capture (and cache, keyed by
@@ -1342,12 +1773,18 @@ class DirectModelRunner:
         cached = self._verify_graphs.get(key)
         if cached is not None:
             return cached
-        if self.num_slots < 2 * batch_size:
+        if batch_size > self.num_slots:
             return None
-        graph = CapturedBatchDecodeGraph(self, batch_size=batch_size, qo_len=qo_len)
-        graph.capture()
-        for s in graph._warmup_slots:
-            self.reset_slot(s)
+        if self.num_slots >= 2 * batch_size:
+            graph = CapturedBatchDecodeGraph(self, batch_size=batch_size, qo_len=qo_len)
+            graph.capture()
+            for s in graph._warmup_slots:
+                self.reset_slot(s)
+        else:
+            warmup_slots = list(range(batch_size))
+            graph = CapturedBatchDecodeGraph(self, batch_size=batch_size, qo_len=qo_len,
+                                             warmup_slots=warmup_slots)
+            graph.capture()
         self._verify_graphs[key] = graph
         return graph
 
@@ -1454,6 +1891,202 @@ class DirectModelRunner:
                 dtype=ssm_state.dtype,
                 device=self.device,
             )
+
+    def _allocate_gdn_checkpoint_pool(self) -> None:
+        # Persistent full-stack GDN checkpoint pool (P3.1, notes/2026-07-19-p3-
+        # implementation-plan.md step 3; R8-aware from day one). SEPARATE from
+        # the live per-slot gdn_snapshot_* buffers above (those keep their
+        # existing MTP role, untouched). Each checkpoint is a full 48-layer
+        # (conv_state, ssm_state) snapshot at an exact prefix boundary -- the
+        # recurrent state, so its size is INDEPENDENT of prefix length (~151 MB
+        # measured, the ~604 MB/4-slot figure). Fixed-address discipline: a pool
+        # slot's per-layer tensors are allocated once (lazily on first use) and
+        # never reallocated; the pool is bounded by max_checkpoints =
+        # byte_budget // per_checkpoint_bytes (default 8 GB => ~53 slots). Only
+        # called when enable_persistent_prefix_cache is on, so the default-off
+        # production path allocates nothing here (byte-for-byte P2).
+        self._gdn_ckpt_conv_shape: dict[str, tuple] = {}
+        self._gdn_ckpt_ssm_shape: dict[str, tuple] = {}
+        self._gdn_ckpt_conv_dtype: dict[str, torch.dtype] = {}
+        self._gdn_ckpt_ssm_dtype: dict[str, torch.dtype] = {}
+        per_checkpoint_bytes = 0
+        for name in self.gdn_layer_names:
+            conv_state, ssm_state = self.kv_caches[name]
+            # Column-0 row shapes (what snapshot_gdn_state captures): one row
+            # per layer, shape shape[1:]. The K spec rows are per-slot scratch,
+            # never cached (INV4 / MambaSpec.supports_eagle_cache_peek=False).
+            self._gdn_ckpt_conv_shape[name] = tuple(conv_state.shape[1:])
+            self._gdn_ckpt_ssm_shape[name] = tuple(ssm_state.shape[1:])
+            self._gdn_ckpt_conv_dtype[name] = conv_state.dtype
+            self._gdn_ckpt_ssm_dtype[name] = ssm_state.dtype
+            conv_elems = 1
+            for d in conv_state.shape[1:]:
+                conv_elems *= int(d)
+            ssm_elems = 1
+            for d in ssm_state.shape[1:]:
+                ssm_elems *= int(d)
+            per_checkpoint_bytes += (
+                conv_elems * conv_state.element_size() + ssm_elems * ssm_state.element_size()
+            )
+        self.gdn_ckpt_per_checkpoint_bytes = per_checkpoint_bytes
+        self.gdn_ckpt_max_checkpoints = max(
+            1, self.gdn_checkpoint_byte_budget // max(1, per_checkpoint_bytes)
+        )
+        # Per-layer pool-slot tensor lists, lazily allocated (None until first
+        # materialize into that slot), bounded by gdn_ckpt_max_checkpoints.
+        self.gdn_ckpt_conv: dict[str, list[torch.Tensor | None]] = {
+            name: [None] * self.gdn_ckpt_max_checkpoints for name in self.gdn_layer_names
+        }
+        self.gdn_ckpt_ssm: dict[str, list[torch.Tensor | None]] = {
+            name: [None] * self.gdn_ckpt_max_checkpoints for name in self.gdn_layer_names
+        }
+        # Meta keyed by the boundary tail block id ("key"): each entry records
+        # {key, hash_value, num_tokens, pool_slot, bytes, __slot__}. The
+        # hash_value tag is what makes a wrong-prefix restore REJECTED, not used
+        # (R1). _gdn_ckpt_by_hash is the reverse index reconcile_prefix_hit
+        # probes (sec 3.4 GDN boundary G). _gdn_ckpt_free is the free pool-slot
+        # stack; _gdn_ckpt_lru (OrderedDict, oldest-first) is maintained now and
+        # hardened into byte-budget eviction in P3.2 (here it is only the
+        # bounded-pool safety valve when the pool is full).
+        self.gdn_ckpt_meta: dict[int, dict] = {}
+        self._gdn_ckpt_by_hash: dict[int, int] = {}
+        self._gdn_ckpt_free: list[int] = list(range(self.gdn_ckpt_max_checkpoints))
+        self._gdn_ckpt_lru: OrderedDict[int, None] = OrderedDict()
+
+    def _gdn_ckpt_alloc_slot(self) -> int:
+        # Pop a free pool slot, or -- only if the bounded pool is full -- evict
+        # the LRU checkpoint to reclaim one (safety valve keeping the pool
+        # bounded; P3.2 replaces this with real byte-budget LRU eviction in
+        # lockstep with the attention index).
+        if self._gdn_ckpt_free:
+            return self._gdn_ckpt_free.pop()
+        lru_key = next(iter(self._gdn_ckpt_lru))
+        evicted_slot = self.gdn_ckpt_meta[lru_key]["pool_slot"]
+        self.evict_gdn_checkpoint(lru_key)
+        return evicted_slot
+
+    def materialize_gdn_checkpoint(
+        self, slot: int, key: int, hash_value: int, num_tokens: int
+    ) -> None:
+        # foreach_copy the 48-layer live state at _physical_slot(slot) (the
+        # column-0 conv/ssm rows the just-completed forward wrote) INTO a free
+        # pool slot, tagged with hash_value (R1's checkpoint-hash tag). The
+        # source is read-only. Idempotent on (key, hash_value): re-materializing
+        # the same boundary is a no-op. Mirrors snapshot_gdn_state's foreach_copy
+        # (same column-0 rows), but into the PERSISTENT pool instead of the live
+        # per-slot snapshot buffer.
+        existing = self.gdn_ckpt_meta.get(key)
+        if existing is not None:
+            if existing["hash_value"] == hash_value:
+                self._gdn_ckpt_lru.move_to_end(key)
+                return
+            # Same block id reused for a different prefix (post-eviction): drop
+            # the stale entry first.
+            self.evict_gdn_checkpoint(key)
+        # P3.2 byte-budget LRU (R8): if adding this checkpoint would exceed
+        # gdn_checkpoint_byte_budget, evict LRU checkpoints (lockstep with their
+        # keyed attention blocks) until it fits. Checkpoints exist only at
+        # chunk + completion boundaries, so this is a bounded, rare operation.
+        self._evict_gdn_checkpoints_for_budget(self.gdn_ckpt_per_checkpoint_bytes)
+        pool_slot = self._gdn_ckpt_alloc_slot()
+        physical = _physical_slot(slot)
+        conv_dsts, ssm_dsts, conv_srcs, ssm_srcs = [], [], [], []
+        for name in self.gdn_layer_names:
+            if self.gdn_ckpt_conv[name][pool_slot] is None:
+                self.gdn_ckpt_conv[name][pool_slot] = torch.zeros(
+                    self._gdn_ckpt_conv_shape[name],
+                    dtype=self._gdn_ckpt_conv_dtype[name],
+                    device=self.device,
+                )
+                self.gdn_ckpt_ssm[name][pool_slot] = torch.zeros(
+                    self._gdn_ckpt_ssm_shape[name],
+                    dtype=self._gdn_ckpt_ssm_dtype[name],
+                    device=self.device,
+                )
+            conv_state, ssm_state = self.kv_caches[name]
+            conv_dsts.append(self.gdn_ckpt_conv[name][pool_slot])
+            ssm_dsts.append(self.gdn_ckpt_ssm[name][pool_slot])
+            conv_srcs.append(conv_state[physical])
+            ssm_srcs.append(ssm_state[physical])
+        torch._foreach_copy_(conv_dsts, conv_srcs)
+        torch._foreach_copy_(ssm_dsts, ssm_srcs)
+        self.gdn_ckpt_meta[key] = {
+            "key": key,
+            "hash_value": hash_value,
+            "num_tokens": num_tokens,
+            "pool_slot": pool_slot,
+            "bytes": self.gdn_ckpt_per_checkpoint_bytes,
+            "__slot__": slot,
+        }
+        self._gdn_ckpt_by_hash[hash_value] = key
+        self._gdn_ckpt_lru[key] = None
+        self._gdn_ckpt_lru.move_to_end(key)
+
+    def checkpoint_view(self, key: int) -> dict | None:
+        # Return a snapshot-shaped dict for the checkpoint at boundary block
+        # "key", consumable UNCHANGED by the EXISTING restore_gdn_state(dest,
+        # view, allow_cross_slot=True) (P3 writes no second restore). The
+        # __slot__ tag is the SOURCE slot whose state was checkpointed (the
+        # cross-slot path only requires it to be non-None). Returns None if no
+        # checkpoint exists for key. Revives the entry in the LRU.
+        meta = self.gdn_ckpt_meta.get(key)
+        if meta is None:
+            return None
+        pool_slot = meta["pool_slot"]
+        view: dict = {"__slot__": meta["__slot__"]}
+        for name in self.gdn_layer_names:
+            view[name] = (
+                self.gdn_ckpt_conv[name][pool_slot],
+                self.gdn_ckpt_ssm[name][pool_slot],
+            )
+        self._gdn_ckpt_lru.move_to_end(key)
+        return view
+
+    def evict_gdn_checkpoint(self, key: int) -> None:
+        # Drop the checkpoint at boundary block "key": remove its meta + hash
+        # index + LRU entry and return its pool slot to the free stack (the
+        # pool-slot tensors stay allocated for reuse).
+        #
+        # LOCKSTEP, reverse direction (INV3/R5): the checkpoint is keyed by the
+        # attention tail block id == key, so dropping the checkpoint ALSO drops
+        # that block's hash -- but ONLY if the block is free (ref_cnt == 0). The
+        # two halves then never disagree about what is cached: a future
+        # reconcile finds A shrunk below this boundary (compute miss L=0), never
+        # a ghost attention hit with no GDN state. If the block is ref_cnt > 0
+        # (an active slot still references it), its hash stays -- losing only the
+        # checkpoint, which merely turns a future would-be hit into a safe
+        # compute miss (L = G <= A still holds). The forward direction
+        # (BlockPool._evict_one reclaiming the attention block) clears block_hash
+        # BEFORE calling here, so this reverse step is a no-op there.
+        meta = self.gdn_ckpt_meta.pop(key, None)
+        if meta is None:
+            return
+        self._gdn_ckpt_by_hash.pop(meta["hash_value"], None)
+        self._gdn_ckpt_lru.pop(key, None)
+        self._gdn_ckpt_free.append(meta["pool_slot"])
+        if 0 <= key < self.block_pool.num_blocks:
+            block = self.block_pool.blocks[key]
+            if block.ref_cnt == 0 and block.block_hash is not None:
+                self.block_pool.hash_to_block.pop(block.block_hash.value, None)
+                block.block_hash = None
+
+    def _evict_gdn_checkpoints_for_budget(self, incoming_bytes: int) -> None:
+        # P3.2 byte-budget LRU (R8): evict LRU checkpoints (oldest-first per
+        # _gdn_ckpt_lru) until adding ``incoming_bytes`` fits within
+        # gdn_checkpoint_byte_budget. Each eviction is lockstep (evict_gdn_
+        # checkpoint drops the co-keyed attention block's hash if free). Pure
+        # bookkeeping (no tensor ops), so it is unit-testable without a GPU.
+        # Never evicts the entry about to be (re-)materialized: callers handle
+        # the idempotent/stale-key cases before invoking this.
+        total_bytes = sum(meta["bytes"] for meta in self.gdn_ckpt_meta.values())
+        while (
+            self.gdn_ckpt_meta
+            and total_bytes + incoming_bytes > self.gdn_checkpoint_byte_budget
+        ):
+            lru_key = next(iter(self._gdn_ckpt_lru))
+            total_bytes -= self.gdn_ckpt_meta[lru_key]["bytes"]
+            self.evict_gdn_checkpoint(lru_key)
+
 
     def _ensure_blocks(self, slot: int, kv_len_needed: int) -> None:
         """P1 (notes/prefix-cache-design.md sec 5): grow
@@ -2048,7 +2681,13 @@ class DirectModelRunner:
         slot that never grew any blocks, because the flag was off the
         whole time, has an empty list here and this is a no-op)."""
         if self.block_table[slot]:
-            self.block_pool.free(self.block_table[slot])
+            # P3.2 (design doc sec 3.2/3.9): free in REVERSE logical order so a
+            # slot's deep-prefix (tail) blocks are enqueued ahead of its shallow
+            # ones and die first under eviction -- keeping shallow, more-shared
+            # prefixes cached longer. (Among hashed blocks, free appends to the
+            # LRU tail in call order, so the first-freed deep tail lands closest
+            # to the evict-next front.)
+            self.block_pool.free(list(reversed(self.block_table[slot])))
             self.block_table[slot] = []
         self.slot_kv_len[slot] = 0
         self.slot_gdn_initialized[slot] = False
@@ -2057,6 +2696,17 @@ class DirectModelRunner:
         # Phase 2 (2026-07-18): bootstrap value for the spec-decode GDN
         # mechanism -- see __init__'s field comment.
         self.slot_num_accepted_tokens[slot] = 1
+        # P3 (notes/2026-07-19-p3-implementation-plan.md step 4): reset this
+        # slot's LOCAL hash-chain view. The published blocks themselves stay in
+        # the global content index at ref_cnt == 0 (freed above, hash retained)
+        # so they remain hit-able across this reset (R10) -- only the slot's own
+        # cursor/chain is cleared for reuse by a new logical request.
+        self.slot_block_hashes[slot] = []
+        self.slot_published_blocks[slot] = 0
+        # P3.2 decode-position populate: clear this slot's committed-token
+        # record (the published blocks themselves stay in the global index at
+        # ref_cnt == 0, hash retained -- only the slot-local sequence is reset).
+        self.slot_committed_tokens[slot] = []
 
     def snapshot_gdn_state(self, slot: int) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
         """Copy out this slot's ``(conv_state, ssm_state)`` for every GDN
@@ -2157,7 +2807,11 @@ class DirectModelRunner:
         return snapshot
 
     def restore_gdn_state(
-        self, slot: int, snapshot: dict[str, tuple[torch.Tensor, torch.Tensor]]
+        self,
+        slot: int,
+        snapshot: dict[str, tuple[torch.Tensor, torch.Tensor]],
+        *,
+        allow_cross_slot: bool = False,
     ) -> None:
         """Restore this slot's GDN state from a prior
         ``snapshot_gdn_state()`` call -- writes IN PLACE into the same
@@ -2177,19 +2831,47 @@ class DirectModelRunner:
         no host round-trip and no ``.to(self.device)`` staging step -- the
         old CPU-clone path did both a D2H (in ``snapshot_gdn_state``) and
         an H2D (here) blocking pageable-memory copy per layer per slot."""
-        if snapshot.get("__slot__") != slot:
-            raise RuntimeError(
-                f"GDN snapshot was taken for slot {snapshot.get('__slot__')}, "
-                f"not slot {slot} -- refusing a cross-slot restore"
-            )
-        if snapshot.get("__consumed__"):
-            raise RuntimeError(f"GDN snapshot for slot {slot} was already restored once")
-        gen = snapshot.get("__generation__")
-        if gen != self.slot_gdn_snapshot_gen[slot]:
-            raise RuntimeError(
-                f"stale GDN snapshot for slot {slot}: snapshot generation {gen} != "
-                f"current {self.slot_gdn_snapshot_gen[slot]}"
-            )
+        if allow_cross_slot:
+            # P2 fan-out fork (notes/prefix-cache-design.md sec 5, "P2 --
+            # Fan-out fork", and sec 3.5 step 2): restore the LEADER's
+            # snapshot into a SIBLING slot. The snapshot's ``__slot__`` is
+            # the leader (the SOURCE of the recurrent state), which
+            # legitimately differs from the destination ``slot`` here, so
+            # the same-slot guard is relaxed. The generation counter is a
+            # SAME-slot staleness guard (it catches restoring a slot's own
+            # long-ago snapshot after that slot re-snapshotted itself); it
+            # is meaningless across slots, where freshness is instead
+            # guaranteed by the caller's synchronous structure --
+            # ``mtp_prefill_fanout_batch`` snapshots the leader and restores
+            # every sibling within ONE atomic admission tick, with no
+            # intervening re-snapshot of the leader (and the MTP verify path
+            # no longer calls snapshot_gdn_state at all, so the leader's
+            # snapshot buffer cannot be clobbered mid-fork). ``__consumed__``
+            # is deliberately NOT set below in this mode, so the ONE leader
+            # snapshot can seed all N siblings: each restore is a read-only
+            # D2D copy FROM the leader's fixed-address snapshot buffer INTO
+            # this slot's own kv_caches row, and the source buffer stays
+            # stable for the whole fork. R1 (GDN corruption on restore) is
+            # still guarded structurally -- the foreach_copy below reads the
+            # same 48-layer snapshot[name] tensors the leader populated.
+            if snapshot.get("__slot__") is None:
+                raise RuntimeError(
+                    "cross-slot GDN restore requires a real snapshot (missing __slot__ tag)"
+                )
+        else:
+            if snapshot.get("__slot__") != slot:
+                raise RuntimeError(
+                    f"GDN snapshot was taken for slot {snapshot.get('__slot__')}, "
+                    f"not slot {slot} -- refusing a cross-slot restore"
+                )
+            if snapshot.get("__consumed__"):
+                raise RuntimeError(f"GDN snapshot for slot {slot} was already restored once")
+            gen = snapshot.get("__generation__")
+            if gen != self.slot_gdn_snapshot_gen[slot]:
+                raise RuntimeError(
+                    f"stale GDN snapshot for slot {slot}: snapshot generation {gen} != "
+                    f"current {self.slot_gdn_snapshot_gen[slot]}"
+                )
         physical = _physical_slot(slot)
         # 2026-07-17, Phase 3 (round 2): same torch._foreach_copy_
         # launch-count reduction as snapshot_gdn_state's mirror-image
@@ -2204,7 +2886,8 @@ class DirectModelRunner:
             ssm_srcs.append(snap_ssm)
         torch._foreach_copy_(conv_dsts, conv_srcs)
         torch._foreach_copy_(ssm_dsts, ssm_srcs)
-        snapshot["__consumed__"] = True
+        if not allow_cross_slot:
+            snapshot["__consumed__"] = True
 
     def _mtp_forward(
         self,
@@ -2405,6 +3088,17 @@ class DirectModelRunner:
             k=self.num_speculative_tokens,
         )
         self.slot_pending_draft_tokens[slot] = draft_tokens
+        # P3 populate-on-completion (attention half): publish this prefill's
+        # full committed blocks to the content index. The GDN completion
+        # checkpoint is NOT materialized here -- a single-shot prefill's live
+        # GDN state is at prompt_len, not at the block-aligned completion
+        # boundary G = block_align_down(prompt_len - 1), so a correct checkpoint
+        # at G needs a forward that ENDS at G (mtp_prefill_with_cache's two-phase
+        # cold path / the fan-out leader at Lc). Publishing attention only here
+        # is safe: a later hit finds A>0 but G=0 => compute miss (L=0, cold
+        # recompute), never a wrong-prefix serve (sec 3.4).
+        if self.enable_persistent_prefix_cache:
+            self._publish_committed_blocks(slot, prompt_token_ids, len(prompt_token_ids))
         return {"anchor": anchor, "draft_tokens": draft_tokens}
 
     def mtp_verify_and_commit(self, slot: int, anchor: int, draft_tokens: list[int]) -> dict:
@@ -2521,6 +3215,10 @@ class DirectModelRunner:
 
         self.slot_kv_len[slot] = kv_len_before + committed_len
         self.slot_num_accepted_tokens[slot] = committed_len
+        # P3.2 decode-position populate: publish any newly-FULL committed blocks
+        # now that slot_kv_len advanced by the REAL committed length (only
+        # committed tokens; INV4). No-op off-flag.
+        self.publish_committed_decode_blocks(slot, real_new_tokens)
         # Ragged slice of the ONE verify forward's hidden states -- valid
         # for a full accept exactly as much as for any partial reject, see
         # the docstring above.
@@ -2732,7 +3430,7 @@ class DirectModelRunner:
         draft_step_graph = self._get_draft_step_graph(num_reqs) if self.enable_cudagraph else None
         for _ in range(1, k):
             if draft_step_graph is not None:
-                step_logits, step_hidden = draft_step_graph.replay(slots, prev_tokens, prev_hidden, running_prior_kv_len)
+                step_logits, step_hidden = draft_step_graph.replay_incremental(slots, prev_tokens, prev_hidden, running_prior_kv_len)
             else:
                 step_logits, step_hidden = self._mtp_forward_batch(
                     slots,
@@ -2847,12 +3545,13 @@ class DirectModelRunner:
         # before routing to that kernel) -- MUST NOT be used for a genuine
         # long prefill, which needs the general/chunked kernel instead.
         step0_graph = None
+        step0_qo_len_padded = 0
         if (
             self.enable_cudagraph
-            and len(set(num_new_tokens_list)) == 1
-            and num_new_tokens_list[0] <= _MAX_DECODE_QO_LEN
+            and max(num_new_tokens_list) <= _MAX_DECODE_QO_LEN
         ):
-            step0_graph = self._get_draft_step_graph(num_reqs, num_new_tokens_list[0])
+            step0_qo_len_padded = max(num_new_tokens_list)
+            step0_graph = self._get_draft_step_graph(num_reqs, step0_qo_len_padded)
         # 2026-07-18, D1-followup fix: whether step0's OWN return is already
         # gathered to last-position-only. NOT simply
         # ``step0_logits_last_position_only`` -- a caller (e.g.
@@ -2874,13 +3573,40 @@ class DirectModelRunner:
         # enough to matter in the first place.
         step0_already_last_only = False
         if step0_graph is not None:
-            step0_qo_len = num_new_tokens_list[0]
-            tokens_for_graph = (
-                [t[0] for t in shifted_input_ids_per_slot] if step0_qo_len == 1 else shifted_input_ids_per_slot
-            )
+            step0_qo_len = step0_qo_len_padded
+            is_uniform = len(set(num_new_tokens_list)) == 1
+            if is_uniform:
+                tokens_for_graph = (
+                    [t[0] for t in shifted_input_ids_per_slot] if step0_qo_len == 1 else shifted_input_ids_per_slot
+                )
+                hidden_for_graph = target_hidden_states
+            else:
+                tokens_for_graph = []
+                hidden_rows = []
+                row_start = 0
+                for i, n in enumerate(num_new_tokens_list):
+                    slot_tokens = list(shifted_input_ids_per_slot[i])
+                    if n < step0_qo_len:
+                        slot_tokens = slot_tokens + [slot_tokens[-1]] * (step0_qo_len - n)
+                    tokens_for_graph.append(slot_tokens)
+                    slot_hidden = target_hidden_states[row_start:row_start + n]
+                    if n < step0_qo_len:
+                        pad_rows = slot_hidden[-1:].expand(step0_qo_len - n, -1)
+                        slot_hidden = torch.cat([slot_hidden, pad_rows], dim=0)
+                    hidden_rows.append(slot_hidden)
+                    row_start += n
+                hidden_for_graph = torch.cat(hidden_rows, dim=0)
             step0_logits, step0_hidden = step0_graph.replay(
-                slots, tokens_for_graph, target_hidden_states, prior_kv_lens_step0
+                slots, tokens_for_graph, hidden_for_graph, prior_kv_lens_step0
             )
+            if not is_uniform:
+                real_last_indices = torch.tensor(
+                    [i * step0_qo_len + num_new_tokens_list[i] - 1 for i in range(num_reqs)],
+                    dtype=torch.long, device=step0_logits.device,
+                )
+                step0_logits = step0_logits.index_select(0, real_last_indices)
+                step0_hidden = step0_hidden.index_select(0, real_last_indices)
+                step0_already_last_only = True
         else:
             step0_logits, step0_hidden = self._mtp_forward_batch(
                 slots,
@@ -3150,6 +3876,13 @@ class DirectModelRunner:
             )
             for s in slots:
                 self.slot_pending_draft_tokens[s] = draft_tokens_by_slot[s]
+            # P3 populate-on-completion (attention half): publish each slot's
+            # full committed blocks. GDN completion checkpoint deferred to the
+            # two-phase cold path (see mtp_prefill's identical note) -- a
+            # single-shot prefill's live GDN state is at prompt_len, not G.
+            if self.enable_persistent_prefix_cache:
+                for i, s in enumerate(slots):
+                    self._publish_committed_blocks(s, prompts_per_slot[i], prompt_lens[i])
             return {s: {"anchor": anchors[s], "draft_tokens": draft_tokens_by_slot[s]} for s in slots}
 
         if not needs_chunking:
@@ -3198,6 +3931,13 @@ class DirectModelRunner:
             )
             for s in slots:
                 self.slot_pending_draft_tokens[s] = draft_tokens_by_slot[s]
+            # P3 populate-on-completion (attention half): publish each slot's
+            # full committed blocks. GDN completion checkpoint deferred to the
+            # two-phase cold path (see mtp_prefill's identical note) -- a
+            # single-shot prefill's live GDN state is at prompt_len, not G.
+            if self.enable_persistent_prefix_cache:
+                for i, s in enumerate(slots):
+                    self._publish_committed_blocks(s, prompts_per_slot[i], prompt_lens[i])
             return {s: {"anchor": anchors[s], "draft_tokens": draft_tokens_by_slot[s]} for s in slots}
 
         # Chunked path (2026-07-19). Processes the prompt in
@@ -3283,6 +4023,33 @@ class DirectModelRunner:
             if is_last_chunk:
                 step0_logits, step0_hidden = draft_logits_chunk, draft_hidden_chunk
 
+            # P3.2 chunk-boundary GDN checkpoints (Fork-2 coarse, step 5): at
+            # each NON-FINAL block-aligned chunk_end (every chunk_size boundary,
+            # default 8192), the target GDN forward has just ended at chunk_end,
+            # so its live state IS the state at chunk_end -- a FREE checkpoint
+            # point (no extra forward) giving 8192-granular cross-request partial
+            # sharing. Publish each slot's [.., chunk_end) attention blocks, then
+            # materialize the persistent GDN checkpoint keyed by the chunk_end
+            # tail block (same chained hash => INV3 agreement). The completion-
+            # boundary checkpoint (two-phase cold path / fan-out leader) remains
+            # separate. The chunked path is uniform-length (asserted above), so
+            # every slot shares these boundaries; each slot checkpoints its OWN
+            # physical GDN state.
+            if (
+                self.enable_persistent_prefix_cache
+                and not is_last_chunk
+                and chunk_end % self.block_size == 0
+            ):
+                num_chunk_blocks = chunk_end // self.block_size
+                for i, s in enumerate(slots):
+                    self._publish_committed_blocks(s, prompts_per_slot[i], chunk_end)
+                    self.materialize_gdn_checkpoint(
+                        s,
+                        key=self.block_table[s][num_chunk_blocks - 1],
+                        hash_value=self.slot_block_hashes[s][num_chunk_blocks - 1].value,
+                        num_tokens=chunk_end,
+                    )
+
             chunk_start = chunk_end
 
         assert step0_logits is not None and step0_hidden is not None
@@ -3299,7 +4066,951 @@ class DirectModelRunner:
         )
         for s in slots:
             self.slot_pending_draft_tokens[s] = draft_tokens[s]
+        # P3 populate-on-completion (attention half) for the chunked path. The
+        # GDN completion checkpoint at G is materialized only by a forward that
+        # ends at G (two-phase cold path); chunk boundaries (P3.2) add the rest.
+        if self.enable_persistent_prefix_cache:
+            for i, s in enumerate(slots):
+                self._publish_committed_blocks(s, prompts_per_slot[i], prompt_lens[i])
         return {s: {"anchor": anchors[s], "draft_tokens": draft_tokens[s]} for s in slots}
+
+    @staticmethod
+    def _common_prefix_len(prompts: list[list[int]]) -> int:
+        """Longest token prefix shared by EVERY prompt in ``prompts`` (direct
+        element-by-element comparison -- cheap for the <=4 same-round requests
+        the fixed-slot runtime ever admits at once; ``notes/prefix-cache-design
+        .md`` sec 5, "P2 -- Fan-out fork": "detect a common token prefix among
+        the same-round admit_now batch by direct comparison")."""
+        if not prompts:
+            return 0
+        first = prompts[0]
+        max_len = min(len(p) for p in prompts)
+        n = 0
+        while n < max_len and all(p[n] == first[n] for p in prompts):
+            n += 1
+        return n
+
+    def mtp_prefill_fanout_batch(
+        self,
+        slots: list[int],
+        prompts_per_slot: list[list[int]],
+        min_shared_prefix_tokens: int | None = None,
+    ) -> dict[int, dict]:
+        """P2 fan-out fork -- Pattern A same-round prefix sharing
+        (``notes/prefix-cache-design.md`` sec 5, "P2 -- Fan-out fork (Pattern
+        A, same-round sharing; self-contained)", and sec 3.5/3.6).
+
+        When ``enable_prefix_cache`` is on AND >=2 same-round requests share a
+        token prefix of at least one full block, the shared prefix is computed
+        ONCE and referenced by all siblings instead of being recomputed N
+        times:
+
+        1. Detect the common token prefix among the same-round admit batch by
+           direct comparison (``_common_prefix_len``, cheap for <=4 requests).
+        2. Prefill the group LEADER (``slots[0]``) over ``[0, Lc)`` -- where
+           ``Lc`` is the block-aligned common-prefix length, capped at
+           ``min(prompt_len) - 1`` so every request keeps >=1 suffix token to
+           recompute for its own logits (sec 3.8) -- forcing a GDN checkpoint
+           boundary there, then ``snapshot_gdn_state`` at ``Lc``.
+        3. Continue-prefill the leader's own suffix ``[Lc, leader_len)`` and
+           draft-sync the leader over its whole prompt (this writes the draft
+           layer's KV for ``[0, Lc)`` into the same shared blocks -- the draft
+           layer is in the attention group, sec 3.1).
+        4. For each SIBLING: reference the leader's ``[0, Lc)`` attention
+           blocks (``BlockPool.reference``, ``ref_cnt += 1``, all 17 attention
+           layers share the one block-id namespace), ``restore_gdn_state`` the
+           leader's snapshot (``allow_cross_slot=True``), set
+           ``slot_draft_sync_len = Lc``, and continue-prefill ONLY the
+           sibling's suffix ``[Lc, sibling_len)`` through the already-validated
+           chunked-prefill continuation machinery (``_forward_batch`` with
+           ``kv_lengths=[Lc]``/``commit``/``is_decode=False`` + the
+           ``_mtp_sync_and_propose_batch`` draft funnel).
+
+        No persistent hash index, no eviction -- the shared entry lives only
+        for this one admission round (P3 builds the persistent cache). Reuses
+        ONLY the P1 block-table/ref-counting substrate + the existing GDN
+        snapshot primitive + the chunked-continuation path; nothing here is a
+        parallel copy of those.
+
+        **Rollback-safe / byte-identical-to-P1 gate**: with ``enable_prefix_
+        cache`` off, OR fewer than 2 requests, OR a block-aligned common
+        prefix shorter than ``min_shared_prefix_tokens`` (default
+        ``block_size`` -- one full shareable block), this falls back to the
+        exact ``mtp_prefill_batch`` path, byte-for-byte P1 behavior.
+
+        Returns the same ``{slot: {"anchor": int, "draft_tokens": list[int]}}``
+        shape ``mtp_prefill_batch`` returns, for the leader AND every sibling.
+        """
+        if self.mtp_model is None or self.num_speculative_tokens is None:
+            raise RuntimeError("no MTP draft model loaded")
+        num_reqs = len(slots)
+        if len(prompts_per_slot) != num_reqs:
+            raise ValueError("slots and prompts_per_slot must have equal length")
+        if num_reqs == 0:
+            return {}
+
+        # Fork gate (rollback-safe boundary -- see docstring). Anything that
+        # does not clear it takes the exact P1 path, byte-for-byte.
+        if not self.enable_prefix_cache or num_reqs < 2:
+            return self.mtp_prefill_batch(slots, prompts_per_slot)
+        threshold = (
+            self.block_size if min_shared_prefix_tokens is None else min_shared_prefix_tokens
+        )
+        common = self._common_prefix_len(prompts_per_slot)
+        min_prompt_len = min(len(p) for p in prompts_per_slot)
+        lc = (min(common, min_prompt_len - 1) // self.block_size) * self.block_size
+        if lc < self.block_size or lc < threshold:
+            return self.mtp_prefill_batch(slots, prompts_per_slot)
+
+        # Defense in depth (R1): every prompt must really share [0, Lc) --
+        # true by construction (Lc <= common), asserted cheaply for <=4 reqs.
+        for p in prompts_per_slot:
+            if p[:lc] != prompts_per_slot[0][:lc]:
+                raise RuntimeError("fan-out fork: a request does not share the detected prefix")
+
+        leader = slots[0]
+        siblings = slots[1:]
+        leader_prompt = prompts_per_slot[0]
+        leader_len = len(leader_prompt)
+        num_prefix_blocks = lc // self.block_size
+
+        # Same fresh-slot contract as mtp_prefill_batch (every slot starts at
+        # kv_len 0 / draft_sync_len 0).
+        for s in slots:
+            if self.slot_kv_len[s] != 0 or self.slot_draft_sync_len[s] != 0:
+                raise RuntimeError(f"slot {s} is not fresh")
+            self.slot_num_accepted_tokens[s] = 1
+
+        # --- Leader phase 1: prefill the shared prefix [0, Lc), checkpoint
+        # the GDN state there (the fork point). ---
+        _, leader_hidden_prefix = self._forward_batch(
+            [leader],
+            [leader_prompt[:lc]],
+            [0],
+            qo_len=lc,
+            commit=True,
+            return_hidden=True,
+            is_decode=False,
+            logits_last_position_only=True,
+        )
+        leader_snapshot = self.snapshot_gdn_state(leader)
+        shared_blocks = list(self.block_table[leader][:num_prefix_blocks])
+        # P3 populate (cross-cutting decision 1): the fan-out leader's phase-1
+        # forward ENDS at Lc, so its live GDN state IS the state at Lc -- a
+        # correct completion checkpoint for the shared prefix. Publish the
+        # leader's [0, Lc) attention blocks + materialize the persistent GDN
+        # checkpoint at Lc so a FUTURE round (or another request sharing this
+        # prefix) can hit it. Purely additive under the flag (P2 unchanged off).
+        if self.enable_persistent_prefix_cache and num_prefix_blocks > 0:
+            self._publish_committed_blocks(leader, leader_prompt, lc)
+            self.materialize_gdn_checkpoint(
+                leader,
+                key=self.block_table[leader][num_prefix_blocks - 1],
+                hash_value=self.slot_block_hashes[leader][num_prefix_blocks - 1].value,
+                num_tokens=lc,
+            )
+
+        # --- Leader phase 2: continue-prefill the leader's own suffix
+        # [Lc, leader_len) (validated chunked-prefill continuation). Lc is
+        # capped at min_prompt_len - 1 <= leader_len - 1, so a non-empty
+        # suffix always exists here. ---
+        leader_logits_suffix, leader_hidden_suffix = self._forward_batch(
+            [leader],
+            [leader_prompt[lc:]],
+            [lc],
+            qo_len=leader_len - lc,
+            commit=True,
+            return_hidden=True,
+            is_decode=False,
+            logits_last_position_only=True,
+        )
+        leader_anchor = int(leader_logits_suffix[0].argmax(dim=-1).item())
+        leader_hidden = torch.cat([leader_hidden_prefix, leader_hidden_suffix], dim=0)
+
+        # Leader draft sync over the WHOLE prompt (step-0 resync + K-1
+        # continuation steps) -- exactly mtp_prefill_batch's uniform-path
+        # draft funnel. Writes the draft layer's KV for [0, leader_len) into
+        # the leader's blocks, INCLUDING the shared [0, Lc) blocks the
+        # siblings reference next (draft layer is in the attention group).
+        leader_drafts = self._mtp_sync_and_propose_batch(
+            [leader],
+            [leader_prompt[1:] + [leader_anchor]],
+            leader_hidden,
+            [0],
+            num_new_tokens=leader_len,
+            k=self.num_speculative_tokens,
+            step0_logits_last_position_only=True,
+        )
+        self.slot_pending_draft_tokens[leader] = leader_drafts[leader]
+        # P3 populate: publish the leader's remaining full blocks [Lc, leader_len)
+        # (the cursor advances from num_prefix_blocks); attention only -- the
+        # leader's live GDN state is now at leader_len, not a block boundary.
+        if self.enable_persistent_prefix_cache:
+            self._publish_committed_blocks(leader, leader_prompt, leader_len)
+        result: dict[int, dict] = {
+            leader: {"anchor": leader_anchor, "draft_tokens": leader_drafts[leader]}
+        }
+
+        # --- Siblings: reference the leader's [0, Lc) attention blocks +
+        # restore the leader's GDN snapshot, then continue-prefill each
+        # sibling's own suffix [Lc, sibling_len). ---
+        sibling_prompts = prompts_per_slot[1:]
+        suffix_per_slot = [p[lc:] for p in sibling_prompts]
+        suffix_lens = [len(sfx) for sfx in suffix_per_slot]
+        for s in siblings:
+            # Reference (ref_cnt += 1) the leader's [0, Lc) blocks -- all 17
+            # attention layers share the one block-id namespace (sec 3.1), so
+            # one reference call covers target + draft KV for the prefix.
+            self.block_table[s] = list(shared_blocks)
+            self.block_pool.reference(shared_blocks)
+            # Restore the leader's GDN state at Lc into this sibling (sec 3.5
+            # step 2); cross-slot by design (source = leader, dest = sibling).
+            self.restore_gdn_state(s, leader_snapshot, allow_cross_slot=True)
+            # Bookkeeping reproduces exactly the state computing [0, Lc) fresh
+            # would have produced (sec 3.5 steps 3-4).
+            self.slot_kv_len[s] = lc
+            self.slot_gdn_initialized[s] = True
+            self.slot_draft_sync_len[s] = lc
+            self.slot_num_accepted_tokens[s] = 1
+
+        # P3.2 decode-position populate: seed each sibling's committed-token
+        # record (its full prompt) so a later verify-commit can hash decode-
+        # produced blocks correctly (they may straddle the prompt tail + decode
+        # head). The shared [0, Lc) blocks are the leader's, already published
+        # by the leader under the flag; the incremental publish a decode round
+        # triggers is idempotent for them (same chained hash) and fresh for the
+        # suffix. Purely additive bookkeeping under the flag (the fan-out test
+        # runs with the persistent flag off => complete no-op there).
+        if self.enable_persistent_prefix_cache:
+            for j, s in enumerate(siblings):
+                self.slot_committed_tokens[s] = list(sibling_prompts[j])
+
+        # Batched target continue-prefill over the (ragged) suffixes: the
+        # validated chunked-prefill continuation (kv_lengths=[Lc], commit,
+        # is_decode=False; GDN has_initial_state=True since every sibling's
+        # slot_gdn_initialized is now True). Fresh suffix KV writes go to
+        # freshly-allocated PRIVATE blocks appended to each sibling's table.
+        sibling_logits, sibling_hidden = self._forward_batch(
+            siblings,
+            suffix_per_slot,
+            [lc] * len(siblings),
+            qo_len=suffix_lens,
+            commit=True,
+            return_hidden=True,
+            is_decode=False,
+            logits_last_position_only=True,
+        )
+        anchors = {s: int(sibling_logits[i].argmax(dim=-1).item()) for i, s in enumerate(siblings)}
+        shifted_suffix_per_slot = [
+            sibling_prompts[i][lc + 1 :] + [anchors[siblings[i]]] for i in range(len(siblings))
+        ]
+
+        # Batched draft step-0 sync over the suffixes + K-1 continuation
+        # steps. prior_kv_lens_step0 = slot_draft_sync_len = Lc for each
+        # sibling; the draft attends over the referenced [0, Lc) blocks and
+        # writes its own suffix KV into fresh private blocks.
+        sibling_drafts = self._mtp_sync_and_propose_batch(
+            siblings,
+            shifted_suffix_per_slot,
+            sibling_hidden,
+            [lc] * len(siblings),
+            num_new_tokens=suffix_lens,
+            k=self.num_speculative_tokens,
+            step0_logits_last_position_only=True,
+        )
+        for s in siblings:
+            self.slot_pending_draft_tokens[s] = sibling_drafts[s]
+            result[s] = {"anchor": anchors[s], "draft_tokens": sibling_drafts[s]}
+        return result
+
+    # ------------------------------------------------------------------
+    # P3.1 -- Persistent content-addressed prefix cache
+    # (notes/2026-07-19-p3-implementation-plan.md, "P3.1 -- Persistent-cache
+    # hit equivalence"). Write path: populate-on-completion (attention) +
+    # completion GDN checkpoint. Read path: reconciliation (L = G <= A) +
+    # restore-and-continue. All behind enable_persistent_prefix_cache
+    # (default False => byte-for-byte P2; L=0 => P2 fan-out/cold).
+    # ------------------------------------------------------------------
+
+    def _publish_committed_blocks(self, slot: int, token_ids: list[int], committed_len: int) -> int:
+        # Populate-on-completion (attention half, P3.1 step 5/6): publish the
+        # full committed blocks [slot_published_blocks[slot], committed_len //
+        # block_size) to the content index, growing this slot's chained hash.
+        # ONLY committed tokens are hashed/published -- the partial tail and any
+        # draft/verify tokens beyond commit are never touched (INV4; mirrors
+        # vLLM kv_cache_manager.py:456-465). Write-time dedup (step 6, sec 3.8):
+        # if get_cached_block(h_i) hits an existing B', paranoid-verify
+        # num_tokens (R7), then swap block_table[slot][i] -> B', touch([B']),
+        # free([fresh]) (the recomputed duplicate's memory is reclaimed -- the
+        # A>0,G=0 compute-miss reclamation). Else publish fresh. Returns the
+        # deepest published boundary in tokens. The draft layer needs no
+        # separate publish: it is the 17th attention-group member, so the same
+        # block_table[slot] blocks hold its KV (sec 3.1).
+        if not self.enable_persistent_prefix_cache:
+            return self.slot_published_blocks[slot] * self.block_size
+        # P3.2: keep the slot's full committed-token sequence available for
+        # hashing decode-produced blocks (which may straddle the prompt tail +
+        # decode head). At prefill this seeds it from the prompt
+        # (token_ids[:committed_len]); during decode populate the caller has
+        # already extended it to slot_kv_len, so this is a no-op there.
+        if len(self.slot_committed_tokens[slot]) < committed_len:
+            self.slot_committed_tokens[slot] = list(token_ids[:committed_len])
+        block_size = self.block_size
+        extra_keys = (self.kv_cache_dtype,)
+        full_blocks = committed_len // block_size
+        cursor = self.slot_published_blocks[slot]
+        parent_hash = self.slot_block_hashes[slot][cursor - 1].value if cursor > 0 else None
+        for i in range(cursor, full_blocks):
+            block_tokens = token_ids[i * block_size : (i + 1) * block_size]
+            h_i = hash_block_tokens(parent_hash, block_tokens, extra_keys)
+            block_hash = BlockHash(h_i, (i + 1) * block_size)
+            self.slot_block_hashes[slot].append(block_hash)
+            fresh_block_id = self.block_table[slot][i]
+            existing = self.block_pool.get_cached_block(h_i)
+            if existing is not None and existing.block_id != fresh_block_id:
+                if (
+                    existing.block_hash is None
+                    or existing.block_hash.num_tokens != (i + 1) * block_size
+                ):
+                    raise RuntimeError(
+                        f"prefix-cache dedup collision: block {existing.block_id} "
+                        f"num_tokens={getattr(existing.block_hash, 'num_tokens', None)} "
+                        f"!= {(i + 1) * block_size} for hash {h_i} (R7)"
+                    )
+                self.block_table[slot][i] = existing.block_id
+                self.block_pool.touch([existing.block_id])
+                self.block_pool.free([fresh_block_id])
+            else:
+                self.block_pool.cache_block(fresh_block_id, block_hash)
+            parent_hash = h_i
+        self.slot_published_blocks[slot] = full_blocks
+        return full_blocks * block_size
+
+    def publish_committed_decode_blocks(self, slot: int, committed_token_ids: list[int]) -> None:
+        """Decode-position populate (attention half, P3.2 step 4). Called by
+        both verify-commit funnels AFTER ``slot_kv_len`` advances by the REAL
+        committed length: append the newly-committed tokens to the slot's
+        committed sequence, then publish any newly-FULL committed blocks
+        ``[slot_published_blocks[slot], slot_kv_len[slot] // block_size)``,
+        chaining each hash from the last published block (via the incremental
+        ``_publish_committed_blocks``).
+
+        ``committed_token_ids`` are the tokens newly written into KV this round
+        (``[anchor] + committed[:-1]`` -- the recovery/bonus token is NOT yet
+        written, so it is excluded). ONLY committed tokens ever reach here
+        (INV4): rejected drafts never advance ``slot_kv_len``, so they are never
+        hashed or published (mirrors vLLM ``kv_cache_manager.py:456-465``).
+        No-op when the flag is off, and a no-op publish when no NEW full block
+        exists yet (the cursor simply does not advance)."""
+        if not self.enable_persistent_prefix_cache:
+            return
+        self.slot_committed_tokens[slot].extend(committed_token_ids)
+        self._publish_committed_blocks(
+            slot, self.slot_committed_tokens[slot], self.slot_kv_len[slot]
+        )
+
+    def _compute_prompt_block_hashes(
+        self, token_ids: list[int], max_tokens: int
+    ) -> list[BlockHash]:
+        # Chained hashes of full blocks, capped at max_tokens (= len(T) - 1 on
+        # lookup so the last token is always recomputed for logits; vLLM
+        # kv_cache_manager.py:225-231). Pure CPU, O(blocks). Block i's hash
+        # depends on all tokens 0..(i+1)*block_size via the chain.
+        block_size = self.block_size
+        extra_keys = (self.kv_cache_dtype,)
+        num_blocks = max_tokens // block_size if max_tokens > 0 else 0
+        hashes: list[BlockHash] = []
+        parent_hash = None
+        for i in range(num_blocks):
+            block_tokens = token_ids[i * block_size : (i + 1) * block_size]
+            h_i = hash_block_tokens(parent_hash, block_tokens, extra_keys)
+            hashes.append(BlockHash(h_i, (i + 1) * block_size))
+            parent_hash = h_i
+        return hashes
+
+    def reconcile_prefix_hit(self, token_ids: list[int]) -> int:
+        # Reconciliation (sec 3.4), specialized to two cache groups (no
+        # iterative solver): L = G <= A.
+        #   A = attention match -- walk hashes left-to-right, stop at first miss
+        #       (the attention group is downward-closed: any prefix of a hit is
+        #       a hit). A = matched_blocks * block_size.
+        #   G = GDN boundary -- the largest checkpoint boundary Lc <= A with a
+        #       GDN checkpoint under the SAME chained hash at Lc. In P3.1
+        #       checkpoints exist only at completion boundaries, so G is that
+        #       boundary or 0.
+        #   L = G (always <= A, always block-aligned). A>0,G=0 => compute miss
+        #       (L=0, prefill fresh -- vLLM v1's rule); write-time dedup still
+        #       reclaims the recomputed attention blocks.
+        if not self.enable_persistent_prefix_cache:
+            return 0
+        block_size = self.block_size
+        hashes = self._compute_prompt_block_hashes(token_ids, len(token_ids) - 1)
+        matched_blocks = 0
+        for bh in hashes:
+            if self.block_pool.get_cached_block(bh.value) is None:
+                break
+            matched_blocks += 1
+        a = matched_blocks * block_size
+        if a == 0:
+            return 0
+        g = 0
+        for boundary_blocks in range(matched_blocks, 0, -1):
+            hash_value = hashes[boundary_blocks - 1].value
+            ckpt_key = self._gdn_ckpt_by_hash.get(hash_value)
+            if ckpt_key is None:
+                continue
+            meta = self.gdn_ckpt_meta.get(ckpt_key)
+            if meta is not None and meta["num_tokens"] == boundary_blocks * block_size:
+                g = boundary_blocks * block_size
+                break
+        return g
+
+    def restore_cached_prefix(self, slot: int, token_ids: list[int], L: int) -> None:
+        # The sec 3.5 reuse steps 1-4 for a FRESH slot: reserve-and-touch the
+        # [0, L) attention blocks BEFORE any forward (R4/INV9), restore the GDN
+        # checkpoint at L (reusing the existing cross-slot restore -- P3 writes
+        # no second restore), and set the bookkeeping to exactly what computing
+        # [0, L) fresh would have produced. R1 addressing proof hook: the
+        # checkpoint at L must be tagged with the SAME chained hash as this
+        # prompt's boundary block at L -- a wrong-prefix checkpoint is REJECTED,
+        # not used.
+        block_size = self.block_size
+        num_blocks = L // block_size
+        if num_blocks <= 0:
+            raise RuntimeError(f"restore_cached_prefix requires L >= block_size, got L={L}")
+        if self.block_table[slot]:
+            raise RuntimeError(f"restore_cached_prefix: slot {slot} is not fresh")
+        hashes = self._compute_prompt_block_hashes(token_ids, len(token_ids) - 1)
+        if len(hashes) < num_blocks:
+            raise RuntimeError(
+                f"restore_cached_prefix: prompt yields {len(hashes)} blocks < {num_blocks}"
+            )
+        matched_ids: list[int] = []
+        for i in range(num_blocks):
+            block = self.block_pool.get_cached_block(hashes[i].value)
+            if block is None:
+                raise RuntimeError(
+                    f"prefix-cache hit lost block {i} (hash {hashes[i].value}) mid-restore"
+                )
+            matched_ids.append(block.block_id)
+        boundary_hash = hashes[num_blocks - 1].value
+        ckpt_key = self._gdn_ckpt_by_hash.get(boundary_hash)
+        if ckpt_key is None:
+            raise RuntimeError(
+                f"prefix-cache hit at L={L} has no GDN checkpoint (hash {boundary_hash})"
+            )
+        meta = self.gdn_ckpt_meta[ckpt_key]
+        if meta["hash_value"] != boundary_hash:
+            raise RuntimeError(
+                f"R1 reject: GDN checkpoint hash {meta['hash_value']} != prompt boundary "
+                f"hash {boundary_hash} -- a wrong-prefix checkpoint is rejected, not used"
+            )
+        # Step 1: reference the [0, L) attention blocks (all 17 attention layers
+        # share the one block-id namespace, sec 3.1). touch revives any block
+        # parked at ref_cnt == 0 in the free queue (a freed-but-published block).
+        self.block_table[slot] = list(matched_ids)
+        self.block_pool.touch(matched_ids)
+        # Step 2: restore the GDN checkpoint at L.
+        view = self.checkpoint_view(ckpt_key)
+        if view is None:
+            raise RuntimeError(f"prefix-cache hit at L={L}: checkpoint view is None")
+        self.restore_gdn_state(slot, view, allow_cross_slot=True)
+        self.slot_gdn_initialized[slot] = True
+        # Steps 3-4: bookkeeping reproduces computing [0, L) fresh.
+        self.slot_draft_sync_len[slot] = L
+        self.slot_kv_len[slot] = L
+        self.slot_num_accepted_tokens[slot] = 1
+        self.slot_block_hashes[slot] = list(hashes[:num_blocks])
+        self.slot_published_blocks[slot] = num_blocks
+
+    def _prefill_cold_with_populate(self, slot: int, prompt: list[int]) -> dict:
+        # Two-phase cold prefill that materializes a CORRECT GDN completion
+        # checkpoint at G = block_align_down(prompt_len - 1). A single-shot
+        # prefill's live GDN state is at prompt_len, NOT at G -- so to capture
+        # the state AT G, phase 1 prefills [0, G) (its GDN forward ENDS at G),
+        # publishes [0, G//16) + materializes the checkpoint, then phase 2
+        # continue-prefills [G, prompt_len). Token-identical to a single-shot
+        # cold prefill (it IS chunked prefill with one boundary at G); mirrors
+        # the proven P2 fan-out leader two-phase pattern. This is the dedicated
+        # test's producing path (the only path that creates a correct completion
+        # checkpoint in P3.1).
+        if self.slot_kv_len[slot] != 0 or self.slot_draft_sync_len[slot] != 0:
+            raise RuntimeError(f"slot {slot} is not fresh")
+        self.slot_num_accepted_tokens[slot] = 1
+        prompt_len = len(prompt)
+        k = self.num_speculative_tokens
+        g = ((prompt_len - 1) // self.block_size) * self.block_size
+        if g >= self.block_size:
+            phase1_logits, phase1_hidden = self._forward_batch(
+                [slot], [prompt[:g]], [0], qo_len=g, commit=True,
+                return_hidden=True, is_decode=False, logits_last_position_only=True,
+            )
+            self._publish_committed_blocks(slot, prompt, g)
+            num_g_blocks = g // self.block_size
+            self.materialize_gdn_checkpoint(
+                slot,
+                key=self.block_table[slot][num_g_blocks - 1],
+                hash_value=self.slot_block_hashes[slot][num_g_blocks - 1].value,
+                num_tokens=g,
+            )
+            suffix_len = prompt_len - g
+            suffix_tokens = prompt[g:]
+            suffix_logits, suffix_hidden = self._forward_batch(
+                [slot],
+                [suffix_tokens] if suffix_len > 1 else [suffix_tokens[0]],
+                [g], qo_len=suffix_len, commit=True,
+                return_hidden=True, is_decode=False, logits_last_position_only=True,
+            )
+            anchor = int(suffix_logits[0].argmax(dim=-1).item())
+            hidden = torch.cat([phase1_hidden, suffix_hidden], dim=0)
+            draft_tokens_by_slot = self._mtp_sync_and_propose_batch(
+                [slot], [prompt[1:] + [anchor]], hidden, [0],
+                num_new_tokens=prompt_len, k=k, step0_logits_last_position_only=True,
+            )
+            self._publish_committed_blocks(slot, prompt, prompt_len)
+            self.slot_pending_draft_tokens[slot] = draft_tokens_by_slot[slot]
+            return {"anchor": anchor, "draft_tokens": draft_tokens_by_slot[slot]}
+        # Prompt too short for a full-block boundary < prompt_len
+        # (prompt_len <= block_size): plain single-shot cold prefill; publish
+        # whatever full blocks exist (the completion checkpoint needs a forward
+        # ending at G >= block_size, impossible here).
+        target_logits, target_hidden = self._forward_batch(
+            [slot],
+            [prompt] if prompt_len > 1 else [prompt[0]],
+            [0], qo_len=prompt_len, commit=True,
+            return_hidden=True, is_decode=False, logits_last_position_only=True,
+        )
+        anchor = int(target_logits[0].argmax(dim=-1).item())
+        draft_tokens_by_slot = self._mtp_sync_and_propose_batch(
+            [slot], [prompt[1:] + [anchor]], target_hidden, [0],
+            num_new_tokens=prompt_len, k=k, step0_logits_last_position_only=True,
+        )
+        self._publish_committed_blocks(slot, prompt, prompt_len)
+        self.slot_pending_draft_tokens[slot] = draft_tokens_by_slot[slot]
+        return {"anchor": anchor, "draft_tokens": draft_tokens_by_slot[slot]}
+
+    def _prefill_hit_with_cache(self, slot: int, prompt: list[int], L: int) -> dict:
+        # Restore-and-continue hit (sec 3.5): restore the [0, L) attention
+        # blocks + GDN checkpoint at L (restore_cached_prefix), then continue-
+        # prefill the suffix [L, prompt_len) via the EXACT validated continuation
+        # the P2 fan-out sibling path uses (_forward_batch([s],[suffix],[L],
+        # qo_len=suffix_len, commit, is_decode=False) + _mtp_sync_and_propose_
+        # batch([s],[prompt[L+1:]+[anchor]], hidden,[L], num_new_tokens=
+        # suffix_len, k=K)). L=0 never reaches here.
+        if self.slot_kv_len[slot] != 0 or self.slot_draft_sync_len[slot] != 0:
+            raise RuntimeError(f"slot {slot} is not fresh")
+        self.restore_cached_prefix(slot, prompt, L)
+        prompt_len = len(prompt)
+        suffix_len = prompt_len - L
+        k = self.num_speculative_tokens
+        suffix_tokens = prompt[L:]
+        suffix_logits, suffix_hidden = self._forward_batch(
+            [slot],
+            [suffix_tokens] if suffix_len > 1 else [suffix_tokens[0]],
+            [L], qo_len=suffix_len, commit=True,
+            return_hidden=True, is_decode=False, logits_last_position_only=True,
+        )
+        anchor = int(suffix_logits[0].argmax(dim=-1).item())
+        draft_tokens_by_slot = self._mtp_sync_and_propose_batch(
+            [slot], [prompt[L + 1 :] + [anchor]], suffix_hidden, [L],
+            num_new_tokens=suffix_len, k=k, step0_logits_last_position_only=True,
+        )
+        # Publish the suffix's full committed blocks (attention) so future
+        # longer requests can hit deeper. The GDN checkpoint at the new
+        # completion boundary is deferred (live GDN state is at prompt_len, not
+        # a block boundary -- a correct one needs a forward ending there).
+        self._publish_committed_blocks(slot, prompt, prompt_len)
+        self.slot_pending_draft_tokens[slot] = draft_tokens_by_slot[slot]
+        return {"anchor": anchor, "draft_tokens": draft_tokens_by_slot[slot]}
+
+    def mtp_prefill_warm_continue(self, slot: int, prompt: list[int], prior_len: int) -> dict:
+        # P4b session affinity -- zero-restore continuation of a WARM slot. The
+        # slot already holds [0, prior_len) KV + GDN LIVE (turn-1's committed
+        # content; it was retained, never reset_slot-ed), so prefill ONLY the
+        # suffix [prior_len, prompt_len). Mirrors _prefill_hit_with_cache MINUS
+        # the restore_cached_prefix call -- there is nothing to restore, because
+        # the boundary state IS turn-1's live state (even more faithful than a
+        # restore). Gated: only the server's session-affinity admission path ever
+        # calls this; with the flag off it is never reached, so the frozen
+        # P0-P3 + P4a paths stay byte-for-byte untouched. Reuses ONLY the private
+        # primitives the hit path already uses (_forward_batch,
+        # _mtp_sync_and_propose_batch, _publish_committed_blocks).
+        if not self.enable_persistent_prefix_cache:
+            raise RuntimeError("mtp_prefill_warm_continue requires the persistent prefix cache")
+        if self.mtp_model is None or self.num_speculative_tokens is None:
+            raise RuntimeError("mtp_prefill_warm_continue: no MTP draft model loaded")
+        if self.slot_kv_len[slot] != prior_len or not self.slot_gdn_initialized[slot]:
+            raise RuntimeError(
+                f"mtp_prefill_warm_continue: slot {slot} is not warm at prior_len={prior_len} "
+                f"(kv_len={self.slot_kv_len[slot]}, gdn_init={self.slot_gdn_initialized[slot]})"
+            )
+        # Authoritative prefix match: the slot's committed-token record (P1+C1)
+        # must equal the new prompt through prior_len. Any mismatch => the caller
+        # must fall back to the cold/restore path (the server catches this raise).
+        if self.slot_committed_tokens[slot][:prior_len] != prompt[:prior_len]:
+            raise RuntimeError(
+                "mtp_prefill_warm_continue: prefix mismatch -- caller must fall back"
+            )
+        # Reset draft state to the committed boundary; discard turn-1's draft-ahead.
+        # _mtp_sync_and_propose_batch requires prior_kv_lens_step0 == start_pos_list
+        # (its own contract), so slot_draft_sync_len MUST be prior_len before the
+        # call below with start_pos_list=[prior_len]. The committed draft KV
+        # [0, prior_len) is valid (the draft layer is the 17th attention-group
+        # member sharing block_table[slot]); the speculative [prior_len, old) is
+        # overwritten by the suffix step-0 sync + K-1 continuation steps, and any
+        # stale KV beyond the new draft_sync_len is never read. slot_num_accepted_
+        # tokens=1 bootstraps the spec-decode GDN mechanism for the next verify
+        # round, exactly as restore_cached_prefix and the fanout sibling do.
+        self.slot_draft_sync_len[slot] = prior_len
+        self.slot_num_accepted_tokens[slot] = 1
+        self.slot_pending_draft_tokens[slot] = None
+        prompt_len = len(prompt)
+        suffix_len = prompt_len - prior_len
+        k = self.num_speculative_tokens
+        suffix_tokens = prompt[prior_len:]
+        suffix_logits, suffix_hidden = self._forward_batch(
+            [slot],
+            [suffix_tokens] if suffix_len > 1 else [suffix_tokens[0]],
+            [prior_len], qo_len=suffix_len, commit=True,
+            return_hidden=True, is_decode=False, logits_last_position_only=True,
+        )
+        anchor = int(suffix_logits[0].argmax(dim=-1).item())
+        draft_tokens_by_slot = self._mtp_sync_and_propose_batch(
+            [slot], [prompt[prior_len + 1 :] + [anchor]], suffix_hidden, [prior_len],
+            num_new_tokens=suffix_len, k=k, step0_logits_last_position_only=True,
+        )
+        # Publish the suffix's full committed blocks (attention) so future longer
+        # requests can hit deeper. The completion GDN checkpoint at the new boundary
+        # is deferred (live GDN is at prompt_len, not a block boundary -- mirrors
+        # the hit path); warm sessions continue in place anyway, and the content-
+        # hash fallback still hits at turn-1's completion checkpoint.
+        self._publish_committed_blocks(slot, prompt, prompt_len)
+        self.slot_pending_draft_tokens[slot] = draft_tokens_by_slot[slot]
+        return {"anchor": anchor, "draft_tokens": draft_tokens_by_slot[slot]}
+
+    def mtp_prefill_with_cache(
+        self,
+        slots: list[int],
+        prompts_per_slot: list[list[int]],
+        chunk_size: int | None = None,
+    ) -> dict[int, dict]:
+        # P3.3 -- UNIFIED production prefill entrypoint (test-driven in P3.1;
+        # production-wired in P3.3a). ONE batched path composes persistent-hit
+        # + P2 same-round fan-out + cold:
+        #   * Per slot, reconcile_prefix_hit yields L.
+        #   * HIT set (L>0): restore_cached_prefix each (references the [0,L_s)
+        #     attention blocks + restores the GDN checkpoint at L_s), then
+        #     continue-prefill ALL hit slots' RAGGED suffixes in ONE batched
+        #     _forward_batch + ONE _mtp_sync_and_propose_batch -- the proven P2
+        #     fan-out sibling ragged-suffix pattern (mtp_prefill_fanout_batch's
+        #     sibling block) generalized from a SHARED Lc to PER-SLOT L_s
+        #     (ragged kv_lengths=[L_s], qo_len=[suffix_len_s]). A single hit
+        #     slot reduces TOKEN-IDENTICALLY to _prefill_hit_with_cache: a
+        #     1-element qo_len LIST normalizes to the same flat tokens /
+        #     positions / GDN metadata as the scalar qo_len the helper passes
+        #     (qo_len==1 takes build_gdn_metadata_batch's decode branch either
+        #     way; qo_len>1 resolves slot_initialized=[True] either way).
+        #   * COLD set (L==0): >=2 cold slots hand to the EXISTING
+        #     mtp_prefill_fanout_batch (P2 same-round fork detection among cold
+        #     slots, falling back to mtp_prefill_batch); a single cold slot uses
+        #     the two-phase _prefill_cold_with_populate so its COMPLETION GDN
+        #     checkpoint is materialized (a future re-request must hit it --
+        #     mtp_prefill_batch/fanout publish attention blocks but materialize
+        #     no per-slot completion checkpoint, so routing a lone cold slot
+        #     there would silently disable hit-after-cold). A persistent hit
+        #     always wins over a same-round fork (hits are removed before the
+        #     cold hand-off).
+        # Returns the same {slot: {"anchor","draft_tokens"}} shape as
+        # mtp_prefill_batch. Rollback spine: flag off => delegate to
+        # mtp_prefill_batch (byte-for-byte P2); a slot's L=0 => the cold/fanout
+        # path => byte-for-byte P2 OUTPUT for it.
+        if self.mtp_model is None or self.num_speculative_tokens is None:
+            raise RuntimeError("no MTP draft model loaded")
+        if len(slots) != len(prompts_per_slot):
+            raise ValueError("slots and prompts_per_slot must have equal length")
+        if not self.enable_persistent_prefix_cache:
+            return self.mtp_prefill_batch(slots, prompts_per_slot, chunk_size)
+        if len(slots) == 0:
+            return {}
+
+        # Per-slot reconciliation (sec 3.4): L = G <= A.
+        L_per_slot = [self.reconcile_prefix_hit(p) for p in prompts_per_slot]
+        hit_idx = [i for i, L in enumerate(L_per_slot) if L > 0]
+        cold_idx = [i for i, L in enumerate(L_per_slot) if L == 0]
+
+        result: dict[int, dict] = {}
+
+        # --- HIT set: restore each, then batched ragged continue-prefill. ---
+        # When chunk_size is given and any hit suffix exceeds it, the hit
+        # block switches to a chunked continue-prefill (Phase A INV8 lift,
+        # 2026-07-20): uniform-suffix batches use the batched chunked pattern
+        # from mtp_prefill_batch's cold chunked path; ragged-suffix batches
+        # process each slot independently with chunking. Suffixes that fit
+        # in one chunk take the EXISTING monolithic path, byte-for-byte.
+        if hit_idx:
+            hit_slots = [slots[i] for i in hit_idx]
+            hit_prompts = [prompts_per_slot[i] for i in hit_idx]
+            hit_L = [L_per_slot[i] for i in hit_idx]
+            k = self.num_speculative_tokens
+            # Same fresh-slot contract as _prefill_hit_with_cache; restore the
+            # [0, L_s) attention blocks + GDN checkpoint at L_s (reserve-and-
+            # touch before any forward, R4/INV9) and set the bookkeeping to
+            # exactly what computing [0, L_s) fresh would have produced.
+            for s, p, L in zip(hit_slots, hit_prompts, hit_L):
+                if self.slot_kv_len[s] != 0 or self.slot_draft_sync_len[s] != 0:
+                    raise RuntimeError(f"slot {s} is not fresh")
+                self.restore_cached_prefix(s, p, L)
+            # Ragged suffix continue-prefill (generalizes the fan-out sibling
+            # block): kv_lengths=[L_s], qo_len=[suffix_len_s]. Fresh suffix KV
+            # writes go to freshly-allocated PRIVATE blocks appended to each
+            # slot's table; GDN has_initial_state=True (restore initialized it).
+            suffix_per_slot = [p[L:] for p, L in zip(hit_prompts, hit_L)]
+            suffix_lens = [len(sfx) for sfx in suffix_per_slot]
+
+            use_chunked_hit = chunk_size is not None and max(suffix_lens) > chunk_size
+
+            if not use_chunked_hit:
+                # === MONOLITHIC PATH (byte-for-byte unchanged) ===
+                suffix_logits, suffix_hidden = self._forward_batch(
+                    hit_slots,
+                    suffix_per_slot,
+                    list(hit_L),
+                    qo_len=suffix_lens,
+                    commit=True,
+                    return_hidden=True,
+                    is_decode=False,
+                    logits_last_position_only=True,
+                )
+                anchors = {
+                    s: int(suffix_logits[i].argmax(dim=-1).item()) for i, s in enumerate(hit_slots)
+                }
+                shifted_suffix_per_slot = [
+                    hit_prompts[i][hit_L[i] + 1 :] + [anchors[hit_slots[i]]]
+                    for i in range(len(hit_slots))
+                ]
+                # Batched draft step-0 sync over the suffixes + K-1 continuation
+                # steps. prior_kv_lens_step0 = slot_draft_sync_len = L_s for each
+                # slot; the draft attends over the referenced [0, L_s) blocks and
+                # writes its own suffix KV into fresh private blocks.
+                hit_drafts = self._mtp_sync_and_propose_batch(
+                    hit_slots,
+                    shifted_suffix_per_slot,
+                    suffix_hidden,
+                    list(hit_L),
+                    num_new_tokens=suffix_lens,
+                    k=k,
+                    step0_logits_last_position_only=True,
+                )
+                for i, s in enumerate(hit_slots):
+                    # Publish the suffix's full committed blocks (attention) so
+                    # future longer requests can hit deeper; the completion GDN
+                    # checkpoint at the new boundary is deferred (live GDN state is
+                    # at prompt_len, not a block boundary).
+                    self._publish_committed_blocks(s, hit_prompts[i], len(hit_prompts[i]))
+                    self.slot_pending_draft_tokens[s] = hit_drafts[s]
+                    result[s] = {"anchor": anchors[s], "draft_tokens": hit_drafts[s]}
+
+            elif len(set(suffix_lens)) == 1:
+                # === UNIFORM SUFFIX CHUNKED PATH ===
+                # All hit slots share the same suffix length (the common
+                # benchmark scenario). Follows the EXACT pattern from
+                # mtp_prefill_batch's cold chunked path, but with per-slot
+                # running_kv_lens (hit_L values may differ per slot even
+                # though suffix_len is uniform).
+                suffix_len = suffix_lens[0]
+                num_hit = len(hit_slots)
+                # Bound TOTAL tokens per chunk at ~chunk_size (matching native
+                # vLLM's max_num_batched_tokens): each slot gets chunk_size //
+                # num_hit tokens per chunk, so the batched forward processes
+                # num_hit × (chunk_size // num_hit) ≈ chunk_size tokens total.
+                effective_chunk = max(1, chunk_size // num_hit)
+                running_kv_lens = list(hit_L)
+                running_draft_lens = list(hit_L)
+                anchors = {}
+                step0_logits = None
+                step0_hidden = None
+                chunk_start = 0
+                while chunk_start < suffix_len:
+                    chunk_end = min(chunk_start + effective_chunk, suffix_len)
+                    this_chunk_len = chunk_end - chunk_start
+                    is_last_chunk = chunk_end == suffix_len
+                    chunk_tokens_per_slot = [
+                        p[hit_L[i] + chunk_start : hit_L[i] + chunk_end]
+                        for i, p in enumerate(hit_prompts)
+                    ]
+
+                    target_logits_chunk, target_hidden_chunk = self._forward_batch(
+                        hit_slots,
+                        chunk_tokens_per_slot if this_chunk_len > 1 else [t[0] for t in chunk_tokens_per_slot],
+                        list(running_kv_lens),
+                        qo_len=this_chunk_len,
+                        commit=True,
+                        return_hidden=True,
+                        is_decode=False,
+                        logits_last_position_only=True,
+                    )
+                    for i in range(num_hit):
+                        running_kv_lens[i] += this_chunk_len
+
+                    if is_last_chunk:
+                        for i, s in enumerate(hit_slots):
+                            anchors[s] = int(target_logits_chunk[i].argmax(dim=-1).item())
+                        shifted_chunk_per_slot = [
+                            hit_prompts[i][hit_L[i] + chunk_start + 1 : hit_L[i] + suffix_len] + [anchors[hit_slots[i]]]
+                            for i in range(num_hit)
+                        ]
+                    else:
+                        shifted_chunk_per_slot = [
+                            hit_prompts[i][hit_L[i] + chunk_start + 1 : hit_L[i] + chunk_end + 1]
+                            for i in range(num_hit)
+                        ]
+
+                    draft_logits_chunk, draft_hidden_chunk = self._mtp_forward_batch(
+                        hit_slots,
+                        shifted_chunk_per_slot if this_chunk_len > 1 else [t[0] for t in shifted_chunk_per_slot],
+                        target_hidden_chunk,
+                        list(running_draft_lens),
+                        list(running_draft_lens),
+                        qo_len=this_chunk_len,
+                        is_decode=False,
+                        logits_last_position_only=True,
+                    )
+                    for i, s in enumerate(hit_slots):
+                        self.slot_draft_sync_len[s] += this_chunk_len
+                        running_draft_lens[i] += this_chunk_len
+
+                    if is_last_chunk:
+                        step0_logits, step0_hidden = draft_logits_chunk, draft_hidden_chunk
+
+                    if (
+                        self.enable_persistent_prefix_cache
+                        and not is_last_chunk
+                    ):
+                        for i, s in enumerate(hit_slots):
+                            abs_chunk_end = hit_L[i] + chunk_end
+                            if abs_chunk_end % self.block_size == 0:
+                                num_chunk_blocks = abs_chunk_end // self.block_size
+                                self._publish_committed_blocks(s, hit_prompts[i], abs_chunk_end)
+                                self.materialize_gdn_checkpoint(
+                                    s,
+                                    key=self.block_table[s][num_chunk_blocks - 1],
+                                    hash_value=self.slot_block_hashes[s][num_chunk_blocks - 1].value,
+                                    num_tokens=abs_chunk_end,
+                                )
+
+                    chunk_start = chunk_end
+
+                assert step0_logits is not None and step0_hidden is not None
+                prev_tokens = step0_logits.argmax(dim=-1).tolist()
+                hit_drafts: dict[int, list[int]] = {s: [prev_tokens[i]] for i, s in enumerate(hit_slots)}
+                next_pos_list = [self.slot_draft_sync_len[s] for s in hit_slots]
+                running_prior_kv_len = [self.slot_draft_sync_len[s] for s in hit_slots]
+                self._mtp_run_continuation_steps(
+                    hit_slots, hit_drafts, prev_tokens, step0_hidden, next_pos_list, running_prior_kv_len, k,
+                )
+                for i, s in enumerate(hit_slots):
+                    self._publish_committed_blocks(s, hit_prompts[i], len(hit_prompts[i]))
+                    self.slot_pending_draft_tokens[s] = hit_drafts[s]
+                    result[s] = {"anchor": anchors[s], "draft_tokens": hit_drafts[s]}
+
+            else:
+                # === RAGGED SUFFIX PER-SLOT CHUNKED PATH ===
+                # Different suffix lengths per slot: process each hit slot
+                # independently with chunking. Simpler and correct, though
+                # less efficient than batched ragged chunking.
+                for idx, s in enumerate(hit_slots):
+                    suffix_len = suffix_lens[idx]
+                    L = hit_L[idx]
+                    prompt = hit_prompts[idx]
+                    running_kv_len = L
+                    running_draft_len = L
+                    chunk_start = 0
+                    step0_logits_s = None
+                    step0_hidden_s = None
+                    anchor_s = None
+                    while chunk_start < suffix_len:
+                        chunk_end = min(chunk_start + chunk_size, suffix_len)
+                        this_chunk_len = chunk_end - chunk_start
+                        is_last_chunk = chunk_end == suffix_len
+                        chunk_tokens = prompt[L + chunk_start : L + chunk_end]
+
+                        target_logits_chunk, target_hidden_chunk = self._forward_batch(
+                            [s],
+                            [chunk_tokens] if this_chunk_len > 1 else [chunk_tokens[0]],
+                            [running_kv_len],
+                            qo_len=this_chunk_len,
+                            commit=True,
+                            return_hidden=True,
+                            is_decode=False,
+                            logits_last_position_only=True,
+                        )
+                        running_kv_len += this_chunk_len
+
+                        if is_last_chunk:
+                            anchor_s = int(target_logits_chunk[0].argmax(dim=-1).item())
+                            shifted_chunk = prompt[L + chunk_start + 1 : L + suffix_len] + [anchor_s]
+                        else:
+                            shifted_chunk = prompt[L + chunk_start + 1 : L + chunk_end + 1]
+
+                        draft_logits_chunk, draft_hidden_chunk = self._mtp_forward_batch(
+                            [s],
+                            [shifted_chunk] if this_chunk_len > 1 else [shifted_chunk[0]],
+                            target_hidden_chunk,
+                            [running_draft_len],
+                            [running_draft_len],
+                            qo_len=this_chunk_len,
+                            is_decode=False,
+                            logits_last_position_only=True,
+                        )
+                        self.slot_draft_sync_len[s] += this_chunk_len
+                        running_draft_len += this_chunk_len
+
+                        if is_last_chunk:
+                            step0_logits_s, step0_hidden_s = draft_logits_chunk, draft_hidden_chunk
+
+                        if (
+                            self.enable_persistent_prefix_cache
+                            and not is_last_chunk
+                            and (L + chunk_end) % self.block_size == 0
+                        ):
+                            abs_end = L + chunk_end
+                            num_blocks = abs_end // self.block_size
+                            self._publish_committed_blocks(s, prompt, abs_end)
+                            self.materialize_gdn_checkpoint(
+                                s,
+                                key=self.block_table[s][num_blocks - 1],
+                                hash_value=self.slot_block_hashes[s][num_blocks - 1].value,
+                                num_tokens=abs_end,
+                            )
+
+                        chunk_start = chunk_end
+
+                    assert step0_logits_s is not None and step0_hidden_s is not None
+                    prev_tokens_s = step0_logits_s.argmax(dim=-1).tolist()
+                    draft_tokens_s: dict[int, list[int]] = {s: [prev_tokens_s[0]]}
+                    next_pos_s = [self.slot_draft_sync_len[s]]
+                    prior_kv_s = [self.slot_draft_sync_len[s]]
+                    self._mtp_run_continuation_steps(
+                        [s], draft_tokens_s, prev_tokens_s, step0_hidden_s, next_pos_s, prior_kv_s, k,
+                    )
+                    self._publish_committed_blocks(s, prompt, len(prompt))
+                    self.slot_pending_draft_tokens[s] = draft_tokens_s[s]
+                    result[s] = {"anchor": anchor_s, "draft_tokens": draft_tokens_s[s]}
+
+        # --- COLD set: P2 same-round fan-out fork when >=2 cold slots; a lone
+        #     cold slot uses the two-phase populate prefill (completion GDN
+        #     checkpoint required for hit-after-cold; see docstring). ---
+        if cold_idx:
+            cold_slots = [slots[i] for i in cold_idx]
+            cold_prompts = [prompts_per_slot[i] for i in cold_idx]
+            if len(cold_slots) >= 2:
+                result.update(self.mtp_prefill_fanout_batch(cold_slots, cold_prompts))
+            else:
+                result[cold_slots[0]] = self._prefill_cold_with_populate(
+                    cold_slots[0], cold_prompts[0]
+                )
+
+        return result
 
     def mtp_verify_and_commit_batch(
         self,
@@ -3416,6 +5127,12 @@ class DirectModelRunner:
         for s in slots:
             self.slot_kv_len[s] = kv_lens_before[s] + committed_lens[s]
             self.slot_num_accepted_tokens[s] = committed_lens[s]
+        # P3.2 decode-position populate (per slot): publish any newly-FULL
+        # committed blocks now that slot_kv_len advanced by each slot's REAL
+        # committed length (only committed tokens; INV4). No-op off-flag.
+        if self.enable_persistent_prefix_cache:
+            for s in slots:
+                self.publish_committed_decode_blocks(s, real_new_tokens[s])
 
         # Ragged slice of the ONE verify forward's hidden states -- see
         # this method's docstring for why this is valid for EVERY slot
@@ -3559,16 +5276,23 @@ class CapturedBatchDecodeGraph:
     further optimization, not attempted this round.
     """
 
-    def __init__(self, runner: "DirectModelRunner", batch_size: int, qo_len: int = 1) -> None:
-        if runner.num_slots < 2 * batch_size:
-            raise ValueError(
-                f"runner.num_slots={runner.num_slots} must be >= 2*batch_size "
-                f"({2 * batch_size}): {batch_size} logical slots for real "
-                f"replay() traffic plus {batch_size} PERMANENTLY RESERVED for "
-                "capture()'s own disposable warmup (never exposed to real "
-                "callers) -- see the class docstring's 'state-neutral "
-                "capture' section for why this is required, not optional."
-            )
+    def __init__(self, runner: "DirectModelRunner", batch_size: int, qo_len: int = 1,
+                 warmup_slots: list[int] | None = None) -> None:
+        if warmup_slots is not None:
+            if len(warmup_slots) != batch_size:
+                raise ValueError(
+                    f"warmup_slots must have exactly batch_size ({batch_size}) "
+                    f"entries, got {len(warmup_slots)}"
+                )
+            self._external_warmup = True
+        else:
+            if runner.num_slots < 2 * batch_size:
+                raise ValueError(
+                    f"runner.num_slots={runner.num_slots} must be >= 2*batch_size "
+                    f"({2 * batch_size}) when warmup_slots is not provided"
+                )
+            warmup_slots = list(range(runner.num_slots - batch_size, runner.num_slots))
+            self._external_warmup = False
         self.runner = runner
         self.batch_size = batch_size
         self.qo_len = qo_len
@@ -3596,11 +5320,8 @@ class CapturedBatchDecodeGraph:
         self.fixed_kv_split_size = runner.decode_fixed_kv_split_size
         self.fixed_max_num_splits = runner.decode_fixed_max_num_splits
 
-        # Permanently reserved for THIS graph object's own capture()
-        # warmup -- the last batch_size logical slots of the runner.
-        # Callers must never pass these to replay() or any other runner
-        # method; doing so would defeat the whole point of reserving them.
-        self._warmup_slots = list(range(runner.num_slots - batch_size, runner.num_slots))
+        self._warmup_slots = warmup_slots
+        self._last_num_pages_per_req: list[int] | None = None
 
         num_reqs = batch_size
         n_tokens = num_reqs * qo_len
@@ -3678,6 +5399,25 @@ class CapturedBatchDecodeGraph:
         # benchmarks/mtp_verify_cudagraph_check.py.
         self.replay_count = 0
 
+        cpu = torch.device("cpu")
+        self._cpu_kv_page_indptr = torch.zeros(num_reqs + 1, dtype=torch.int32, device=cpu, pin_memory=True)
+        self._cpu_kv_page_indices = torch.zeros(num_reqs * blocks_per_slot, dtype=torch.int32, device=cpu, pin_memory=True)
+        self._cpu_kv_last_page_len = torch.zeros(num_reqs, dtype=torch.int32, device=cpu, pin_memory=True)
+        self._cpu_state_indices = torch.zeros(num_reqs, dtype=torch.int32, device=cpu, pin_memory=True)
+        self._cpu_input_ids = torch.zeros(n_tokens, dtype=torch.long, device=cpu, pin_memory=True)
+        self._cpu_positions = torch.zeros(n_tokens, dtype=torch.long, device=cpu, pin_memory=True)
+        self._cpu_slot_mapping = torch.zeros(n_tokens, dtype=torch.long, device=cpu, pin_memory=True)
+        self._np_kv_page_indptr = self._cpu_kv_page_indptr.numpy()
+        self._np_kv_page_indices = self._cpu_kv_page_indices.numpy()
+        self._np_kv_last_page_len = self._cpu_kv_last_page_len.numpy()
+        self._np_state_indices = self._cpu_state_indices.numpy()
+        self._np_input_ids = self._cpu_input_ids.numpy()
+        self._np_positions = self._cpu_positions.numpy()
+        self._np_slot_mapping = self._cpu_slot_mapping.numpy()
+        if qo_len > 1:
+            self._cpu_spec_state_indices = torch.zeros((num_reqs, qo_len), dtype=torch.int32, device=cpu, pin_memory=True)
+            self._cpu_num_accepted_tokens = torch.zeros(num_reqs, dtype=torch.int32, device=cpu, pin_memory=True)
+
     def _fill_buffers(
         self,
         slot_ids: list[int],
@@ -3736,17 +5476,32 @@ class CapturedBatchDecodeGraph:
             for slot, kv_len in zip(slot_ids, new_kv_lens):
                 runner._ensure_blocks(slot, kv_len)
 
-        kv_page_indptr_list = [0]
-        for num_pages in num_pages_per_req:
-            kv_page_indptr_list.append(kv_page_indptr_list[-1] + num_pages)
+        pages_unchanged = (self._last_num_pages_per_req is not None
+                           and num_pages_per_req == self._last_num_pages_per_req
+                           and slot_ids == getattr(self, '_last_slot_ids', None))
+        if not pages_unchanged:
+            kv_page_indptr_list = [0]
+            for num_pages in num_pages_per_req:
+                kv_page_indptr_list.append(kv_page_indptr_list[-1] + num_pages)
 
-        page_indices_list: list[int] = []
-        for slot, num_pages in zip(slot_ids, num_pages_per_req):
-            if runner.enable_block_table:
-                page_indices_list.extend(runner.block_table[slot][:num_pages])
-            else:
-                first_block = _physical_slot(slot) * blocks_per_slot
-                page_indices_list.extend(range(first_block, first_block + num_pages))
+            page_indices_list: list[int] = []
+            for slot, num_pages in zip(slot_ids, num_pages_per_req):
+                if runner.enable_block_table:
+                    page_indices_list.extend(runner.block_table[slot][:num_pages])
+                else:
+                    first_block = _physical_slot(slot) * blocks_per_slot
+                    page_indices_list.extend(range(first_block, first_block + num_pages))
+
+            n_indptr = len(kv_page_indptr_list)
+            self._np_kv_page_indptr[:n_indptr] = kv_page_indptr_list
+            self.static_kv_page_indptr.copy_(self._cpu_kv_page_indptr, non_blocking=True)
+            self.static_kv_page_indices.zero_()
+            n_pages = len(page_indices_list)
+            if n_pages:
+                self._np_kv_page_indices[:n_pages] = page_indices_list
+                self.static_kv_page_indices[:n_pages].copy_(self._cpu_kv_page_indices[:n_pages], non_blocking=True)
+            self._last_num_pages_per_req = list(num_pages_per_req)
+            self._last_slot_ids = list(slot_ids)
 
         last_page_len_list = [
             kv_len - (num_pages - 1) * block_size
@@ -3764,18 +5519,18 @@ class CapturedBatchDecodeGraph:
                 block_id = table[pos // block_size] if table is not None else first_block + pos // block_size
                 offset = pos % block_size
                 slot_mapping_list.append(block_id * block_size + offset)
-
-        self.static_kv_page_indptr.copy_(torch.tensor(kv_page_indptr_list, dtype=torch.int32, device=device))
-        self.static_kv_page_indices.zero_()
-        if page_indices_list:
-            self.static_kv_page_indices[: len(page_indices_list)].copy_(
-                torch.tensor(page_indices_list, dtype=torch.int32, device=device)
-            )
-        self.static_kv_last_page_len.copy_(torch.tensor(last_page_len_list, dtype=torch.int32, device=device))
-        self.static_state_indices.copy_(torch.tensor(state_indices_list, dtype=torch.int32, device=device))
-        self.static_input_ids.copy_(torch.tensor(flat_token_ids, dtype=torch.long, device=device))
-        self.static_positions.copy_(torch.tensor(positions_list, dtype=torch.long, device=device))
-        self.static_slot_mapping.copy_(torch.tensor(slot_mapping_list, dtype=torch.long, device=device))
+        n_reqs = len(last_page_len_list)
+        self._np_kv_last_page_len[:n_reqs] = last_page_len_list
+        self.static_kv_last_page_len.copy_(self._cpu_kv_last_page_len, non_blocking=True)
+        self._np_state_indices[:n_reqs] = state_indices_list
+        self.static_state_indices.copy_(self._cpu_state_indices, non_blocking=True)
+        n_tok = len(flat_token_ids)
+        self._np_input_ids[:n_tok] = flat_token_ids
+        self.static_input_ids.copy_(self._cpu_input_ids, non_blocking=True)
+        self._np_positions[:n_tok] = positions_list
+        self.static_positions.copy_(self._cpu_positions, non_blocking=True)
+        self._np_slot_mapping[:n_tok] = slot_mapping_list
+        self.static_slot_mapping.copy_(self._cpu_slot_mapping, non_blocking=True)
 
         if qo_len > 1:
             if num_accepted_tokens_prev is None:
@@ -3787,12 +5542,10 @@ class CapturedBatchDecodeGraph:
                 [_ssm_spec_row(slot, col, self.total_physical_slots, self.num_spec) for col in range(qo_len)]
                 for slot in slot_ids
             ]
-            self.static_spec_state_indices.copy_(
-                torch.tensor(spec_indices_list, dtype=torch.int32, device=device)
-            )
-            self.static_num_accepted_tokens.copy_(
-                torch.tensor(num_accepted_tokens_prev, dtype=torch.int32, device=device)
-            )
+            self._cpu_spec_state_indices[:n_reqs] = torch.tensor(spec_indices_list, dtype=torch.int32)
+            self.static_spec_state_indices.copy_(self._cpu_spec_state_indices, non_blocking=True)
+            self._cpu_num_accepted_tokens[:n_reqs] = torch.tensor(num_accepted_tokens_prev, dtype=torch.int32)
+            self.static_num_accepted_tokens.copy_(self._cpu_num_accepted_tokens, non_blocking=True)
 
     def _static_metadata_dicts(self) -> tuple[dict, dict]:
         runner = self.runner
@@ -3926,6 +5679,10 @@ class CapturedBatchDecodeGraph:
             self._static_logits, self._static_hidden_states = self._forward_no_sync()
         self._graph = g
 
+        if self._external_warmup:
+            for slot in self._warmup_slots:
+                runner.reset_slot(slot)
+
     def replay(
         self,
         slot_ids: list[int],
@@ -3990,7 +5747,7 @@ class CapturedBatchDecodeGraph:
         OTHER unrelated work queued on the device -- directly working
         against the whole point of using a captured graph to cut CPU-side
         launch/dispatch overhead."""
-        if slot_ids == self._warmup_slots or set(slot_ids) & set(self._warmup_slots):
+        if not self._external_warmup and (slot_ids == self._warmup_slots or set(slot_ids) & set(self._warmup_slots)):
             raise RuntimeError(
                 f"slot(s) {set(slot_ids) & set(self._warmup_slots)} are this "
                 "graph's own reserved warmup slots -- never replay() against "
@@ -4096,25 +5853,30 @@ class CapturedMTPDraftStepGraph:
     physical reserved-slot range across both graph classes (each resets
     its own warmup slots right after its own ``capture()``)."""
 
-    def __init__(self, runner: "DirectModelRunner", batch_size: int, qo_len: int = 1) -> None:
+    def __init__(self, runner: "DirectModelRunner", batch_size: int, qo_len: int = 1,
+                 warmup_slots: list[int] | None = None) -> None:
         if runner.mtp_model is None:
             raise RuntimeError("no MTP draft model loaded")
-        if runner.num_slots < 2 * batch_size:
-            raise ValueError(
-                f"runner.num_slots={runner.num_slots} must be >= 2*batch_size ({2 * batch_size})"
-            )
+        if warmup_slots is not None:
+            if len(warmup_slots) != batch_size:
+                raise ValueError(f"warmup_slots must have exactly batch_size ({batch_size}) entries")
+            self._external_warmup = True
+        else:
+            if runner.num_slots < 2 * batch_size:
+                raise ValueError(
+                    f"runner.num_slots={runner.num_slots} must be >= 2*batch_size ({2 * batch_size})"
+                )
+            warmup_slots = list(range(runner.num_slots - batch_size, runner.num_slots))
+            self._external_warmup = False
         self.runner = runner
         self.batch_size = batch_size
         self.qo_len = qo_len
         device = runner.device
         blocks_per_slot = runner.blocks_per_slot
-        # Reuse the runner's own fixed split-KV derivation (already
-        # CUDA-graph-safe -- every real _mtp_forward_batch call already
-        # passes these same fixed values, see that method's docstring).
         self.fixed_kv_split_size = runner.decode_fixed_kv_split_size
         self.fixed_max_num_splits = runner.decode_fixed_max_num_splits
 
-        self._warmup_slots = list(range(runner.num_slots - batch_size, runner.num_slots))
+        self._warmup_slots = warmup_slots
 
         n_tokens = batch_size * qo_len
         self.static_qo_indptr = torch.arange(0, batch_size + 1, dtype=torch.int32, device=device) * qo_len
@@ -4124,6 +5886,19 @@ class CapturedMTPDraftStepGraph:
         self.static_input_ids = torch.zeros(n_tokens, dtype=torch.long, device=device)
         self.static_positions = torch.zeros(n_tokens, dtype=torch.long, device=device)
         self.static_slot_mapping = torch.zeros(n_tokens, dtype=torch.long, device=device)
+        cpu = torch.device("cpu")
+        self._cpu_kv_page_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=cpu, pin_memory=True)
+        self._cpu_kv_page_indices = torch.zeros(batch_size * blocks_per_slot, dtype=torch.int32, device=cpu, pin_memory=True)
+        self._cpu_kv_last_page_len = torch.zeros(batch_size, dtype=torch.int32, device=cpu, pin_memory=True)
+        self._cpu_input_ids = torch.zeros(n_tokens, dtype=torch.long, device=cpu, pin_memory=True)
+        self._cpu_positions = torch.zeros(n_tokens, dtype=torch.long, device=cpu, pin_memory=True)
+        self._cpu_slot_mapping = torch.zeros(n_tokens, dtype=torch.long, device=cpu, pin_memory=True)
+        self._np_kv_page_indptr = self._cpu_kv_page_indptr.numpy()
+        self._np_kv_page_indices = self._cpu_kv_page_indices.numpy()
+        self._np_kv_last_page_len = self._cpu_kv_last_page_len.numpy()
+        self._np_input_ids = self._cpu_input_ids.numpy()
+        self._np_positions = self._cpu_positions.numpy()
+        self._np_slot_mapping = self._cpu_slot_mapping.numpy()
         self.hidden_size = runner.vllm_config.model_config.get_hidden_size()
         # Dtype/device matched lazily on first real hidden_states_in at
         # capture time (mirrors how the class discovers its own model's
@@ -4136,6 +5911,9 @@ class CapturedMTPDraftStepGraph:
         # Test-observability only -- see CapturedBatchDecodeGraph's
         # identical field for the rationale.
         self.replay_count = 0
+        self._last_slot_ids: list[int] | None = None
+        self._last_kv_lengths: list[int] | None = None
+
 
     def _fill_buffers(self, slot_ids: list[int], token_ids, hidden_states_in: torch.Tensor, kv_lengths: list[int]) -> None:
         runner = self.runner
@@ -4185,16 +5963,22 @@ class CapturedMTPDraftStepGraph:
                 offset = pos % block_size
                 slot_mapping_list.append(block_id * block_size + offset)
 
-        self.static_kv_page_indptr.copy_(torch.tensor(kv_page_indptr_list, dtype=torch.int32, device=device))
+        n_indptr = len(kv_page_indptr_list)
+        self._np_kv_page_indptr[:n_indptr] = kv_page_indptr_list
+        self.static_kv_page_indptr.copy_(self._cpu_kv_page_indptr, non_blocking=True)
         self.static_kv_page_indices.zero_()
-        if page_indices_list:
-            self.static_kv_page_indices[: len(page_indices_list)].copy_(
-                torch.tensor(page_indices_list, dtype=torch.int32, device=device)
-            )
-        self.static_kv_last_page_len.copy_(torch.tensor(last_page_len_list, dtype=torch.int32, device=device))
-        self.static_input_ids.copy_(torch.tensor(flat_token_ids, dtype=torch.long, device=device))
-        self.static_positions.copy_(torch.tensor(positions_list, dtype=torch.long, device=device))
-        self.static_slot_mapping.copy_(torch.tensor(slot_mapping_list, dtype=torch.long, device=device))
+        n_pages = len(page_indices_list)
+        if n_pages:
+            self._np_kv_page_indices[:n_pages] = page_indices_list
+            self.static_kv_page_indices[:n_pages].copy_(self._cpu_kv_page_indices[:n_pages], non_blocking=True)
+        self._np_kv_last_page_len[:len(last_page_len_list)] = last_page_len_list
+        self.static_kv_last_page_len.copy_(self._cpu_kv_last_page_len, non_blocking=True)
+        self._np_input_ids[:len(flat_token_ids)] = flat_token_ids
+        self.static_input_ids.copy_(self._cpu_input_ids, non_blocking=True)
+        self._np_positions[:len(positions_list)] = positions_list
+        self.static_positions.copy_(self._cpu_positions, non_blocking=True)
+        self._np_slot_mapping[:len(slot_mapping_list)] = slot_mapping_list
+        self.static_slot_mapping.copy_(self._cpu_slot_mapping, non_blocking=True)
         if self.static_hidden_states_in is None:
             self.static_hidden_states_in = torch.zeros_like(hidden_states_in)
         self.static_hidden_states_in.copy_(hidden_states_in)
@@ -4276,6 +6060,10 @@ class CapturedMTPDraftStepGraph:
             self._static_logits, self._static_hidden_states_out = self._forward_no_sync()
         self._graph = g
 
+        if self._external_warmup:
+            for slot in self._warmup_slots:
+                runner.reset_slot(slot)
+
     def replay(
         self, slot_ids: list[int], token_ids, hidden_states_in: torch.Tensor, kv_lengths: list[int]
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -4289,7 +6077,7 @@ class CapturedMTPDraftStepGraph:
         replaces. ``token_ids`` follows ``_mtp_forward_batch``'s own
         convention: flat (one id per slot) when ``qo_len==1``, else a
         list of per-slot ``qo_len``-length lists."""
-        if set(slot_ids) & set(self._warmup_slots):
+        if not self._external_warmup and set(slot_ids) & set(self._warmup_slots):
             raise RuntimeError(
                 f"slot(s) {set(slot_ids) & set(self._warmup_slots)} are this "
                 "graph's own reserved warmup slots -- never replay() against them"
@@ -4301,4 +6089,76 @@ class CapturedMTPDraftStepGraph:
         self._fill_buffers(slot_ids, token_ids, hidden_states_in, kv_lengths)
         self._graph.replay()
         self.replay_count += 1
+        self._last_slot_ids = slot_ids
+        self._last_kv_lengths = kv_lengths
         return self._static_logits, self._static_hidden_states_out
+
+    def replay_incremental(
+        self, slot_ids: list[int], token_ids, hidden_states_in: torch.Tensor, kv_lengths: list[int]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Optimized replay for draft continuation steps where KV length
+        increased by 1 from the previous replay. Skips rebuilding the
+        expensive kv_page_indices array when no slot crossed a page boundary."""
+        if self._graph is None:
+            raise RuntimeError("capture() must be called first")
+        runner = self.runner
+        block_size = runner.block_size
+        can_skip_pages = (
+            self._last_slot_ids is not None
+            and self._last_slot_ids == slot_ids
+            and self._last_kv_lengths is not None
+            and len(self._last_kv_lengths) == len(kv_lengths)
+            and all(
+                new - old == self.qo_len
+                and (old + self.qo_len) // block_size == (new + self.qo_len) // block_size
+                for old, new in zip(self._last_kv_lengths, kv_lengths)
+            )
+        )
+        if can_skip_pages:
+            self._fill_buffers_incremental(slot_ids, token_ids, hidden_states_in, kv_lengths)
+        else:
+            self._fill_buffers(slot_ids, token_ids, hidden_states_in, kv_lengths)
+        self._graph.replay()
+        self.replay_count += 1
+        self._last_slot_ids = slot_ids
+        self._last_kv_lengths = kv_lengths
+        return self._static_logits, self._static_hidden_states_out
+
+    def _fill_buffers_incremental(self, slot_ids: list[int], token_ids, hidden_states_in: torch.Tensor, kv_lengths: list[int]) -> None:
+        """Fast path: only update last_page_len, positions, slot_mapping,
+        input_ids, hidden_states. Skip kv_page_indptr and kv_page_indices."""
+        runner = self.runner
+        block_size = runner.block_size
+        qo_len = self.qo_len
+        new_kv_lens = [kv_len + qo_len for kv_len in kv_lengths]
+        num_pages_per_req = [(kv_len + block_size - 1) // block_size for kv_len in new_kv_lens]
+        if runner.enable_block_table:
+            for slot, kv_len in zip(slot_ids, new_kv_lens):
+                runner._ensure_blocks(slot, kv_len)
+        last_page_len_list = [
+            kv_len - (num_pages - 1) * block_size for kv_len, num_pages in zip(new_kv_lens, num_pages_per_req)
+        ]
+        positions_list = [kv_len + j for kv_len in kv_lengths for j in range(qo_len)]
+        slot_mapping_list = []
+        for slot, kv_len in zip(slot_ids, kv_lengths):
+            table = runner.block_table[slot] if runner.enable_block_table else None
+            first_block = _physical_slot(slot) * runner.blocks_per_slot
+            for j in range(qo_len):
+                pos = kv_len + j
+                block_id = table[pos // block_size] if table is not None else first_block + pos // block_size
+                slot_mapping_list.append(block_id * block_size + pos % block_size)
+        if qo_len == 1:
+            flat_token_ids = token_ids
+        else:
+            flat_token_ids = [tok for slot_tokens in token_ids for tok in slot_tokens]
+        self._np_kv_last_page_len[:len(last_page_len_list)] = last_page_len_list
+        self.static_kv_last_page_len.copy_(self._cpu_kv_last_page_len, non_blocking=True)
+        self._np_input_ids[:len(flat_token_ids)] = flat_token_ids
+        self.static_input_ids.copy_(self._cpu_input_ids, non_blocking=True)
+        self._np_positions[:len(positions_list)] = positions_list
+        self.static_positions.copy_(self._cpu_positions, non_blocking=True)
+        self._np_slot_mapping[:len(slot_mapping_list)] = slot_mapping_list
+        self.static_slot_mapping.copy_(self._cpu_slot_mapping, non_blocking=True)
+        if self.static_hidden_states_in is None:
+            self.static_hidden_states_in = torch.zeros_like(hidden_states_in)
+        self.static_hidden_states_in.copy_(hidden_states_in)
