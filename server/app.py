@@ -459,3 +459,12 @@ async def metrics():
     ]
     from fastapi.responses import PlainTextResponse
     return PlainTextResponse("\n".join(lines) + "\n", media_type="text/plain; charset=utf-8")
+
+
+@app.get("/v1")
+async def v1_root():
+    return {
+        "object": "api_info",
+        "endpoints": ["/v1/models", "/v1/chat/completions", "/v1/completions", "/metrics"],
+        "model": ServerEngine.MODEL,
+    }
