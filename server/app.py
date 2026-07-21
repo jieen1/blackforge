@@ -48,6 +48,9 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from server.engine import ServerEngine
+from server.formats import strip_thinking, extract_text, convert_tools_to_chat_template
+from server.formats import openai as openai_format
+from server.formats import anthropic as anthropic_format
 
 logger = logging.getLogger("qwen_sm120_server.app")
 
@@ -130,23 +133,18 @@ app = FastAPI(title="qwen-sm120-runtime server", lifespan=lifespan)
 # -- schemas (loose OpenAI-compatible subset -- see module docstring for
 # the explicit, intentional deviations: greedy-only, non-streaming, plus
 # a debug-only extra field). --
-class ChatMessage(BaseModel):
-    role: str
-    content: str
 
 
 class ChatCompletionRequest(BaseModel):
     model: str | None = None
-    messages: list[ChatMessage]
+    messages: list[dict]
     max_tokens: int | None = None
     temperature: float | None = None
     top_p: float | None = None
     n: int | None = None
     stream: bool | None = False
-    # P4b session affinity (opt-in): caller-supplied session id. With the server
-    # built --session-affinity, the finished slot is retained warm for the TTL so
-    # the next turn of the same session continues in place with zero restore.
-    # Ignored (byte-for-byte P4a) when the feature is off.
+    tools: list[dict] | None = None
+    tool_choice: str | dict | None = None
     session_id: str | None = None
 
 
@@ -191,6 +189,8 @@ def _validate_capacity(prompt_ids: list[int], max_tokens: int) -> None:
         )
 
 
+
+
 @app.exception_handler(Exception)
 async def _unhandled_exception_handler(request, exc: Exception):
     # A defensive net so an unexpected runtime error (e.g. the engine's own
@@ -231,18 +231,16 @@ async def chat_completions(req: ChatCompletionRequest):
     assert engine is not None
     _validate_sampling_params(req.temperature, req.top_p, req.n, req.stream)
     max_tokens = _validate_and_resolve_max_tokens(req.max_tokens)
-    # return_dict=False is required here: this tokenizer's
-    # apply_chat_template(tokenize=True) defaults to returning a
-    # BatchEncoding (dict-like, keyed by "input_ids"/"attention_mask"),
-    # NOT a plain list of token ids -- confirmed by direct instrumentation
-    # (a real bug caught by this task's own E2E run: passing the
-    # BatchEncoding straight through crashed
-    # ``mtp_prefill_batch``/``_forward_batch``'s ``torch.tensor(...)`` call
-    # deep inside the runtime with "too many dimensions 'str'"). This flag
-    # makes the return value a plain ``list[int]``, matching every other
-    # prompt_ids producer in this codebase (e.g. plain ``tok.encode(...)``).
+
+    # Parse messages through the format layer (handles string | array content)
+    chat_messages = openai_format.parse_chat_messages(req.model_dump())
+
+    # Convert tools for the chat template
+    tools = convert_tools_to_chat_template(req.tools)
+
     prompt_ids = engine.tok.apply_chat_template(
-        [m.model_dump() for m in req.messages],
+        chat_messages,
+        tools=tools,
         tokenize=True,
         add_generation_prompt=True,
         return_dict=False,
@@ -250,49 +248,29 @@ async def chat_completions(req: ChatCompletionRequest):
     _validate_capacity(prompt_ids, max_tokens)
 
     result = await engine.submit(prompt_ids, max_tokens, session_id=req.session_id)
-    text = engine.tok.decode(result["committed_token_ids"])
-    cmpl_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
-    created = int(time.time())
+    text = strip_thinking(engine.tok.decode(result["committed_token_ids"], skip_special_tokens=True))
     model_name = req.model or ServerEngine.MODEL
 
     if req.stream:
         import json as _json
+        cmpl_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+        created = int(time.time())
         async def _sse():
-            chunk = {
-                "id": cmpl_id, "object": "chat.completion.chunk", "created": created,
-                "model": model_name,
-                "choices": [{"index": 0, "delta": {"role": "assistant", "content": text}, "finish_reason": None}],
-            }
-            yield f"data: {_json.dumps(chunk)}\n\n"
-            done = {
-                "id": cmpl_id, "object": "chat.completion.chunk", "created": created,
-                "model": model_name,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": result["finish_reason"]}],
-            }
-            yield f"data: {_json.dumps(done)}\n\n"
-            yield "data: [DONE]\n\n"
+            for chunk_str in openai_format.build_sse_chunks(
+                cmpl_id, model_name, text, result["finish_reason"], created
+            ):
+                yield chunk_str
         return StreamingResponse(_sse(), media_type="text/event-stream")
 
-    return {
-        "id": cmpl_id,
-        "object": "chat.completion",
-        "created": created,
-        "model": model_name,
-        "choices": [
-            {
-                "index": 0,
-                "message": {"role": "assistant", "content": text},
-                "finish_reason": result["finish_reason"],
-            }
-        ],
-        "usage": {
-            "prompt_tokens": result["prompt_tokens"],
-            "completion_tokens": result["completion_tokens"],
-            "total_tokens": result["prompt_tokens"] + result["completion_tokens"],
-        },
-        "debug_committed_token_ids": result["committed_token_ids"],
-        "debug_prompt_token_ids": list(prompt_ids),
-    }
+    return openai_format.build_response(
+        model=model_name,
+        text=text,
+        finish_reason=result["finish_reason"],
+        prompt_tokens=result["prompt_tokens"],
+        completion_tokens=result["completion_tokens"],
+        committed_token_ids=result["committed_token_ids"],
+        prompt_token_ids=list(prompt_ids),
+    )
 
 
 @app.post("/v1/completions")
@@ -304,7 +282,7 @@ async def completions(req: CompletionRequest):
     _validate_capacity(prompt_ids, max_tokens)
 
     result = await engine.submit(prompt_ids, max_tokens, session_id=req.session_id)
-    text = engine.tok.decode(result["committed_token_ids"])
+    text = strip_thinking(engine.tok.decode(result["committed_token_ids"], skip_special_tokens=True))
     return {
         "id": f"cmpl-{uuid.uuid4().hex[:24]}",
         "object": "text_completion",
@@ -479,46 +457,9 @@ async def v1_root():
     }
 
 
-# -- Anthropic Messages API compatibility ---------------------------------
-# Full Anthropic Messages API support (/v1/messages).
-# Accepts: string or array-of-blocks for content and system fields,
-# cache_control blocks (ignored), stream=true/false.
-# Internally uses apply_chat_template for proper model formatting.
-
-
-def _anthropic_extract_text(field) -> str:
-    """Extract plain text from an Anthropic content field (str or list of blocks)."""
-    if field is None:
-        return ""
-    if isinstance(field, str):
-        return field
-    if isinstance(field, list):
-        parts = []
-        for block in field:
-            if isinstance(block, dict):
-                if block.get("type") == "text":
-                    parts.append(block.get("text", ""))
-            elif isinstance(block, str):
-                parts.append(block)
-        return "\n".join(parts)
-    return str(field)
-
-
-def _anthropic_to_chat_messages(body: dict) -> list[dict]:
-    """Convert Anthropic Messages API request body to OpenAI-style messages list."""
-    chat_messages = []
-
-    system_text = _anthropic_extract_text(body.get("system"))
-    if system_text:
-        chat_messages.append({"role": "system", "content": system_text})
-
-    for msg in body.get("messages", []):
-        role = msg.get("role", "user")
-        text = _anthropic_extract_text(msg.get("content"))
-        if text:
-            chat_messages.append({"role": role, "content": text})
-
-    return chat_messages
+# -- Anthropic Messages API (/v1/messages) ---------------------------------
+# Full format handling delegated to server/formats.py.
+# This handler only does: parse -> tokenize -> engine.submit -> format response.
 
 
 @app.post("/v1/messages")
@@ -530,15 +471,20 @@ async def anthropic_messages(request: Request):
     model_name = body.get("model", "qwen3.6")
     stream = body.get("stream", False)
 
-    chat_messages = _anthropic_to_chat_messages(body)
+    # Parse through the Anthropic format layer (handles array content, tool_use, tool_result)
+    chat_messages = anthropic_format.parse_messages(body)
     if not chat_messages:
         return JSONResponse(
             status_code=400,
             content={"type": "error", "error": {"type": "invalid_request_error", "message": "no messages provided"}},
         )
 
+    # Convert tools for the chat template
+    tools = convert_tools_to_chat_template(body.get("tools"))
+
     prompt_ids = engine.tok.apply_chat_template(
         chat_messages,
+        tools=tools,
         tokenize=True,
         add_generation_prompt=True,
         return_dict=False,
@@ -552,79 +498,24 @@ async def anthropic_messages(request: Request):
         )
 
     result = await engine.submit(prompt_ids, effective_max)
-    text = engine.tok.decode(result["committed_token_ids"], skip_special_tokens=True)
-    stop_reason = "end_turn" if result["finish_reason"] == "stop" else "max_tokens"
-    msg_id = f"msg_{uuid.uuid4().hex[:24]}"
-
-    usage = {
-        "input_tokens": result["prompt_tokens"],
-        "output_tokens": result["completion_tokens"],
-        "cache_creation_input_tokens": 0,
-        "cache_read_input_tokens": 0,
-    }
+    text = strip_thinking(engine.tok.decode(result["committed_token_ids"], skip_special_tokens=True))
 
     if stream:
-        import json as _json
+        return StreamingResponse(
+            anthropic_format.build_sse_events(
+                model=model_name,
+                text=text,
+                finish_reason=result["finish_reason"],
+                input_tokens=result["prompt_tokens"],
+                output_tokens=result["completion_tokens"],
+            ),
+            media_type="text/event-stream",
+        )
 
-        async def _sse():
-            # message_start
-            msg_start = {
-                "type": "message_start",
-                "message": {
-                    "id": msg_id,
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [],
-                    "model": model_name,
-                    "stop_reason": None,
-                    "stop_sequence": None,
-                    "usage": {"input_tokens": result["prompt_tokens"], "output_tokens": 0},
-                },
-            }
-            yield f"event: message_start\ndata: {_json.dumps(msg_start)}\n\n"
-
-            # content_block_start
-            block_start = {
-                "type": "content_block_start",
-                "index": 0,
-                "content_block": {"type": "text", "text": ""},
-            }
-            yield f"event: content_block_start\ndata: {_json.dumps(block_start)}\n\n"
-
-            # ping
-            yield f"event: ping\ndata: {_json.dumps({'type': 'ping'})}\n\n"
-
-            # content_block_delta with full text
-            delta = {
-                "type": "content_block_delta",
-                "index": 0,
-                "delta": {"type": "text_delta", "text": text},
-            }
-            yield f"event: content_block_delta\ndata: {_json.dumps(delta)}\n\n"
-
-            # content_block_stop
-            yield f"event: content_block_stop\ndata: {_json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
-
-            # message_delta
-            msg_delta = {
-                "type": "message_delta",
-                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-                "usage": {"output_tokens": result["completion_tokens"]},
-            }
-            yield f"event: message_delta\ndata: {_json.dumps(msg_delta)}\n\n"
-
-            # message_stop
-            yield f"event: message_stop\ndata: {_json.dumps({'type': 'message_stop'})}\n\n"
-
-        return StreamingResponse(_sse(), media_type="text/event-stream")
-
-    return {
-        "id": msg_id,
-        "type": "message",
-        "role": "assistant",
-        "content": [{"type": "text", "text": text}],
-        "model": model_name,
-        "stop_reason": stop_reason,
-        "stop_sequence": None,
-        "usage": usage,
-    }
+    return anthropic_format.build_response(
+        model=model_name,
+        text=text,
+        finish_reason=result["finish_reason"],
+        input_tokens=result["prompt_tokens"],
+        output_tokens=result["completion_tokens"],
+    )

@@ -1,0 +1,139 @@
+"""OpenAI Chat Completions API formatting.
+
+Handles request parsing and response formatting for the OpenAI-compatible
+/v1/chat/completions endpoint.
+"""
+
+from __future__ import annotations
+
+import json
+import time
+import uuid
+from typing import Any
+
+from server.formats.content import extract_text
+from server.formats.tools import parse_tool_calls, format_tool_calls_openai
+
+
+def parse_chat_messages(body: dict) -> list[dict]:
+    """Parse OpenAI chat messages, handling flexible content types.
+
+    Accepts content as string or list of content blocks.
+    Also handles tool_calls in assistant messages and tool role messages.
+    """
+    messages = []
+    for msg in body.get("messages", []):
+        role = msg.get("role", "user")
+        entry: dict[str, Any] = {"role": role}
+
+        if role == "tool":
+            entry["content"] = extract_text(msg.get("content"))
+            if "tool_call_id" in msg:
+                entry["tool_call_id"] = msg["tool_call_id"]
+        elif role == "assistant" and "tool_calls" in msg:
+            entry["content"] = extract_text(msg.get("content"))
+            # Chat template expects arguments as dict, not JSON string
+            converted_calls = []
+            for tc in msg["tool_calls"]:
+                tc_copy = dict(tc)
+                if "function" in tc_copy:
+                    fn = dict(tc_copy["function"])
+                    if isinstance(fn.get("arguments"), str):
+                        try:
+                            fn["arguments"] = json.loads(fn["arguments"])
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+                    tc_copy["function"] = fn
+                converted_calls.append(tc_copy)
+            entry["tool_calls"] = converted_calls
+        else:
+            entry["content"] = extract_text(msg.get("content"))
+
+        messages.append(entry)
+    return messages
+
+
+def build_response(
+    model: str,
+    text: str,
+    finish_reason: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+    committed_token_ids: list[int] | None = None,
+    prompt_token_ids: list[int] | None = None,
+) -> dict:
+    """Build a non-streaming OpenAI chat completion response."""
+    visible_text, tool_calls = parse_tool_calls(text)
+
+    message: dict[str, Any] = {"role": "assistant"}
+    if tool_calls:
+        message["content"] = visible_text or None
+        message["tool_calls"] = format_tool_calls_openai(tool_calls)
+        finish_reason = "tool_calls"
+    else:
+        message["content"] = visible_text
+
+    resp: dict[str, Any] = {
+        "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": finish_reason,
+        }],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
+    }
+    if committed_token_ids is not None:
+        resp["debug_committed_token_ids"] = committed_token_ids
+    if prompt_token_ids is not None:
+        resp["debug_prompt_token_ids"] = prompt_token_ids
+    return resp
+
+
+def build_sse_chunks(
+    cmpl_id: str,
+    model: str,
+    text: str,
+    finish_reason: str,
+    created: int,
+):
+    """Generate OpenAI SSE stream chunks (yields strings)."""
+    visible_text, tool_calls = parse_tool_calls(text)
+
+    if tool_calls:
+        finish_reason = "tool_calls"
+        if visible_text:
+            chunk = {
+                "id": cmpl_id, "object": "chat.completion.chunk", "created": created,
+                "model": model,
+                "choices": [{"index": 0, "delta": {"role": "assistant", "content": visible_text}, "finish_reason": None}],
+            }
+            yield f"data: {json.dumps(chunk)}\n\n"
+        for i, tc in enumerate(format_tool_calls_openai(tool_calls)):
+            chunk = {
+                "id": cmpl_id, "object": "chat.completion.chunk", "created": created,
+                "model": model,
+                "choices": [{"index": 0, "delta": {"tool_calls": [{"index": i, **tc}]}, "finish_reason": None}],
+            }
+            yield f"data: {json.dumps(chunk)}\n\n"
+    else:
+        chunk = {
+            "id": cmpl_id, "object": "chat.completion.chunk", "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": visible_text}, "finish_reason": None}],
+        }
+        yield f"data: {json.dumps(chunk)}\n\n"
+
+    done = {
+        "id": cmpl_id, "object": "chat.completion.chunk", "created": created,
+        "model": model,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+    }
+    yield f"data: {json.dumps(done)}\n\n"
+    yield "data: [DONE]\n\n"
