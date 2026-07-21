@@ -112,6 +112,7 @@ def build_response(
         "content": content_blocks,
         "model": model,
         "stop_reason": stop_reason,
+        "stop_sequence": None,
         "usage": {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,

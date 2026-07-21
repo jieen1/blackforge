@@ -130,6 +130,24 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="qwen-sm120-runtime server", lifespan=lifespan)
 
+@app.head("/")
+@app.get("/")
+async def root():
+    return {"status": "ok", "service": "blackforge"}
+
+
+@app.middleware("http")
+async def log_request_timing(request: Request, call_next):
+    import time as _time
+    t0 = _time.perf_counter()
+    response = await call_next(request)
+    elapsed_ms = (_time.perf_counter() - t0) * 1000
+    if elapsed_ms > 100:
+        logger.info("SLOW %s %s -> %d (%.0fms)", request.method, request.url.path, response.status_code, elapsed_ms)
+    return response
+
+
+
 
 # -- schemas (loose OpenAI-compatible subset -- see module docstring for
 # the explicit, intentional deviations: greedy-only, non-streaming, plus
@@ -513,6 +531,18 @@ async def anthropic_messages(request: Request):
     assert engine is not None
     body = await request.json()
 
+    # Diagnostic: log request shape for Claude Desktop debugging
+    _sys = body.get("system")
+    _sys_len = len(str(_sys)) if _sys else 0
+    _msgs = body.get("messages", [])
+    _tools_n = len(body.get("tools", []))
+    _stream = body.get("stream", False)
+    logger.info(
+        "ANTHROPIC REQ: system_chars=%d msgs=%d tools=%d stream=%s max_tokens=%s qs=%s",
+        _sys_len, len(_msgs), _tools_n, _stream, body.get("max_tokens"),
+        str(request.url.query) if request.url.query else "-",
+    )
+
     max_tokens = body.get("max_tokens", DEFAULT_MAX_TOKENS)
     model_name = body.get("model", "qwen3.6")
     stream = body.get("stream", False)
@@ -559,25 +589,55 @@ async def anthropic_messages(request: Request):
                 },
             }
             yield f"event: message_start\ndata: {_json.dumps(msg_start)}\n\n"
-            bs = {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}
-            yield f"event: content_block_start\ndata: {_json.dumps(bs)}\n\n"
             yield f"event: ping\ndata: " + _json.dumps({"type": "ping"}) + "\n\n"
+
+            block_index = 0
+            thinking_open = False
+            thinking_closed = False
+            text_open = False
 
             async for item in engine.submit_stream(prompt_ids, effective_max):
                 if isinstance(item, dict):
                     final_result = item
                     break
                 proc.add_tokens(item)
-                for delta in proc.drain_content():
-                    d = {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": delta}}
+
+                for td in proc.drain_thinking():
+                    if not thinking_open:
+                        thinking_open = True
+                        bs = {"type": "content_block_start", "index": block_index, "content_block": {"type": "thinking", "thinking": ""}}
+                        yield f"event: content_block_start\ndata: {_json.dumps(bs)}\n\n"
+                    d = {"type": "content_block_delta", "index": block_index, "delta": {"type": "thinking_delta", "thinking": td}}
                     yield f"event: content_block_delta\ndata: {_json.dumps(d)}\n\n"
 
-            yield f"event: content_block_stop\ndata: " + _json.dumps({"type": "content_block_stop", "index": 0}) + "\n\n"
+                for delta in proc.drain_content():
+                    if thinking_open and not thinking_closed:
+                        thinking_closed = True
+                        yield f"event: content_block_stop\ndata: " + _json.dumps({"type": "content_block_stop", "index": block_index}) + "\n\n"
+                        block_index += 1
+                    if not text_open:
+                        text_open = True
+                        bs = {"type": "content_block_start", "index": block_index, "content_block": {"type": "text", "text": ""}}
+                        yield f"event: content_block_start\ndata: {_json.dumps(bs)}\n\n"
+                    d = {"type": "content_block_delta", "index": block_index, "delta": {"type": "text_delta", "text": delta}}
+                    yield f"event: content_block_delta\ndata: {_json.dumps(d)}\n\n"
+
+            if thinking_open and not thinking_closed:
+                yield f"event: content_block_stop\ndata: " + _json.dumps({"type": "content_block_stop", "index": block_index}) + "\n\n"
+                block_index += 1
+            if text_open:
+                yield f"event: content_block_stop\ndata: " + _json.dumps({"type": "content_block_stop", "index": block_index}) + "\n\n"
+                block_index += 1
+            if not thinking_open and not text_open:
+                bs = {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}
+                yield f"event: content_block_start\ndata: {_json.dumps(bs)}\n\n"
+                yield f"event: content_block_stop\ndata: " + _json.dumps({"type": "content_block_stop", "index": 0}) + "\n\n"
+                block_index = 1
+
             finish = final_result["finish_reason"] if final_result else "stop"
             stop_reason = "end_turn" if finish == "stop" else "max_tokens"
             visible_text, tool_calls = proc.finalize()
             out_tokens = len(proc.all_ids)
-            block_index = 1
             if tool_calls:
                 stop_reason = "tool_use"
                 from server.formats.tools import format_tool_calls_anthropic
@@ -588,7 +648,7 @@ async def anthropic_messages(request: Request):
                     yield f"event: content_block_delta\ndata: {_json.dumps(delta_ev)}\n\n"
                     yield f"event: content_block_stop\ndata: " + _json.dumps({"type": "content_block_stop", "index": block_index}) + "\n\n"
                     block_index += 1
-            msg_delta = {"type": "message_delta", "delta": {"stop_reason": stop_reason}, "usage": {"input_tokens": len(prompt_ids), "output_tokens": out_tokens}}
+            msg_delta = {"type": "message_delta", "delta": {"stop_reason": stop_reason, "stop_sequence": None}, "usage": {"input_tokens": len(prompt_ids), "output_tokens": out_tokens}}
             yield f"event: message_delta\ndata: {_json.dumps(msg_delta)}\n\n"
             yield f"event: message_stop\ndata: " + _json.dumps({"type": "message_stop"}) + "\n\n"
         return StreamingResponse(_anthropic_sse(), media_type="text/event-stream")

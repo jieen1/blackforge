@@ -38,6 +38,7 @@ class StreamProcessor:
         self._thinking_done = False
         self._tool_call_started = False
         self._emitted_len = 0
+        self._thinking_emitted_len = 0
         self._last_decode_len = 0
         self._cached_raw = ""
 
@@ -56,6 +57,31 @@ class StreamProcessor:
         self._cached_raw = self._tok.decode(self._all_ids, skip_special_tokens=True)
         self._last_decode_len = n
         return self._cached_raw
+
+
+    def drain_thinking(self) -> list[str]:
+        """Return thinking text deltas since last call.
+
+        Returns the raw text inside  tags as it accumulates.
+        Returns empty list once thinking phase is complete or if
+        no thinking block was detected.
+        """
+        if self._thinking_done:
+            return []
+        raw = self._get_raw()
+        if _THINK_OPEN not in raw:
+            return []
+        start = raw.index(_THINK_OPEN) + len(_THINK_OPEN)
+        if _THINK_CLOSE in raw:
+            end = raw.index(_THINK_CLOSE)
+            thinking = raw[start:end]
+        else:
+            thinking = raw[start:]
+        if len(thinking) > self._thinking_emitted_len:
+            delta = thinking[self._thinking_emitted_len:]
+            self._thinking_emitted_len = len(thinking)
+            return [delta]
+        return []
 
     def drain_content(self) -> list[str]:
         """Return list of safe content deltas since last call.
