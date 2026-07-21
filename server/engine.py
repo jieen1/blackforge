@@ -616,7 +616,10 @@ class ServerEngine:
                     self._activate_slot(slot, req, anchor, drafts)
 
         # -- idle: block on pipe (zero CPU, instant wakeup) --
-        if not self.active:
+        # Only block when BOTH active and waiting are empty.
+        # If waiting has requests (e.g. admission failed and re-queued),
+        # we must loop back to retry admission, NOT block on the pipe.
+        if not self.active and not self.waiting:
             # Set pipe to blocking mode for efficient idle wait
             os.set_blocking(self._req_pipe_r, True)
             try:
@@ -628,6 +631,12 @@ class ServerEngine:
                 return
             self._drain_requests()
             _drain_pipe(self._req_pipe_r)
+            return
+        elif not self.active and self.waiting:
+            # Have waiting requests but no active slots — retry admission
+            # next round without blocking. Brief sleep to avoid hot-spin
+            # if admission keeps failing (e.g. OOM).
+            time.sleep(0.01)
             return
 
         # -- MTP verify/commit round (hot path, zero wait) --

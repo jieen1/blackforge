@@ -308,6 +308,14 @@ async def chat_completions(req: ChatCompletionRequest):
                     final_result = item
                     break
                 proc.add_tokens(item)
+                # Stream thinking as reasoning_content (vLLM compatible)
+                for td in proc.drain_thinking():
+                    chunk = {
+                        "id": cmpl_id, "object": "chat.completion.chunk", "created": created,
+                        "model": model_name,
+                        "choices": [{"index": 0, "delta": {"reasoning_content": td}, "finish_reason": None}],
+                    }
+                    yield f"data: {_json.dumps(chunk)}\n\n"
                 for delta in proc.drain_content():
                     chunk = {
                         "id": cmpl_id, "object": "chat.completion.chunk", "created": created,
@@ -346,8 +354,24 @@ async def chat_completions(req: ChatCompletionRequest):
 
     # Non-streaming path
     result = await engine.submit(prompt_ids, max_tokens, session_id=req.session_id)
-    text = strip_thinking(await _tokenize_decode(engine, result["committed_token_ids"]))
-    return openai_format.build_response(
+    raw_text = await _tokenize_decode(engine, result["committed_token_ids"])
+    # Prepend  for strip_thinking (chat template injects it in prompt)
+    _raw_for_strip = raw_text if raw_text.startswith(chr(60) + "think" + chr(62)) else (chr(60) + "think" + chr(62) + "\n" + raw_text)
+    text = strip_thinking(_raw_for_strip)
+    # Extract reasoning_content (thinking) for non-streaming response
+    # Generated tokens start with thinking content (no  prefix since
+    # the chat template injected it in the prompt). Prepend  to extract.
+    reasoning_content = None
+    _THINK_OPEN = chr(60) + "think" + chr(62)
+    _THINK_CLOSE = chr(60) + "/think" + chr(62)
+    _raw_with_think = raw_text if raw_text.startswith(_THINK_OPEN) else _THINK_OPEN + "\n" + raw_text
+    if _THINK_CLOSE in _raw_with_think:
+        start = _raw_with_think.index(_THINK_OPEN) + len(_THINK_OPEN)
+        if start < len(_raw_with_think) and _raw_with_think[start] == "\n":
+            start += 1
+        end = _raw_with_think.index(_THINK_CLOSE)
+        reasoning_content = _raw_with_think[start:end].strip()
+    resp = openai_format.build_response(
         model=model_name,
         text=text,
         finish_reason=result["finish_reason"],
@@ -356,6 +380,9 @@ async def chat_completions(req: ChatCompletionRequest):
         committed_token_ids=result["committed_token_ids"],
         prompt_token_ids=list(prompt_ids),
     )
+    if reasoning_content:
+        resp["choices"][0]["message"]["reasoning_content"] = reasoning_content
+    return resp
 
 
 @app.post("/v1/completions")
@@ -367,7 +394,9 @@ async def completions(req: CompletionRequest):
     _validate_capacity(prompt_ids, max_tokens)
 
     result = await engine.submit(prompt_ids, max_tokens, session_id=req.session_id)
-    text = strip_thinking(await _tokenize_decode(engine, result["committed_token_ids"]))
+    _raw_comp = await _tokenize_decode(engine, result["committed_token_ids"])
+    _raw_comp_full = _raw_comp if _raw_comp.startswith(chr(60) + "think" + chr(62)) else (chr(60) + "think" + chr(62) + "\n" + _raw_comp)
+    text = strip_thinking(_raw_comp_full)
     return {
         "id": f"cmpl-{uuid.uuid4().hex[:24]}",
         "object": "text_completion",
@@ -491,7 +520,7 @@ async def metrics():
     kv_usage = used_blocks / total_blocks if total_blocks > 0 else 0.0
 
     num_running = len(engine.active)
-    num_waiting = len(engine.pending)
+    num_waiting = len(engine.waiting)
     num_free_slots = len(engine.free_slots)
 
     lines = [
@@ -540,6 +569,20 @@ async def v1_root():
         "endpoints": ["/v1/models", "/v1/chat/completions", "/v1/completions", "/metrics"],
         "model": ServerEngine.MODEL,
     }
+
+
+
+@app.post("/v1/messages/count_tokens")
+async def anthropic_count_tokens(request: Request):
+    """Anthropic token counting endpoint (Claude Desktop requires this)."""
+    assert engine is not None
+    body = await request.json()
+    from server.formats.anthropic import parse_messages
+    from server.formats import convert_tools_to_chat_template
+    chat_messages = parse_messages(body)
+    tools = convert_tools_to_chat_template(body.get("tools"))
+    prompt_ids = await _tokenize_chat(engine, chat_messages, tools=tools)
+    return {"input_tokens": len(prompt_ids)}
 
 
 # -- Anthropic Messages API (/v1/messages) ---------------------------------
@@ -670,7 +713,9 @@ async def anthropic_messages(request: Request):
 
     # Non-streaming path
     result = await engine.submit(prompt_ids, effective_max)
-    text = strip_thinking(await _tokenize_decode(engine, result["committed_token_ids"]))
+    _raw_anth = await _tokenize_decode(engine, result["committed_token_ids"])
+    _raw_anth_full = _raw_anth if _raw_anth.startswith(chr(60) + "think" + chr(62)) else (chr(60) + "think" + chr(62) + "\n" + _raw_anth)
+    text = strip_thinking(_raw_anth_full)
     return anthropic_format.build_response(
         model=model_name,
         text=text,

@@ -1,12 +1,20 @@
 """Stateful stream processor for model output.
 
 Handles the two-phase nature of Qwen3.6 streaming output:
-1. Thinking phase: think-block...think-close -- must be completely suppressed
-2. Content phase: visible text, possibly followed by tool-call XML
+1. Thinking phase: content between <think> and </think> -- streamed as thinking
+2. Content phase: visible text after </think>, possibly followed by tool-call XML
 
-The processor buffers tokens and emits safe content deltas while
-suppressing thinking blocks and tool-call XML from the content stream.
-Tool calls are extracted at the end and emitted as structured chunks.
+The Qwen3.6 chat template ALWAYS injects <think> at the END of the prompt
+(add_generation_prompt=True). Therefore the GENERATED tokens start directly
+with thinking content (no <think> prefix in generated text). The model
+eventually produces </think> followed by the actual answer.
+
+We prepend <think> to the decoded generated text so that the thinking
+detection logic works correctly.
+
+For API compatibility:
+- Anthropic: thinking is streamed as "thinking" content blocks
+- OpenAI: thinking is streamed as "reasoning_content" in delta
 """
 
 from __future__ import annotations
@@ -26,6 +34,8 @@ class StreamProcessor:
         proc = StreamProcessor(tokenizer)
         for token_batch in stream:
             proc.add_tokens(token_batch)
+            for delta in proc.drain_thinking():
+                yield delta  # thinking text
             for delta in proc.drain_content():
                 yield delta  # safe visible text, no thinking, no tool XML
         # After stream ends:
@@ -50,19 +60,32 @@ class StreamProcessor:
         return self._all_ids
 
     def _get_raw(self) -> str:
-        """Decode all accumulated tokens (cached when unchanged)."""
+        """Decode all accumulated tokens with <think> prepended.
+
+        The chat template injects <think> at the end of the prompt,
+        so generated tokens start with thinking content directly.
+        We prepend <think> to make the thinking detection logic work.
+        """
         n = len(self._all_ids)
         if n == self._last_decode_len:
             return self._cached_raw
-        self._cached_raw = self._tok.decode(self._all_ids, skip_special_tokens=True)
+        decoded = self._tok.decode(self._all_ids, skip_special_tokens=True)
+        # Prepend <think> since the chat template already injected it in the prompt
+        if not decoded.startswith(_THINK_OPEN):
+            self._cached_raw = _THINK_OPEN + "\n" + decoded
+        else:
+            self._cached_raw = decoded
         self._last_decode_len = n
         return self._cached_raw
 
+    @property
+    def thinking_done(self) -> bool:
+        return self._thinking_done
 
     def drain_thinking(self) -> list[str]:
         """Return thinking text deltas since last call.
 
-        Returns the raw text inside  tags as it accumulates.
+        Returns the raw text inside <think> tags as it accumulates.
         Returns empty list once thinking phase is complete or if
         no thinking block was detected.
         """
@@ -72,6 +95,9 @@ class StreamProcessor:
         if _THINK_OPEN not in raw:
             return []
         start = raw.index(_THINK_OPEN) + len(_THINK_OPEN)
+        # Skip leading newline after <think>
+        if start < len(raw) and raw[start] == "\n":
+            start += 1
         if _THINK_CLOSE in raw:
             end = raw.index(_THINK_CLOSE)
             thinking = raw[start:end]
@@ -102,11 +128,10 @@ class StreamProcessor:
             elif _THINK_OPEN in raw:
                 # Think block opened but not yet closed -- still thinking
                 return []
-            elif len(raw) > 50:
-                # No think tags at all after 50 chars -- no thinking phase
-                self._thinking_done = True
             else:
-                return []
+                # No think tags at all -- should not happen with Qwen3.6
+                # but handle gracefully
+                self._thinking_done = True
 
         visible = strip_thinking(raw)
 
@@ -131,6 +156,9 @@ class StreamProcessor:
     def finalize(self) -> tuple[str, list[dict]]:
         """Called after stream ends. Returns (visible_text, tool_calls)."""
         raw = self._tok.decode(self._all_ids, skip_special_tokens=True)
+        # Prepend <think> for consistent processing
+        if not raw.startswith(_THINK_OPEN):
+            raw = _THINK_OPEN + "\n" + raw
         visible = strip_thinking(raw)
         visible_text, tool_calls = parse_tool_calls(visible)
         return visible_text, tool_calls
