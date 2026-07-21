@@ -270,3 +270,72 @@ class TestSSE:
         evts = list(anthropic_format.build_sse_events("m","Hi","stop",10,5))
         assert evts[0].startswith("event: message_start")
 
+
+
+# ============================================================
+# <usage> metadata block stripping (model artifact from training data)
+# ============================================================
+
+class TestUsageStripping:
+    """Regression: model generates <usage>...</usage> blocks that must not
+    leak into visible content (reported via Claude Desktop sub-agent output)."""
+
+    def test_paired_usage_block_stripped(self):
+        text = "Here is the answer.<usage>subagent_tokens: 53407\ntool_uses: 146\nduration_ms: 353827</usage>"
+        result = strip_thinking(text)
+        assert "<usage>" not in result
+        assert "subagent_tokens" not in result
+        assert "Here is the answer." in result
+
+    def test_usage_block_with_surrounding_whitespace(self):
+        text = "Result text.\n\n<usage>\ntokens: 100\n</usage>\n\n"
+        result = strip_thinking(text)
+        assert "<usage>" not in result
+        assert "tokens: 100" not in result
+        assert "Result text." in result
+
+    def test_unclosed_usage_block_stripped(self):
+        text = "Some output.<usage>subagent_tokens: 999"
+        result = strip_thinking(text)
+        assert "<usage>" not in result
+        assert "subagent_tokens" not in result
+        assert "Some output." in result
+
+    def test_usage_after_thinking(self):
+        text = f"{THINK_OPEN}reasoning here{THINK_CLOSE}Visible answer.<usage>duration_ms: 1000</usage>"
+        result = strip_thinking(text)
+        assert "reasoning" not in result
+        assert "<usage>" not in result
+        assert "Visible answer." in result
+
+    def test_multiple_usage_blocks(self):
+        text = "A.<usage>x: 1</usage> B.<usage>y: 2</usage>"
+        result = strip_thinking(text)
+        assert "<usage>" not in result
+        assert "A." in result
+        assert "B." in result
+
+    def test_no_usage_unchanged(self):
+        text = "Normal response without any metadata tags."
+        result = strip_thinking(text)
+        assert result == "Normal response without any metadata tags."
+
+    def test_usage_in_openai_response(self):
+        """Ensure <usage> doesn't appear in OpenAI response content."""
+        from server.formats import openai as openai_format
+        raw = "Answer here.<usage>subagent_tokens: 100</usage>"
+        cleaned = strip_thinking(raw)
+        resp = openai_format.build_response("test", cleaned, "stop", 10, 5)
+        content = resp["choices"][0]["message"]["content"]
+        assert "<usage>" not in content
+        assert "Answer here." in content
+
+    def test_usage_in_anthropic_response(self):
+        """Ensure <usage> doesn't appear in Anthropic response content."""
+        from server.formats import anthropic as anthropic_format
+        raw = "Answer here.<usage>subagent_tokens: 100</usage>"
+        cleaned = strip_thinking(raw)
+        resp = anthropic_format.build_response("test", cleaned, "stop", 10, 5)
+        text_block = resp["content"][0]
+        assert "<usage>" not in text_block["text"]
+        assert "Answer here." in text_block["text"]

@@ -24,6 +24,7 @@ from server.formats.tools import parse_tool_calls, find_tool_call_start
 
 _THINK_OPEN = chr(60) + "think" + chr(62)
 _THINK_CLOSE = chr(60) + "/think" + chr(62)
+_USAGE_OPEN = chr(60) + "usage" + chr(62)
 
 
 class StreamProcessor:
@@ -148,6 +149,25 @@ class StreamProcessor:
                 self._emitted_len = len(safe)
                 return [delta]
             return []
+
+        # Hold back <usage> metadata blocks (model artifact)
+        usage_idx = visible.find(_USAGE_OPEN)
+        if usage_idx >= 0:
+            safe = visible[:usage_idx]
+            if len(safe) > self._emitted_len:
+                delta = safe[self._emitted_len:]
+                self._emitted_len = len(safe)
+                return [delta]
+            return []
+        # Partial <usage> prefix at end of buffer (streaming edge)
+        for plen in range(len(_USAGE_OPEN) - 1, 0, -1):
+            if visible.endswith(_USAGE_OPEN[:plen]):
+                safe = visible[: len(visible) - plen]
+                if len(safe) > self._emitted_len:
+                    delta = safe[self._emitted_len:]
+                    self._emitted_len = len(safe)
+                    return [delta]
+                return []
 
         # Normal content delta
         if len(visible) > self._emitted_len:
