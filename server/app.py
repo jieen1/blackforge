@@ -405,3 +405,57 @@ async def list_models():
             for name in names
         ],
     }
+
+
+@app.get("/metrics")
+async def metrics():
+    """Prometheus-compatible metrics (vLLM naming convention)."""
+    assert engine is not None
+    runner = engine.runner
+    pool = runner.block_pool
+    total_blocks = pool.num_blocks - pool.reserved
+    free_blocks = len(pool._free_queue)
+    used_blocks = total_blocks - free_blocks
+    kv_usage = used_blocks / total_blocks if total_blocks > 0 else 0.0
+
+    num_running = len(engine.active)
+    num_waiting = len(engine.pending)
+    num_free_slots = len(engine.free_slots)
+
+    lines = [
+        "# HELP vllm:num_requests_running Number of requests currently running.",
+        "# TYPE vllm:num_requests_running gauge",
+        f'vllm:num_requests_running{{model_name="{ServerEngine.MODEL}"}} {num_running}',
+        "# HELP vllm:num_requests_waiting Number of requests waiting to be processed.",
+        "# TYPE vllm:num_requests_waiting gauge",
+        f'vllm:num_requests_waiting{{model_name="{ServerEngine.MODEL}"}} {num_waiting}',
+        "# HELP vllm:kv_cache_usage_perc KV cache usage percentage.",
+        "# TYPE vllm:kv_cache_usage_perc gauge",
+        f'vllm:kv_cache_usage_perc{{model_name="{ServerEngine.MODEL}"}} {kv_usage:.4f}',
+        "# HELP vllm:num_free_slots Number of free production slots.",
+        "# TYPE vllm:num_free_slots gauge",
+        f'vllm:num_free_slots{{model_name="{ServerEngine.MODEL}"}} {num_free_slots}',
+        "# HELP vllm:capacity_tokens_per_slot Max tokens per slot.",
+        "# TYPE vllm:capacity_tokens_per_slot gauge",
+        f'vllm:capacity_tokens_per_slot{{model_name="{ServerEngine.MODEL}"}} {engine.capacity_tokens_per_slot}',
+        "# HELP vllm:requests_completed_total Total completed requests.",
+        "# TYPE vllm:requests_completed_total counter",
+        f'vllm:requests_completed_total{{model_name="{ServerEngine.MODEL}"}} {engine.stats.get("requests_completed", 0)}',
+        "# HELP vllm:prefix_cache_hit_rate Prefix cache hit rate.",
+        "# TYPE vllm:prefix_cache_hit_rate gauge",
+        f'vllm:prefix_cache_hit_rate{{model_name="{ServerEngine.MODEL}"}} {engine.stats.get("prefix_cache_hit_rate", 0.0):.4f}',
+        "# HELP vllm:prefix_cache_hits_total Prefix cache hits.",
+        "# TYPE vllm:prefix_cache_hits_total counter",
+        f'vllm:prefix_cache_hits_total{{model_name="{ServerEngine.MODEL}"}} {engine.stats.get("prefix_cache_hits", 0)}',
+        "# HELP vllm:prefix_cache_misses_total Prefix cache misses.",
+        "# TYPE vllm:prefix_cache_misses_total counter",
+        f'vllm:prefix_cache_misses_total{{model_name="{ServerEngine.MODEL}"}} {engine.stats.get("prefix_cache_misses", 0)}',
+        "# HELP vllm:kv_cache_total_blocks Total KV cache blocks.",
+        "# TYPE vllm:kv_cache_total_blocks gauge",
+        f'vllm:kv_cache_total_blocks{{model_name="{ServerEngine.MODEL}"}} {total_blocks}',
+        "# HELP vllm:kv_cache_used_blocks Used KV cache blocks.",
+        "# TYPE vllm:kv_cache_used_blocks gauge",
+        f'vllm:kv_cache_used_blocks{{model_name="{ServerEngine.MODEL}"}} {used_blocks}',
+    ]
+    from fastapi.responses import PlainTextResponse
+    return PlainTextResponse("\n".join(lines) + "\n", media_type="text/plain; charset=utf-8")
