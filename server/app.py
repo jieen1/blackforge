@@ -44,7 +44,7 @@ import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from server.engine import ServerEngine
@@ -167,21 +167,8 @@ def _invalid_request(message: str) -> HTTPException:
 
 
 def _validate_sampling_params(temperature: float | None, top_p: float | None, n: int | None, stream: bool | None) -> None:
-    if stream:
-        raise _invalid_request(
-            "stream=true is not supported by this server (non-streaming only, first cut)."
-        )
-    if temperature is not None and temperature != 0:
-        raise _invalid_request(
-            f"temperature={temperature!r} is not supported: this runtime is greedy-decode only "
-            "(MTP verify is a greedy match, see runtime/direct_model_runner.py). "
-            "Omit temperature or set it to 0."
-        )
-    if top_p is not None and top_p != 1.0:
-        raise _invalid_request(
-            f"top_p={top_p!r} is not supported: this runtime does not implement nucleus sampling. "
-            "Omit top_p or set it to 1.0."
-        )
+    # Accept temperature/top_p/stream for client compatibility.
+    # Internally always greedy decode (MTP verify requires greedy match).
     if n is not None and n != 1:
         raise _invalid_request(f"n={n!r} is not supported: only a single completion (n=1) per request.")
 
@@ -264,11 +251,33 @@ async def chat_completions(req: ChatCompletionRequest):
 
     result = await engine.submit(prompt_ids, max_tokens, session_id=req.session_id)
     text = engine.tok.decode(result["committed_token_ids"])
+    cmpl_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    created = int(time.time())
+    model_name = req.model or ServerEngine.MODEL
+
+    if req.stream:
+        import json as _json
+        async def _sse():
+            chunk = {
+                "id": cmpl_id, "object": "chat.completion.chunk", "created": created,
+                "model": model_name,
+                "choices": [{"index": 0, "delta": {"role": "assistant", "content": text}, "finish_reason": None}],
+            }
+            yield f"data: {_json.dumps(chunk)}\n\n"
+            done = {
+                "id": cmpl_id, "object": "chat.completion.chunk", "created": created,
+                "model": model_name,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": result["finish_reason"]}],
+            }
+            yield f"data: {_json.dumps(done)}\n\n"
+            yield "data: [DONE]\n\n"
+        return StreamingResponse(_sse(), media_type="text/event-stream")
+
     return {
-        "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+        "id": cmpl_id,
         "object": "chat.completion",
-        "created": int(time.time()),
-        "model": req.model or ServerEngine.MODEL,
+        "created": created,
+        "model": model_name,
         "choices": [
             {
                 "index": 0,
@@ -472,9 +481,19 @@ async def v1_root():
 
 # -- Anthropic Messages API compatibility ---------------------------------
 
+class AnthropicContentBlock(BaseModel):
+    type: str = "text"
+    text: str = ""
+
 class AnthropicMessage(BaseModel):
     role: str
-    content: str
+    content: str | list[AnthropicContentBlock] = ""
+
+    @property
+    def text(self) -> str:
+        if isinstance(self.content, str):
+            return self.content
+        return "\n".join(block.text for block in self.content if block.type == "text")
 
 class AnthropicMessagesRequest(BaseModel):
     model: str = "qwen3.6"
@@ -490,19 +509,13 @@ class AnthropicMessagesRequest(BaseModel):
 @app.post("/v1/messages")
 async def anthropic_messages(req: AnthropicMessagesRequest):
     assert engine is not None
-    if req.stream:
-        raise HTTPException(status_code=400, detail="stream=true is not supported")
-    if req.temperature != 0:
-        raise HTTPException(
-            status_code=400,
-            detail=f"temperature={req.temperature!r} is not supported: greedy-decode only",
-        )
+    # Accept temperature/stream for compatibility; internally always greedy.
 
     parts = []
     if req.system:
-        parts.append(req.system)
+        parts.append(req.system if isinstance(req.system, str) else str(req.system))
     for msg in req.messages:
-        parts.append(msg.content)
+        parts.append(msg.text)
     combined = "\n\n".join(parts)
 
     prompt_ids = engine.tok.encode(combined, add_special_tokens=False)
