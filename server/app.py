@@ -62,8 +62,31 @@ DEFAULT_MAX_TOKENS = 256
 SERVER_CAPACITY = int(os.environ.get("QSR_SERVER_CAPACITY", "4"))
 SERVER_NUM_SLOTS = int(os.environ.get("QSR_SERVER_NUM_SLOTS", "16"))
 SERVER_BLOCK_SIZE = int(os.environ.get("QSR_SERVER_BLOCK_SIZE", "16"))
-SERVER_BLOCKS_PER_SLOT = int(os.environ.get("QSR_SERVER_BLOCKS_PER_SLOT", "512"))
+# P4a (§25.10 follow-up): raised from 512 so a real >=64K request is
+# ADMISSIBLE -- capacity_ok gates on the per-slot ceiling blocks_per_slot *
+# block_size, and ceil((65536 + max_tokens)/16) ~= 4113, so 4200 (=> 67200-
+# token ceiling) admits a 64K prompt with ~1.6K of generation room. The KV
+# cache is allocated up front for the WHOLE shared BlockPool ((num_slots +
+# RESERVED) * blocks_per_slot blocks), so this is a fixed startup cost paid
+# regardless of how many slots are active; see server/README.md + notes/
+# prefix-cache-implementation-log.md (P4a) for the measured memory fit. The
+# E2E check sets its OWN smaller blocks_per_slot (its prompts are moderate),
+# so it does not pay for the full long-context pool.
+SERVER_BLOCKS_PER_SLOT = int(os.environ.get("QSR_SERVER_BLOCKS_PER_SLOT", "4200"))
 SERVER_ENABLE_CUDAGRAPH = os.environ.get("QSR_SERVER_ENABLE_CUDAGRAPH", "1") != "0"
+# P4a (notes/prefix-cache-design.md sec 5-P4): the prefix-cache rollback
+# spine, plumbed straight into ServerEngine(enable_prefix_cache=...). Default
+# ON (this is THE product value -- warm prefix hits served across requests);
+# `python -m server.app --no-prefix-cache` (or QSR_SERVER_ENABLE_PREFIX_CACHE=0)
+# turns it off => byte-for-byte the old server.
+SERVER_ENABLE_PREFIX_CACHE = os.environ.get("QSR_SERVER_ENABLE_PREFIX_CACHE", "1") != "0"
+# P4b session affinity (notes/2026-07-20-p4b-session-affinity-plan.md): opt-in
+# warm-slot retention. Default OFF => byte-for-byte P4a (without a session_id, or
+# with the flag off, _finish_request does the unconditional reset_slot). Requires
+# the prefix cache -- ServerEngine raises ValueError if affinity is on but prefix
+# cache is off (warm-continue needs the persistent content-hash cache).
+SERVER_ENABLE_SESSION_AFFINITY = os.environ.get("QSR_SERVER_ENABLE_SESSION_AFFINITY", "0") != "0"
+SERVER_SESSION_TTL_S = float(os.environ.get("QSR_SERVER_SESSION_TTL_S", "30.0"))
 SERVER_KV_CACHE_DTYPE = os.environ.get("QSR_SERVER_KV_CACHE_DTYPE", "fp8_e4m3")
 SERVER_GPU_MEM_UTIL = float(os.environ.get("QSR_SERVER_GPU_MEM_UTIL", "0.85"))
 
@@ -81,12 +104,17 @@ async def lifespan(app: FastAPI):
         blocks_per_slot=SERVER_BLOCKS_PER_SLOT,
         kv_cache_dtype=SERVER_KV_CACHE_DTYPE,
         enable_cudagraph=SERVER_ENABLE_CUDAGRAPH,
+        enable_prefix_cache=SERVER_ENABLE_PREFIX_CACHE,
+        enable_session_affinity=SERVER_ENABLE_SESSION_AFFINITY,
+        session_ttl_s=SERVER_SESSION_TTL_S,
         gpu_memory_utilization=SERVER_GPU_MEM_UTIL,
     )
     engine.start()
     logger.info(
-        "engine ready: capacity=%d num_slots=%d capacity_tokens_per_slot=%d cudagraph=%s",
+        "engine ready: capacity=%d num_slots=%d capacity_tokens_per_slot=%d cudagraph=%s prefix_cache=%s "
+        "session_affinity=%s ttl=%.1fs",
         engine.capacity, engine.num_slots, engine.capacity_tokens_per_slot, SERVER_ENABLE_CUDAGRAPH,
+        SERVER_ENABLE_PREFIX_CACHE, SERVER_ENABLE_SESSION_AFFINITY, SERVER_SESSION_TTL_S,
     )
     try:
         yield
@@ -113,6 +141,11 @@ class ChatCompletionRequest(BaseModel):
     top_p: float | None = None
     n: int | None = None
     stream: bool | None = False
+    # P4b session affinity (opt-in): caller-supplied session id. With the server
+    # built --session-affinity, the finished slot is retained warm for the TTL so
+    # the next turn of the same session continues in place with zero restore.
+    # Ignored (byte-for-byte P4a) when the feature is off.
+    session_id: str | None = None
 
 
 class CompletionRequest(BaseModel):
@@ -123,6 +156,8 @@ class CompletionRequest(BaseModel):
     top_p: float | None = None
     n: int | None = None
     stream: bool | None = False
+    # P4b session affinity (opt-in) -- see ChatCompletionRequest.session_id.
+    session_id: str | None = None
 
 
 def _invalid_request(message: str) -> HTTPException:
@@ -225,7 +260,7 @@ async def chat_completions(req: ChatCompletionRequest):
     )
     _validate_capacity(prompt_ids, max_tokens)
 
-    result = await engine.submit(prompt_ids, max_tokens)
+    result = await engine.submit(prompt_ids, max_tokens, session_id=req.session_id)
     text = engine.tok.decode(result["committed_token_ids"])
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
@@ -257,7 +292,7 @@ async def completions(req: CompletionRequest):
     prompt_ids = engine.tok.encode(req.prompt, add_special_tokens=False)
     _validate_capacity(prompt_ids, max_tokens)
 
-    result = await engine.submit(prompt_ids, max_tokens)
+    result = await engine.submit(prompt_ids, max_tokens, session_id=req.session_id)
     text = engine.tok.decode(result["committed_token_ids"])
     return {
         "id": f"cmpl-{uuid.uuid4().hex[:24]}",
@@ -289,13 +324,42 @@ def main() -> None:
     parser.add_argument("--num-slots", type=int, default=SERVER_NUM_SLOTS)
     parser.add_argument("--blocks-per-slot", type=int, default=SERVER_BLOCKS_PER_SLOT)
     parser.add_argument("--no-cudagraph", action="store_true")
+    parser.add_argument(
+        "--no-prefix-cache",
+        action="store_true",
+        help="Disable the persistent prefix cache (rollback to the pre-P4a server).",
+    )
+    parser.add_argument(
+        "--session-affinity",
+        action="store_true",
+        help="Enable opt-in session-affinity warm-slot retention (P4b). Requires the prefix cache.",
+    )
+    parser.add_argument(
+        "--session-ttl-s",
+        type=float,
+        default=SERVER_SESSION_TTL_S,
+        help="Warm-slot retention TTL in seconds for session affinity (P4b). Default 30.0.",
+    )
     args = parser.parse_args()
+
+    # P4b: refuse --session-affinity together with --no-prefix-cache -- a clean
+    # startup error, not a runtime crash (warm-continue needs the persistent
+    # content-hash cache; ServerEngine.__init__ raises the same way as a backstop).
+    if args.session_affinity and args.no_prefix_cache:
+        parser.error(
+            "--session-affinity requires the prefix cache (cannot combine with --no-prefix-cache)"
+        )
 
     os.environ["QSR_SERVER_CAPACITY"] = str(args.capacity)
     os.environ["QSR_SERVER_NUM_SLOTS"] = str(args.num_slots)
     os.environ["QSR_SERVER_BLOCKS_PER_SLOT"] = str(args.blocks_per_slot)
     if args.no_cudagraph:
         os.environ["QSR_SERVER_ENABLE_CUDAGRAPH"] = "0"
+    if args.no_prefix_cache:
+        os.environ["QSR_SERVER_ENABLE_PREFIX_CACHE"] = "0"
+    if args.session_affinity:
+        os.environ["QSR_SERVER_ENABLE_SESSION_AFFINITY"] = "1"
+    os.environ["QSR_SERVER_SESSION_TTL_S"] = str(args.session_ttl_s)
 
     uvicorn.run("server.app:app", host=args.host, port=args.port, log_level="info")
 

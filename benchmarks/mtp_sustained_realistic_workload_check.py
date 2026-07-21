@@ -441,7 +441,9 @@ def _run_sustained(runner, tok, pool: list[dict], capacity: int, duration_s: flo
             for slot, _ in admit_now:
                 if runner.slot_kv_len[slot] != 0:
                     runner.reset_slot(slot)
-            prefill_result = runner.mtp_prefill_batch(new_slots, new_prompts)
+            # P3.3a: unified production prefill entrypoint (delegates to
+            # mtp_prefill_batch when the persistent cache flag is off => P2).
+            prefill_result = runner.mtp_prefill_with_cache(new_slots, new_prompts)
             for slot, req in admit_now:
                 anchor = prefill_result[slot]["anchor"]
                 drafts = prefill_result[slot]["draft_tokens"]

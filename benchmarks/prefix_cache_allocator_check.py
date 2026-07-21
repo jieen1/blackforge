@@ -46,12 +46,14 @@ invariants (sec 4):
 2. ``_check_ref_cnt_bookkeeping`` -- ``Block.ref_cnt`` goes 0->1 on
    allocate, 1->0 on free, and a block can be correctly re-allocated
    (0->1 again) after being freed once.
-3. ``_check_free_queue_ordering`` -- FIFO: blocks are handed back out in
-   the exact order they were freed (oldest-freed-first), the concrete,
-   deterministic ordering behavior P1's plain ``collections.deque``
-   free queue implements (see ``BlockPool``'s docstring for why this is
-   sufficient for P1's no-sharing-yet scope, and a strict subset of what
-   P3's LRU-with-revival will need).
+3. ``_check_free_queue_ordering`` -- P3.2 LRU eviction ordering of the
+   intrusive ``FreeBlockQueue`` (vLLM ``free_blocks`` order): hashless
+   freed blocks are prepended to the evict-next front (reclaimed before
+   any cached block, newest-free-call first); hashed (cached) freed
+   blocks are appended to the LRU tail (oldest-freed-first among them);
+   hashless are always evicted before hashed. (P1's plain-FIFO deque
+   behavior was intentionally superseded by this eviction policy in
+   P3.2; see ``BlockPool``/``FreeBlockQueue`` docstrings.)
 4. ``_check_inv7_reserved_block_zero`` -- block 0 (and, generally, every
    id ``< reserved``) is never handed out by ``allocate`` and never
    accepted by ``free``, across many allocate/free cycles, and the pool
@@ -103,6 +105,16 @@ class _StubRunner:
         self.slot_draft_sync_len = [0] * num_slots
         self.slot_pending_draft_tokens: list[list[int] | None] = [None] * num_slots
         self.slot_num_accepted_tokens = [1] * num_slots
+        # P3.1 (notes/2026-07-19-p3-implementation-plan.md step 4): reset_slot
+        # now also clears the per-slot hash-chain cursor/count. Built
+        # unconditionally in the real __init__, so the stub must expose them
+        # too (this stub mirrors exactly what reset_slot touches).
+        self.slot_block_hashes: list[list] = [[] for _ in range(num_slots)]
+        self.slot_published_blocks: list[int] = [0] * num_slots
+        # P3.2 decode-position populate: reset_slot now also clears the per-slot
+        # committed-token record. Built unconditionally in the real __init__, so
+        # the stub mirrors it (this stub mirrors exactly what reset_slot touches).
+        self.slot_committed_tokens: list[list[int]] = [[] for _ in range(num_slots)]
 
 
 def _check_alloc_free_correctness() -> dict:
@@ -185,38 +197,67 @@ def _check_ref_cnt_bookkeeping() -> dict:
 
 
 def _check_free_queue_ordering() -> dict:
-    from runtime.direct_model_runner import BlockPool
+    from runtime.direct_model_runner import BlockHash, BlockPool, hash_block_tokens
 
     errors = []
-    # Fully drain the pool, then free in a DELIBERATE, non-sorted order and
-    # confirm allocate() hands blocks back out in EXACTLY that order (FIFO:
-    # oldest-freed-first) -- the concrete free-queue ordering behavior this
-    # phase's plain deque implements.
+    extra = ("fp8_e4m3",)
+
+    # (a) HASHLESS freed blocks are prepended to the evict-next front: freed in
+    #     one call [7,2,9,0], each appendleft jumps ahead of the previous, so
+    #     popleft returns them newest-in-call-first (the reverse) -- they are
+    #     reclaimed before any cached block (vLLM free_blocks order).
     pool = BlockPool(num_blocks=11, reserved=1)  # ids 1..10
     all_ids = pool.allocate(10)
     if pool.num_free_blocks() != 0:
         errors.append("pool not fully drained after allocating every block")
-
     free_order = [all_ids[7], all_ids[2], all_ids[9], all_ids[0]]
-    pool.free(free_order)
+    pool.free(free_order)  # all hashless => appendleft each => front reversed
     realloc = pool.allocate(4)
-    if realloc != free_order:
-        errors.append(f"free-queue ordering violated: freed {free_order}, reallocated {realloc}")
-
-    # A second round: every block is held again now (the other 6 were
-    # never freed; the 4 just reallocated are held again too). Free them
-    # ALL in a deliberate two-part order (still-held 6, then the
-    # just-reallocated 4) and confirm a full allocate() reproduces exactly
-    # that combined order (front of queue = whatever was freed earliest).
-    still_held = [i for i in all_ids if i not in free_order]
-    pool.free(still_held)
-    pool.free(realloc)
-    realloc_all = pool.allocate(10)
-    expected = still_held + realloc
-    if realloc_all != expected:
+    expected_hashless = list(reversed(free_order))
+    if realloc != expected_hashless:
         errors.append(
-            f"free-queue ordering violated across two free rounds: expected {expected}, got {realloc_all}"
+            f"hashless prepend ordering violated: freed {free_order}, "
+            f"expected {expected_hashless}, got {realloc}"
         )
+
+    # (b) HASHLESS blocks are evicted BEFORE hashed (cached) blocks. Cache a
+    #     pair (append => LRU tail) and free a hashless pair (appendleft =>
+    #     head); the next two allocations must be the hashless pair first.
+    pool2 = BlockPool(num_blocks=5, reserved=1)  # ids 1..4 (drained exactly)
+    h_ids = pool2.allocate(2)            # become cached (hashed)
+    plain_ids = pool2.allocate(2)        # stay hashless; pool now fully drained
+    for i, bid in enumerate(h_ids):
+        pool2.cache_block(bid, BlockHash(hash_block_tokens(None, [i + 1] * 16, extra), 16))
+    pool2.free(h_ids)      # hashed  => append (tail)
+    pool2.free(plain_ids)  # hashless => appendleft (head, evicted first)
+    first_two = pool2.allocate(2)
+    if first_two != list(reversed(plain_ids)):
+        errors.append(
+            f"hashless not evicted before hashed: got {first_two}, "
+            f"expected {list(reversed(plain_ids))}"
+        )
+    # The two hashed blocks remain free (tail) and still cached...
+    if pool2.num_free_blocks() != 2:
+        errors.append(f"expected 2 hashed blocks still free, got {pool2.num_free_blocks()}")
+    # ...and allocating them DROPS their hashes (INV2 eviction-before-hand-out).
+    last_two = pool2.allocate(2)
+    if set(last_two) != set(h_ids):
+        errors.append(f"hashed blocks not returned after hashless: got {last_two}")
+    for bid in h_ids:
+        if pool2.blocks[bid].block_hash is not None:
+            errors.append(f"evicted hashed block {bid} kept its hash (INV2)")
+
+    # (c) Among HASHED blocks, oldest-freed-first (LRU tail order): a freed
+    #     before b => a closer to the head => evicted first.
+    pool3 = BlockPool(num_blocks=3, reserved=1)  # ids 1,2
+    a, b = pool3.allocate(2)  # drains the pool
+    pool3.cache_block(a, BlockHash(hash_block_tokens(None, [1] * 16, extra), 16))
+    pool3.cache_block(b, BlockHash(hash_block_tokens(None, [2] * 16, extra), 16))
+    pool3.free([a])  # hashed => append first  (older, closer to head)
+    pool3.free([b])  # hashed => append second (newer, closer to tail)
+    order = pool3.allocate(2)
+    if order != [a, b]:
+        errors.append(f"hashed LRU ordering violated: expected [{a}, {b}], got {order}")
 
     return {"passed": not errors, "errors": errors}
 
@@ -370,27 +411,27 @@ def _check_fragmentation_after_churn() -> dict:
     errors = []
     details: dict[str, object] = {}
     pool = BlockPool(num_blocks=50, reserved=1)
-    # slot 0 = the slot under test, slot 1 = a "scratch" slot churned in
-    # between slot 0's own growth steps to force real, deliberate
-    # non-contiguity (allocate/reset/reallocate cycles), per the design
-    # doc's own framing of this phase's purpose.
+    # slot 0 = the slot under test, slot 1 = a concurrent slot whose own
+    # allocation pressure forces slot 0's block_table to be non-contiguous --
+    # the real fragmentation scenario this phase exists to prove safe.
     runner = _StubRunner(num_slots=2, block_size=16, blocks_per_slot=8, pool=pool)  # capacity 128 tokens/slot
 
-    # Step 1: slot 0 grows by one block.
+    # Step 1: slot 0 grows by one block (its first physical id).
     DirectModelRunner._ensure_blocks(runner, 0, 10)
-    # Step 2: scratch churn on slot 1 -- allocate then immediately free,
-    # several times, to push freed ids into the queue ahead of fresh ones.
-    for _ in range(3):
-        DirectModelRunner._ensure_blocks(runner, 1, 10)
-        DirectModelRunner.reset_slot(runner, 1)
-    # Step 3: slot 0 grows again -- since the queue now has scratch's
-    # recently-freed (low) ids ahead of the untouched-so-far (high) ids,
-    # slot 0's next block comes from the scratch-recycled range, not the
-    # next-sequential id after its first block.
+    # Step 2: slot 1 grows by SEVERAL blocks and HOLDS them. Under P3.2's
+    # appendleft-for-hashless LRU policy a freed hashless block is prepended to
+    # the evict-next front (so plain allocate/free churn just recycles the same
+    # low id back to the head -- it no longer rotates the queue the way P1's
+    # FIFO deque did). The realistic way a gap therefore forms is a concurrent
+    # slot HOLDING the ids adjacent to slot 0's first block, removing them from
+    # the free queue so the head advances past them.
+    DirectModelRunner._ensure_blocks(runner, 1, 40)  # 3 blocks, held by slot 1
+    # Step 3: slot 0 grows again -- the free-queue head is now past slot 1's
+    # held blocks, so slot 0's second block is non-adjacent to its first.
     DirectModelRunner._ensure_blocks(runner, 0, 25)
-    # Step 4: one more scratch churn cycle, then grow slot 0 a third time.
-    DirectModelRunner._ensure_blocks(runner, 1, 10)
-    DirectModelRunner.reset_slot(runner, 1)
+    # Step 4: slot 1 grows further (holds more), then slot 0 grows a third time
+    # -- again drawing from past the held range, staying non-contiguous.
+    DirectModelRunner._ensure_blocks(runner, 1, 57)
     DirectModelRunner._ensure_blocks(runner, 0, 40)
 
     table0 = runner.block_table[0]

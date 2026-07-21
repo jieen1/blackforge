@@ -78,6 +78,25 @@ VALIDATION_DIAG_SLOTS = list(range(5 * CAPACITY, 6 * CAPACITY))
 os.environ["QSR_SERVER_CAPACITY"] = str(CAPACITY)
 os.environ["QSR_SERVER_NUM_SLOTS"] = str(NUM_SLOTS)
 os.environ.setdefault("QSR_SERVER_ENABLE_CUDAGRAPH", "1")
+# P4a: the e2e sets its OWN moderate blocks_per_slot (its prompts are a few
+# thousand tokens, NOT 64K), so it does NOT pay for the full long-context KV
+# pool the server's raised default (4200) allocates up front. NUM_SLOTS here
+# is 24 (6*CAPACITY: the engine's 16 + this script's 8 validation slots), and
+# (24+1)*4200 blocks of KV would be far more than this moderate-prompt test
+# needs. 512 (the pre-P4a default) gives an 8192-token per-slot ceiling --
+# ample for the turn-1/turn-2 hit prompts below. The persistent prefix cache
+# stays ON (the default): proving the server SERVES a warm hit is the whole
+# point of the P4a subtest added below.
+os.environ["QSR_SERVER_BLOCKS_PER_SLOT"] = "512"
+os.environ.setdefault("QSR_SERVER_ENABLE_PREFIX_CACHE", "1")
+# P4b (notes/2026-07-20-p4b-session-affinity-plan.md §4.1): turn ON the opt-in
+# session-affinity warm-slot retention for the P4b subtest below, with a generous
+# 120s TTL so the retained warm slot survives the sequential turn-1/turn-2 HTTP
+# calls deterministically (the default 30s is plenty too, but 120s removes any
+# timing sensitivity). The no-session_id P4a subtest still runs unchanged with the
+# flag on (warm counters stay 0 without a session_id -- proves no default-path leak).
+os.environ["QSR_SERVER_ENABLE_SESSION_AFFINITY"] = "1"
+os.environ["QSR_SERVER_SESSION_TTL_S"] = "120"
 
 sys.path.insert(0, SM120_VLLM_INTEGRATION)
 
@@ -336,6 +355,339 @@ async def _run() -> dict:
                 post_defensive.status_code == 200 and len(post_defensive.json()["choices"][0]["text"]) > 0
             )
 
+            # -- 6. P4a prefix-cache turn-1/turn-2 hit over real HTTP (the
+            # P4 product-value test). Turn 1 POSTs a few-thousand-token prompt
+            # (multi-block prefix + measurable prefill, but NOT 64K -- P3.4's
+            # longctx check already proved the 64K case at the runtime level)
+            # via /v1/completions, temperature 0 => COLD, populates the
+            # persistent content-addressed cache. Reset nothing (the cache
+            # persists across requests by design -- R10: a slot's published
+            # blocks stay hit-able at ref_cnt==0 across reset_slot). Turn 2
+            # POSTs the SAME prompt + a short appended turn => should HIT
+            # turn-1's cached prefix at L ~= turn-1's prompt boundary. --
+            stats_before_turn1 = (await client.get("/debug/stats")).json()
+            p4a_block = (
+                "def reconcile_prefix_hit(token_ids):\n"
+                "    # Walk chained block hashes left-to-right; stop at the first miss.\n"
+                "    matched_blocks = 0\n"
+                "    for block_hash in compute_prompt_block_hashes(token_ids):\n"
+                "        if block_pool.get_cached_block(block_hash) is None:\n"
+                "            break\n"
+                "        matched_blocks += 1\n"
+                "    return matched_blocks * block_size\n\n"
+            )
+            turn1_text = (
+                "# P4A_PREFIX_CACHE_TURN1_MARKER_20260720\n"
+                "You are a careful code reviewer. Read the following reference implementation "
+                "of a persistent prefix-cache reconciliation probe, repeated for context, then "
+                "answer the question at the end precisely and briefly.\n\n"
+                + (p4a_block * 32)
+                + "\nQuestion: In one short sentence, what does reconcile_prefix_hit return?\n"
+            )
+            turn2_text = (
+                turn1_text
+                + "\nFollow-up: now state the time complexity of that hash walk in one short sentence.\n"
+            )
+            p4a_max_tokens = 32
+
+            t1_t0 = time.perf_counter()
+            turn1 = await client.post(
+                "/v1/completions",
+                json={"prompt": turn1_text, "max_tokens": p4a_max_tokens, "temperature": 0},
+                timeout=180.0,
+            )
+            turn1_wall_s = time.perf_counter() - t1_t0
+            t2_t0 = time.perf_counter()
+            turn2 = await client.post(
+                "/v1/completions",
+                json={"prompt": turn2_text, "max_tokens": p4a_max_tokens, "temperature": 0},
+                timeout=180.0,
+            )
+            turn2_wall_s = time.perf_counter() - t2_t0
+            stats_after_turn2 = (await client.get("/debug/stats")).json()
+
+            p4a: dict = {
+                "turn1_status": turn1.status_code,
+                "turn2_status": turn2.status_code,
+                "turn1_wall_s": turn1_wall_s,
+                "turn2_wall_s": turn2_wall_s,
+            }
+            if turn1.status_code == 200 and turn2.status_code == 200:
+                t1_body = turn1.json()
+                t2_body = turn2.json()
+                prompt_ids_1 = t1_body["debug_prompt_token_ids"]
+                turn2_ids = t2_body["debug_prompt_token_ids"]
+                committed_1 = t1_body["debug_committed_token_ids"]
+                committed_2 = t2_body["debug_committed_token_ids"]
+                # Precondition (what makes the hit deterministic + a hash-
+                # collision guard): turn-2 must reproduce turn-1's prompt tokens
+                # through the CACHED block-aligned depth G1 = block_align_down(
+                # len(prompt_1) - 1) -- the cold completion-checkpoint depth, i.e.
+                # exactly the prefix the hit serves. The check is at G1, NOT the
+                # full prompt length: the cache holds only FULL prefix blocks [0,
+                # G1), and the partial tail block past G1 is not cached -- and the
+                # tokenizer can re-segment that tail when the follow-up turn is
+                # appended (so a full-length prefix match is neither required nor
+                # always true). The server's own debug_prompt_token_ids are the
+                # authoritative tokenization, so there is no decode/encode
+                # ambiguity in this comparison. prefix_clean_full is reported too,
+                # purely as an informational note on that junction re-segmentation.
+                cached_prefix_len = ((len(prompt_ids_1) - 1) // 16) * 16
+                prefix_clean = turn2_ids[:cached_prefix_len] == prompt_ids_1[:cached_prefix_len]
+                prefix_clean_full = turn2_ids[: len(prompt_ids_1)] == prompt_ids_1
+                # (a) turn-2 is a HIT: hits advanced during the turn-1/turn-2
+                # window (turn-1 is cold by construction -- a unique marker no
+                # earlier request populated -- so the new hit is turn-2), and a
+                # hit_L sample keyed to turn-2's prompt length has L > 0 at ~= the
+                # cold completion checkpoint G = block_align_down(len(prompt_1)-1).
+                hits_delta = stats_after_turn2["prefix_cache_hits"] - stats_before_turn1["prefix_cache_hits"]
+                misses_delta = stats_after_turn2["prefix_cache_misses"] - stats_before_turn1["prefix_cache_misses"]
+                turn2_hit_samples = [
+                    samp
+                    for samp in stats_after_turn2["prefix_cache_hit_L_samples"]
+                    if samp["prompt_tokens"] == len(turn2_ids)
+                ]
+                hit_L = turn2_hit_samples[-1]["hit_L"] if turn2_hit_samples else 0
+                hit_L_ok = (
+                    hit_L > 0
+                    and hit_L % 16 == 0
+                    and len(prompt_ids_1) - 16 <= hit_L <= len(prompt_ids_1)
+                )
+                # (b) INV1 end-to-end: turn-2's HIT-served committed tokens match
+                # an independent COLD single-slot reference replay of the SAME
+                # turn-2 prompt (the existing _independent_reference_replay
+                # methodology; runner.prefill is a cold prefill that never
+                # restores from the cache, so the reference is genuinely
+                # independent of the hit path). Proves the warm hit served the
+                # SAME tokens a cold prefill would have.
+                inv1_replay = await _independent_reference_replay(
+                    engine,
+                    VALIDATION_SLOTS[3],
+                    VALIDATION_DIAG_SLOTS[3],
+                    tok,
+                    turn2_text,
+                    committed_2,
+                )
+                # (c) user-facing win: turn-2 (hit, prefills only the short
+                # appended suffix) is materially faster than turn-1 (cold full
+                # prefill). Non-streaming, so wall time is the TTFT proxy; the
+                # always-on admission bootstrap check adds a cold reference
+                # prefill to BOTH turns, so the differential is the production
+                # prefill going cold->hit (still a clear, lenient drop).
+                speedup = (turn1_wall_s / turn2_wall_s) if turn2_wall_s > 0 else float("inf")
+                p4a.update(
+                    {
+                        "turn1_prompt_tokens": len(prompt_ids_1),
+                        "turn2_prompt_tokens": len(turn2_ids),
+                        "turn1_committed_tokens": len(committed_1),
+                        "cached_prefix_len": cached_prefix_len,
+                        "prefix_clean": prefix_clean,
+                        "prefix_clean_full": prefix_clean_full,
+                        "hits_delta": hits_delta,
+                        "misses_delta": misses_delta,
+                        "turn2_hit_L": hit_L,
+                        "turn2_hit_L_over_prompt_len": (hit_L / len(prompt_ids_1)) if prompt_ids_1 else 0.0,
+                        "hit_L_ok": hit_L_ok,
+                        "turn2_is_hit": hits_delta >= 1 and hit_L > 0,
+                        "turn1_is_miss": misses_delta >= 1,
+                        "inv1_e2e_replay": inv1_replay,
+                        "inv1_e2e_ok": inv1_replay["ok"],
+                        "ttft_speedup": speedup,
+                        "ttft_drop": turn2_wall_s < turn1_wall_s,
+                        "turn1_completion_preview": t1_body["choices"][0]["text"][:120],
+                        "turn2_completion_preview": t2_body["choices"][0]["text"][:120],
+                    }
+                )
+                p4a["ok"] = bool(
+                    prefix_clean
+                    and p4a["turn2_is_hit"]
+                    and p4a["turn1_is_miss"]
+                    and hit_L_ok
+                    and p4a["inv1_e2e_ok"]
+                    and p4a["ttft_drop"]
+                )
+            else:
+                p4a["ok"] = False
+                p4a["turn1_body"] = turn1.text[:300]
+                p4a["turn2_body"] = turn2.text[:300]
+            result["prefix_cache_turn_hit"] = p4a
+
+            # -- 7. P4b session-affinity warm-slot continuation over real HTTP
+            # (the P4b zero-restore test). Turn 1 POSTs a few-thousand-token
+            # coding prompt + session_id, temperature 0 => COLD (unique marker,
+            # no earlier request populated it), populates the cache, and on finish
+            # the slot is RETAINED warm (not reset). Turn 2 POSTs the SAME
+            # session_id with a prompt that EXTENDS turn-1's P1+C1 exactly =>
+            # continues the warm slot in place with ZERO restore
+            # (mtp_prefill_warm_continue). Zero-restore is PROVEN by
+            # session_warm_continuations advancing by exactly 1 while
+            # prefix_cache_hits does NOT advance for turn-2 (the warm path bypasses
+            # reconcile_prefix_hit entirely) -- distinct from the content-hash hit. --
+            stats_before_p4b = (await client.get("/debug/stats")).json()
+            # Feature must not leak into the default path: the no-session_id P4a
+            # subtest above (flag ON, no session_id) left warm continuations at 0.
+            p4b_no_leak = stats_before_p4b["session_warm_continuations"] == 0
+
+            p4b_turn1_text = (
+                "# P4B_SESSION_AFFINITY_TURN1_MARKER_20260720\n"
+                "You are a careful code reviewer. Read the following reference implementation "
+                "of a persistent prefix-cache reconciliation probe, repeated for context, then "
+                "answer the question at the end precisely and briefly.\n\n"
+                + (p4a_block * 32)
+                + "\nQuestion: In one short sentence, what does reconcile_prefix_hit return?\n"
+            )
+            p4b_max_tokens = 32
+            p4b_sess_id = "P4B_SESS_1"
+
+            p4b: dict = {"no_leak_default_path": p4b_no_leak}
+            p4b_t1_t0 = time.perf_counter()
+            p4b_turn1 = await client.post(
+                "/v1/completions",
+                json={"prompt": p4b_turn1_text, "max_tokens": p4b_max_tokens, "temperature": 0, "session_id": p4b_sess_id},
+                timeout=180.0,
+            )
+            p4b_turn1_wall_s = time.perf_counter() - p4b_t1_t0
+            p4b["turn1_status"] = p4b_turn1.status_code
+            p4b["turn1_wall_s"] = p4b_turn1_wall_s
+
+            if p4b_turn1.status_code == 200:
+                p4b_t1_body = p4b_turn1.json()
+                p4b_p1 = p4b_t1_body["debug_prompt_token_ids"]
+                p4b_c1 = p4b_t1_body["debug_committed_token_ids"]  # server's max_tokens-truncated view
+                # The warm-continue boundary is the runtime's AUTHORITATIVE committed
+                # state (slot_kv_len / slot_committed_tokens), which may extend a few
+                # tokens past the server's max_tokens-truncated response (MTP final-
+                # round overshoot). Read it directly (the e2e already drives
+                # engine.runner for the independent reference replay) so turn-2
+                # reproduces the EXACT boundary and the warm path fires
+                # deterministically. A real HTTP client sees only p4b_c1, so for real
+                # traffic the warm path is opportunistic (plan §5 risk #1); the e2e
+                # proves the zero-restore MECHANISM by constructing the exact turn-2.
+                await asyncio.sleep(0.1)  # let the engine loop finish the retention
+                p4b_retained = engine.retained.get(p4b_sess_id)
+                assert p4b_retained is not None, "turn-1 slot was not retained warm"
+                p4b_retained_slot = p4b_retained["slot"]
+                p4b_l1 = engine.runner.slot_kv_len[p4b_retained_slot]
+                p4b_target = list(engine.runner.slot_committed_tokens[p4b_retained_slot][:p4b_l1])
+                # C1_full = committed tokens AFTER the prompt (incl. any overshoot).
+                p4b_c1_full = p4b_target[len(p4b_p1):p4b_l1]
+                p4b_c1_text = tok.decode(p4b_c1_full)
+                p4b["server_c1_tokens"] = len(p4b_c1)
+                p4b["runtime_c1_full_tokens"] = len(p4b_c1_full)
+                p4b["mtp_overshoot_tokens"] = p4b_l1 - (len(p4b_p1) + len(p4b_c1))
+                # Warm-continue exact-prefix precondition (plan §5 risk #1): turn-2's
+                # prompt tokens must equal P1+C1 through L1. The tokenizer re-segments
+                # at the turn1|C1 and C1|follow-up junctions, so try a small set of
+                # follow-up boundary styles and pick the first whose re-tokenization
+                # reproduces P1+C1 EXACTLY -- verified locally with the SAME tokenizer
+                # the server uses, then re-asserted against the server's authoritative
+                # debug_prompt_token_ids after the POST. (turn1_text ends with "\n"; a
+                # C1 starting with "\n" would make "\n\n" which re-segments P1 at idx
+                # 2533 -- verified -- so such a C1 cannot satisfy the precondition by
+                # simple concatenation and is reported honestly below.)
+                p4b_followup_variants = [
+                    "\nFollow-up: now state the time complexity of that hash walk in one short sentence.\n",
+                    " Follow-up: now state the time complexity of that hash walk in one short sentence.\n",
+                    "\n\nFollow-up: now state the time complexity of that hash walk in one short sentence.\n",
+                ]
+                p4b_turn2_text = None
+                p4b_chosen_followup = None
+                for fu in p4b_followup_variants:
+                    candidate = p4b_turn1_text + p4b_c1_text + fu
+                    if tok.encode(candidate, add_special_tokens=False)[:p4b_l1] == p4b_target:
+                        p4b_turn2_text = candidate
+                        p4b_chosen_followup = fu
+                        break
+                p4b["turn1_prompt_tokens"] = len(p4b_p1)
+                p4b["turn1_committed_tokens"] = len(p4b_c1)
+                p4b["c1_text_preview"] = p4b_c1_text[:60]
+                p4b["c1_starts_with_newline"] = p4b_c1_text.startswith("\n")
+                p4b["chosen_followup"] = repr(p4b_chosen_followup)
+                p4b["local_precondition_found"] = p4b_turn2_text is not None
+
+                if p4b_turn2_text is not None:
+                    p4b_t2_t0 = time.perf_counter()
+                    p4b_turn2 = await client.post(
+                        "/v1/completions",
+                        json={"prompt": p4b_turn2_text, "max_tokens": p4b_max_tokens, "temperature": 0, "session_id": p4b_sess_id},
+                        timeout=180.0,
+                    )
+                    p4b_turn2_wall_s = time.perf_counter() - p4b_t2_t0
+                    p4b["turn2_status"] = p4b_turn2.status_code
+                    p4b["turn2_wall_s"] = p4b_turn2_wall_s
+                    stats_after_p4b = (await client.get("/debug/stats")).json()
+
+                    if p4b_turn2.status_code == 200:
+                        p4b_t2_body = p4b_turn2.json()
+                        p4b_turn2_ids = p4b_t2_body["debug_prompt_token_ids"]
+                        p4b_committed_2 = p4b_t2_body["debug_committed_token_ids"]
+                        # Authoritative exact-prefix precondition (server's own
+                        # tokenization): turn-2 reproduces P1+C1 through L1.
+                        p4b_precond = p4b_turn2_ids[:p4b_l1] == p4b_target
+                        # Zero-restore proof: session_warm_continuations advanced by
+                        # exactly 1 AND prefix_cache_hits did NOT advance for turn-2.
+                        warm_delta = (
+                            stats_after_p4b["session_warm_continuations"]
+                            - stats_before_p4b["session_warm_continuations"]
+                        )
+                        hits_delta_p4b = (
+                            stats_after_p4b["prefix_cache_hits"]
+                            - stats_before_p4b["prefix_cache_hits"]
+                        )
+                        retentions_delta = (
+                            stats_after_p4b["session_retentions"]
+                            - stats_before_p4b["session_retentions"]
+                        )
+                        fallbacks_delta = (
+                            stats_after_p4b["session_warm_fallbacks"]
+                            - stats_before_p4b["session_warm_fallbacks"]
+                        )
+                        # INV1 end-to-end: turn-2's warm-served committed tokens match
+                        # an independent COLD single-slot reference replay of the SAME
+                        # turn-2 prompt (runner.prefill never restores from the cache,
+                        # so the reference is genuinely independent of the warm path).
+                        p4b_inv1 = await _independent_reference_replay(
+                            engine, VALIDATION_SLOTS[3], VALIDATION_DIAG_SLOTS[3], tok, p4b_turn2_text, p4b_committed_2
+                        )
+                        speedup_p4b = (p4b_turn1_wall_s / p4b_turn2_wall_s) if p4b_turn2_wall_s > 0 else float("inf")
+                        p4b.update(
+                            {
+                                "turn2_prompt_tokens": len(p4b_turn2_ids),
+                                "prior_len_L1": p4b_l1,
+                                "exact_prefix_precondition": p4b_precond,
+                                "warm_continuations_delta": warm_delta,
+                                "prefix_cache_hits_delta": hits_delta_p4b,
+                                "session_retentions_delta": retentions_delta,
+                                "session_warm_fallbacks_delta": fallbacks_delta,
+                                "warm_fired": warm_delta == 1 and hits_delta_p4b == 0,
+                                "inv1_e2e_replay": p4b_inv1,
+                                "inv1_e2e_ok": p4b_inv1["ok"],
+                                "ttft_speedup": speedup_p4b,
+                                "ttft_drop": p4b_turn2_wall_s < p4b_turn1_wall_s,
+                                "turn1_completion_preview": p4b_t1_body["choices"][0]["text"][:120],
+                                "turn2_completion_preview": p4b_t2_body["choices"][0]["text"][:120],
+                                "warm_continuation_samples": stats_after_p4b["session_warm_continuation_samples"][-2:],
+                            }
+                        )
+                        p4b["ok"] = bool(
+                            p4b_no_leak
+                            and p4b_precond
+                            and warm_delta == 1
+                            and hits_delta_p4b == 0
+                            and p4b_inv1["ok"]
+                            and p4b["ttft_drop"]
+                        )
+                    else:
+                        p4b["ok"] = False
+                        p4b["turn2_body"] = p4b_turn2.text[:300]
+                else:
+                    p4b["ok"] = False
+                    p4b["note"] = "no follow-up construction satisfied the exact-prefix precondition locally"
+            else:
+                p4b["ok"] = False
+                p4b["turn1_body"] = p4b_turn1.text[:300]
+            result["session_affinity_warm_continue"] = p4b
+
             result["final_stats"] = (await client.get("/debug/stats")).json()
 
             result["passed"] = bool(
@@ -345,6 +697,8 @@ async def _run() -> dict:
                 and result["concurrent_batching_proof"]["all_status_200"]
                 and defensive_ok
                 and result["post_defensive_real_request_ok"]
+                and result["prefix_cache_turn_hit"]["ok"]
+                and result["session_affinity_warm_continue"]["ok"]
                 and result["final_stats"]["bootstrap_checks_failed"] == 0
             )
     finally:

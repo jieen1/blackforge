@@ -200,7 +200,10 @@ def _run_batch_batched(
     end_evt = torch.cuda.Event(enable_timing=True)
     t0 = time.perf_counter()
     start_evt.record()
-    prefill_result = runner.mtp_prefill_batch(slots, prompts_batch, chunk_size=chunk_size)
+    # P3.3a: production prefill is the unified entrypoint. Flag off => it
+    # delegates straight to mtp_prefill_batch (byte-for-byte P2), so this swap
+    # regresses nothing when the persistent cache is disabled (the default).
+    prefill_result = runner.mtp_prefill_with_cache(slots, prompts_batch, chunk_size=chunk_size)
     end_evt.record()
     torch.cuda.synchronize()
     t1 = time.perf_counter()

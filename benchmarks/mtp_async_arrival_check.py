@@ -349,7 +349,9 @@ def _run_async_arrival(runner, tok) -> dict:
             # (different-length-per-slot, when len(new_slots) > 1 and their
             # prompt_lens differ) batched prefill in ONE call, admitting
             # multiple fresh requests alongside each other.
-            prefill_result = runner.mtp_prefill_batch(new_slots, new_prompts)
+            # P3.3a: unified production prefill entrypoint (delegates to
+            # mtp_prefill_batch when the persistent cache flag is off => P2).
+            prefill_result = runner.mtp_prefill_with_cache(new_slots, new_prompts)
 
             for (slot, (req_id, earliest_round, prompt_len, max_tokens, question, city)), prompt in zip(
                 admit_now, new_prompts
