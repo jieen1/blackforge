@@ -51,6 +51,7 @@ from server.engine import ServerEngine
 from server.formats import strip_thinking, extract_text, convert_tools_to_chat_template
 from server.formats import openai as openai_format
 from server.formats import anthropic as anthropic_format
+from server.formats.stream import StreamProcessor
 
 logger = logging.getLogger("qwen_sm120_server.app")
 
@@ -254,42 +255,25 @@ async def chat_completions(req: ChatCompletionRequest):
         cmpl_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created = int(time.time())
         async def _sse():
-            all_ids: list[int] = []
-            prev_visible = ""
+            proc = StreamProcessor(engine.tok)
             final_result = None
-            thinking_done = False
             async for item in engine.submit_stream(prompt_ids, max_tokens, session_id=req.session_id):
                 if isinstance(item, dict):
                     final_result = item
                     break
-                all_ids.extend(item)
-                raw = engine.tok.decode(all_ids, skip_special_tokens=True)
-                # Don't emit until thinking phase is definitively over:
-                # either the think-close tag was found and stripped, or we
-                # have enough text that it's clearly not a thinking prefix.
-                if not thinking_done:
-                    TC = chr(60) + "/think" + chr(62)
-                    if TC in raw or (len(raw) > 60 and raw == strip_thinking(raw)):
-                        thinking_done = True
-                    else:
-                        continue
-                visible = strip_thinking(raw)
-                delta = visible[len(prev_visible):]
-                if delta:
+                proc.add_tokens(item)
+                for delta in proc.drain_content():
                     chunk = {
                         "id": cmpl_id, "object": "chat.completion.chunk", "created": created,
                         "model": model_name,
                         "choices": [{"index": 0, "delta": {"role": "assistant", "content": delta}, "finish_reason": None}],
                     }
                     yield f"data: {_json.dumps(chunk)}\n\n"
-                    prev_visible = visible
-            # Final chunk with finish_reason
             finish = final_result["finish_reason"] if final_result else "stop"
-            # Check for tool calls in the final visible text
-            from server.formats.tools import parse_tool_calls, format_tool_calls_openai
-            _, tool_calls = parse_tool_calls(prev_visible)
+            visible_text, tool_calls = proc.finalize()
             if tool_calls:
                 finish = "tool_calls"
+                from server.formats.tools import format_tool_calls_openai
                 for i, tc in enumerate(format_tool_calls_openai(tool_calls)):
                     chunk = {
                         "id": cmpl_id, "object": "chat.completion.chunk", "created": created,
@@ -547,11 +531,9 @@ async def anthropic_messages(request: Request):
     if stream:
         import json as _json
         async def _anthropic_sse():
-            all_ids: list[int] = []
-            prev_visible = ""
+            proc = StreamProcessor(engine.tok)
             final_result = None
             msg_id = f"msg_{uuid.uuid4().hex[:24]}"
-            # message_start
             msg_start = {
                 "type": "message_start",
                 "message": {
@@ -562,35 +544,35 @@ async def anthropic_messages(request: Request):
                 },
             }
             yield f"event: message_start\ndata: {_json.dumps(msg_start)}\n\n"
-            # content_block_start
             bs = {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}
             yield f"event: content_block_start\ndata: {_json.dumps(bs)}\n\n"
             yield f"event: ping\ndata: " + _json.dumps({"type": "ping"}) + "\n\n"
 
-            thinking_done = False
             async for item in engine.submit_stream(prompt_ids, effective_max):
                 if isinstance(item, dict):
                     final_result = item
                     break
-                all_ids.extend(item)
-                raw = engine.tok.decode(all_ids, skip_special_tokens=True)
-                if not thinking_done:
-                    TC = chr(60) + "/think" + chr(62)
-                    if TC in raw or (len(raw) > 60 and raw == strip_thinking(raw)):
-                        thinking_done = True
-                    else:
-                        continue
-                visible = strip_thinking(raw)
-                delta = visible[len(prev_visible):]
-                if delta:
+                proc.add_tokens(item)
+                for delta in proc.drain_content():
                     d = {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": delta}}
                     yield f"event: content_block_delta\ndata: {_json.dumps(d)}\n\n"
-                    prev_visible = visible
 
             yield f"event: content_block_stop\ndata: " + _json.dumps({"type": "content_block_stop", "index": 0}) + "\n\n"
             finish = final_result["finish_reason"] if final_result else "stop"
             stop_reason = "end_turn" if finish == "stop" else "max_tokens"
-            out_tokens = len(all_ids)
+            visible_text, tool_calls = proc.finalize()
+            out_tokens = len(proc.all_ids)
+            block_index = 1
+            if tool_calls:
+                stop_reason = "tool_use"
+                from server.formats.tools import format_tool_calls_anthropic
+                for tc in format_tool_calls_anthropic(tool_calls):
+                    bs = {"type": "content_block_start", "index": block_index, "content_block": {"type": "tool_use", "id": tc["id"], "name": tc["name"], "input": {}}}
+                    yield f"event: content_block_start\ndata: {_json.dumps(bs)}\n\n"
+                    delta_ev = {"type": "content_block_delta", "index": block_index, "delta": {"type": "input_json_delta", "partial_json": _json.dumps(tc["input"])}}
+                    yield f"event: content_block_delta\ndata: {_json.dumps(delta_ev)}\n\n"
+                    yield f"event: content_block_stop\ndata: " + _json.dumps({"type": "content_block_stop", "index": block_index}) + "\n\n"
+                    block_index += 1
             msg_delta = {"type": "message_delta", "delta": {"stop_reason": stop_reason, "stop_sequence": None}, "usage": {"output_tokens": out_tokens}}
             yield f"event: message_delta\ndata: {_json.dumps(msg_delta)}\n\n"
             yield f"event: message_stop\ndata: " + _json.dumps({"type": "message_stop"}) + "\n\n"

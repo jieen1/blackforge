@@ -98,3 +98,30 @@ def convert_tools_to_chat_template(tools: list[dict] | None) -> list[dict] | Non
         else:
             converted.append(tool)
     return converted
+
+
+# -- Streaming tool-call detection ------------------------------------------
+
+_TOOL_CALL_OPEN = chr(60) + 'tool_call' + chr(62)
+
+
+def find_tool_call_start(text: str) -> int:
+    """Find the earliest position where a tool call block might be starting.
+
+    Returns the index of the first character of the potential tool call,
+    or -1 if no tool call start is detected.
+
+    We look for progressively shorter prefixes of the opening tag to catch
+    partial matches at the end of a streaming buffer (e.g. the model has
+    emitted '<tool' but not yet '_call>').
+    """
+    # Full tag present
+    idx = text.find(_TOOL_CALL_OPEN)
+    if idx >= 0:
+        return idx
+    # Partial prefixes at the very end of the text (streaming edge case)
+    for length in range(len(_TOOL_CALL_OPEN) - 1, 0, -1):
+        prefix = _TOOL_CALL_OPEN[:length]
+        if text.endswith(prefix):
+            return len(text) - length
+    return -1

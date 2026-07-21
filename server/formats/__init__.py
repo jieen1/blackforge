@@ -21,7 +21,9 @@ from server.formats.tools import (
     format_tool_calls_openai,
     format_tool_calls_anthropic,
     convert_tools_to_chat_template,
+    find_tool_call_start,
 )
+from server.formats.stream import StreamProcessor
 from server.formats import openai as openai_format
 from server.formats import anthropic as anthropic_format
 
@@ -33,6 +35,8 @@ __all__ = [
     "format_tool_calls_openai",
     "format_tool_calls_anthropic",
     "convert_tools_to_chat_template",
+    "find_tool_call_start",
+    "StreamProcessor",
     "openai_format",
     "anthropic_format",
 ]
