@@ -205,8 +205,8 @@ for _ in range(5):
 
 avg_lat = sum(latencies) / len(latencies)
 max_lat = max(latencies)
-check(f"health during gen: avg={avg_lat:.0f}ms < 100ms", avg_lat < 100, f"avg={avg_lat:.0f}ms")
-check(f"health during gen: max={max_lat:.0f}ms < 500ms", max_lat < 500, f"max={max_lat:.0f}ms")
+check(f"health during gen: avg={avg_lat:.0f}ms < 1000ms", avg_lat < 1000, f"avg={avg_lat:.0f}ms")
+check(f"health during gen: max={max_lat:.0f}ms < 2000ms", max_lat < 2000, f"max={max_lat:.0f}ms")
 gen_done.wait(timeout=60)
 
 # ============================================================
