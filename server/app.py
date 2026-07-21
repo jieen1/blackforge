@@ -370,7 +370,7 @@ async def chat_completions(req: ChatCompletionRequest):
         if start < len(_raw_with_think) and _raw_with_think[start] == "\n":
             start += 1
         end = _raw_with_think.index(_THINK_CLOSE)
-        reasoning_content = _raw_with_think[start:end].strip()
+        reasoning_content = _raw_with_think[start:end].strip().replace("\ufffd", "")
     resp = openai_format.build_response(
         model=model_name,
         text=text,

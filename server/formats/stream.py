@@ -70,6 +70,9 @@ class StreamProcessor:
         if n == self._last_decode_len:
             return self._cached_raw
         decoded = self._tok.decode(self._all_ids, skip_special_tokens=True)
+        # Strip U+FFFD from stray byte-level BPE tokens (Qwen3.6 vocab has
+        # ~14 tokens that decode to incomplete UTF-8 / replacement chars).
+        decoded = decoded.replace("\ufffd", "")
         # Prepend <think> since the chat template already injected it in the prompt
         if not decoded.startswith(_THINK_OPEN):
             self._cached_raw = _THINK_OPEN + "\n" + decoded

@@ -41,4 +41,8 @@ def strip_thinking(text: str) -> str:
     text = _UNCLOSED_THINK_RE.sub("", text)
     # Pattern 4: plain-text prefix fallback (no tags at all)
     text = _THINKING_PREFIX_RE.sub("", text)
+    # Strip U+FFFD replacement characters produced by stray byte-level
+    # BPE tokens (e.g. token ids 246873/246883/247033/247081 in Qwen3.6
+    # vocab decode to incomplete UTF-8 sequences).
+    text = text.replace("\ufffd", "")
     return text.strip()
