@@ -1,15 +1,61 @@
+# Python
 __pycache__/
 *.py[cod]
-.pytest_cache/
-.ruff_cache/
-.venv/
-build/
-dist/
 *.egg-info/
+dist/
+build/
+.eggs/
 
-# Generated artifacts and local model data
-artifacts/
-profiles/*.nsys-rep
-benchmarks/baseline/*.json
+# Virtual environments
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs and runtime artifacts
+*.log
+logs/
+
+# Evaluation results (large, reproducible)
+evalplus_results/
+evalplus_*.log
+
+# Benchmark artifacts
+*.nsys-rep
+*.ncu-rep
+*.sqlite
+
+# Original/backup files
+*.orig
+*.bak
+
+# CUDA build artifacts
+*.so
+*.o
+*.a
+
+# Pytest
+.pytest_cache/
+
+# OMX / agent state
+.omx/
+.codegraph/
+.codex/
+
+# Internal session notes (not for public release)
+notes/2026-07-1*-session*.md
+notes/2026-07-1*-codex*.md
+notes/2026-07-2*-session*.md
+
+# Model weights (never commit)
 *.safetensors
-*.pt
+*.bin
+*.gguf

@@ -29,7 +29,7 @@ import sys
 os.environ.setdefault("USE_LIBUV", "0")
 os.environ.setdefault("SM120_GQA_USE_V2_DECODE_KERNEL", "1")
 
-SM120_VLLM_INTEGRATION = "/home/bot/project/sm120-flash-attention/vllm_integration"
+SM120_VLLM_INTEGRATION = os.environ.get("SM120_VLLM_INTEGRATION", "")
 EXPECTED_PREFIX = " Paris"
 PROMPT = "The capital of France is"
 MODEL = "unsloth/Qwen3.6-27B-NVFP4"
