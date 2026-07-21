@@ -43,6 +43,8 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 
+import asyncio
+import functools
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -96,6 +98,31 @@ SERVER_GPU_MEM_UTIL = float(os.environ.get("QSR_SERVER_GPU_MEM_UTIL", "0.85"))
 SERVER_PRODUCTION = os.environ.get("QSR_SERVER_PRODUCTION", "0") != "0"
 
 engine: ServerEngine | None = None
+
+async def _tokenize_chat(engine_ref, messages, tools=None):
+    """Run apply_chat_template in a thread to avoid blocking the event loop."""
+    loop = asyncio.get_running_loop()
+    fn = functools.partial(
+        engine_ref.tok.apply_chat_template,
+        messages, tools=tools, tokenize=True,
+        add_generation_prompt=True, return_dict=False,
+    )
+    return await loop.run_in_executor(None, fn)
+
+
+async def _tokenize_encode(engine_ref, text):
+    """Run tokenizer encode in a thread."""
+    loop = asyncio.get_running_loop()
+    fn = functools.partial(engine_ref.tok.encode, text, add_special_tokens=False)
+    return await loop.run_in_executor(None, fn)
+
+
+async def _tokenize_decode(engine_ref, token_ids):
+    """Run tokenizer decode in a thread."""
+    loop = asyncio.get_running_loop()
+    fn = functools.partial(engine_ref.tok.decode, token_ids, skip_special_tokens=True)
+    return await loop.run_in_executor(None, fn)
+
 
 
 @asynccontextmanager
@@ -257,13 +284,7 @@ async def chat_completions(req: ChatCompletionRequest):
     # Convert tools for the chat template
     tools = convert_tools_to_chat_template(req.tools)
 
-    prompt_ids = engine.tok.apply_chat_template(
-        chat_messages,
-        tools=tools,
-        tokenize=True,
-        add_generation_prompt=True,
-        return_dict=False,
-    )
+    prompt_ids = await _tokenize_chat(engine, chat_messages, tools=tools)
     _validate_capacity(prompt_ids, max_tokens)
 
     model_name = req.model or ServerEngine.MODEL
@@ -325,7 +346,7 @@ async def chat_completions(req: ChatCompletionRequest):
 
     # Non-streaming path
     result = await engine.submit(prompt_ids, max_tokens, session_id=req.session_id)
-    text = strip_thinking(engine.tok.decode(result["committed_token_ids"], skip_special_tokens=True))
+    text = strip_thinking(await _tokenize_decode(engine, result["committed_token_ids"]))
     return openai_format.build_response(
         model=model_name,
         text=text,
@@ -342,11 +363,11 @@ async def completions(req: CompletionRequest):
     assert engine is not None
     _validate_sampling_params(req.temperature, req.top_p, req.n, req.stream)
     max_tokens = _validate_and_resolve_max_tokens(req.max_tokens)
-    prompt_ids = engine.tok.encode(req.prompt, add_special_tokens=False)
+    prompt_ids = await _tokenize_encode(engine, req.prompt)
     _validate_capacity(prompt_ids, max_tokens)
 
     result = await engine.submit(prompt_ids, max_tokens, session_id=req.session_id)
-    text = strip_thinking(engine.tok.decode(result["committed_token_ids"], skip_special_tokens=True))
+    text = strip_thinking(await _tokenize_decode(engine, result["committed_token_ids"]))
     return {
         "id": f"cmpl-{uuid.uuid4().hex[:24]}",
         "object": "text_completion",
@@ -558,13 +579,7 @@ async def anthropic_messages(request: Request):
     # Convert tools for the chat template
     tools = convert_tools_to_chat_template(body.get("tools"))
 
-    prompt_ids = engine.tok.apply_chat_template(
-        chat_messages,
-        tools=tools,
-        tokenize=True,
-        add_generation_prompt=True,
-        return_dict=False,
-    )
+    prompt_ids = await _tokenize_chat(engine, chat_messages, tools=tools)
 
     effective_max = min(max_tokens, engine.capacity_tokens_per_slot - len(prompt_ids) - 1)
     if effective_max < 1:
@@ -655,7 +670,7 @@ async def anthropic_messages(request: Request):
 
     # Non-streaming path
     result = await engine.submit(prompt_ids, effective_max)
-    text = strip_thinking(engine.tok.decode(result["committed_token_ids"], skip_special_tokens=True))
+    text = strip_thinking(await _tokenize_decode(engine, result["committed_token_ids"]))
     return anthropic_format.build_response(
         model=model_name,
         text=text,
