@@ -257,6 +257,13 @@ async def chat_completions(req: ChatCompletionRequest):
         async def _sse():
             proc = StreamProcessor(engine.tok)
             final_result = None
+            # First chunk: role announcement (matches vLLM format)
+            first_chunk = {
+                "id": cmpl_id, "object": "chat.completion.chunk", "created": created,
+                "model": model_name,
+                "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}],
+            }
+            yield f"data: {_json.dumps(first_chunk)}\n\n"
             async for item in engine.submit_stream(prompt_ids, max_tokens, session_id=req.session_id):
                 if isinstance(item, dict):
                     final_result = item
@@ -266,7 +273,7 @@ async def chat_completions(req: ChatCompletionRequest):
                     chunk = {
                         "id": cmpl_id, "object": "chat.completion.chunk", "created": created,
                         "model": model_name,
-                        "choices": [{"index": 0, "delta": {"role": "assistant", "content": delta}, "finish_reason": None}],
+                        "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
                     }
                     yield f"data: {_json.dumps(chunk)}\n\n"
             finish = final_result["finish_reason"] if final_result else "stop"
@@ -275,16 +282,24 @@ async def chat_completions(req: ChatCompletionRequest):
                 finish = "tool_calls"
                 from server.formats.tools import format_tool_calls_openai
                 for i, tc in enumerate(format_tool_calls_openai(tool_calls)):
-                    chunk = {
+                    # Chunk 1: id + type + function name (matches vLLM incremental format)
+                    name_chunk = {
                         "id": cmpl_id, "object": "chat.completion.chunk", "created": created,
                         "model": model_name,
-                        "choices": [{"index": 0, "delta": {"tool_calls": [{"index": i, **tc}]}, "finish_reason": None}],
+                        "choices": [{"index": 0, "delta": {"tool_calls": [{"index": i, "id": tc["id"], "type": "function", "function": {"name": tc["function"]["name"]}}]}, "finish_reason": None}],
                     }
-                    yield f"data: {_json.dumps(chunk)}\n\n"
+                    yield f"data: {_json.dumps(name_chunk)}\n\n"
+                    # Chunk 2: arguments (full string in one piece)
+                    args_chunk = {
+                        "id": cmpl_id, "object": "chat.completion.chunk", "created": created,
+                        "model": model_name,
+                        "choices": [{"index": 0, "delta": {"tool_calls": [{"index": i, "function": {"arguments": tc["function"]["arguments"]}}]}, "finish_reason": None}],
+                    }
+                    yield f"data: {_json.dumps(args_chunk)}\n\n"
             done = {
                 "id": cmpl_id, "object": "chat.completion.chunk", "created": created,
                 "model": model_name,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
+                "choices": [{"index": 0, "delta": {}, "finish_reason": finish, "logprobs": None}],
             }
             yield f"data: {_json.dumps(done)}\n\n"
             yield "data: [DONE]\n\n"
@@ -573,7 +588,7 @@ async def anthropic_messages(request: Request):
                     yield f"event: content_block_delta\ndata: {_json.dumps(delta_ev)}\n\n"
                     yield f"event: content_block_stop\ndata: " + _json.dumps({"type": "content_block_stop", "index": block_index}) + "\n\n"
                     block_index += 1
-            msg_delta = {"type": "message_delta", "delta": {"stop_reason": stop_reason, "stop_sequence": None}, "usage": {"output_tokens": out_tokens}}
+            msg_delta = {"type": "message_delta", "delta": {"stop_reason": stop_reason}, "usage": {"input_tokens": len(prompt_ids), "output_tokens": out_tokens}}
             yield f"event: message_delta\ndata: {_json.dumps(msg_delta)}\n\n"
             yield f"event: message_stop\ndata: " + _json.dumps({"type": "message_stop"}) + "\n\n"
         return StreamingResponse(_anthropic_sse(), media_type="text/event-stream")

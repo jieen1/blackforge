@@ -1,0 +1,3994 @@
+{
+  "label": "vllm-native",
+  "base_url": "http://127.0.0.1:8000",
+  "timestamp": "2026-07-21T14:51:21",
+  "scenarios": {
+    "oai_chat": {
+      "status_code": 200,
+      "headers": {
+        "date": "Tue, 21 Jul 2026 06:51:21 GMT",
+        "server": "uvicorn",
+        "content-length": "1966",
+        "content-type": "application/json"
+      },
+      "body": {
+        "id": "chatcmpl-bc668887e793010e",
+        "object": "chat.completion",
+        "created": 1784616681,
+        "model": "qwen3.6",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "\n\nHello",
+              "refusal": null,
+              "annotations": null,
+              "audio": null,
+              "function_call": null,
+              "reasoning": "Here's a thinking process:\n\n1.  **Analyze User Input:**\n   - **Request:** \"Say hello in exactly one word.\"\n   - **Constraint:** Exactly one word.\n   - **Content:** A greeting/hello.\n\n2.  **Identify Key Constraints:**\n   - Must be exactly one word.\n   - Must convey \"hello\" or a greeting.\n\n3.  **Brainstorm Options:**\n   - Hello\n   - Hi\n   - Hey\n   - Greetings\n   - Bonjour\n   - Hola\n   - Hallo\n\n4.  **Evaluate Options against Constraints:**\n   - All are single words.\n   - All convey a greeting.\n   - \"Hello\" is the most direct match to the prompt.\n   - \"Hi\" is also very common and one word.\n   - I'll go with \"Hello\" as it directly matches the prompt's intent.\n\n5.  **Verify Constraint:**\n   - Output: \"Hello\"\n   - Word count: 1\n   - Matches request exactly.\n\n6.  **Final Output Generation:**\n   - Just output the single word. No extra text, no punctuation if it might be construed as breaking the \"one word\" rule (though punctuation is typically fine, I'll keep it strictly to the word itself to be safe). Actually, standard punctuation like a period or exclamation is fine, but to be strictly compliant, I'll just output the word.\n\n   Decision: \"Hello\" (or \"Hi\")\n   I'll output: Hello\n   Check: Exactly one word? Yes. Says hello? Yes.\n\n   Ready.✅\n"
+            },
+            "logprobs": null,
+            "finish_reason": "stop",
+            "stop_reason": null,
+            "token_ids": null,
+            "routed_experts": null
+          }
+        ],
+        "service_tier": null,
+        "system_fingerprint": "vllm-0.25.1.dev0+ge12b91b03.d20260711-fa9da507",
+        "usage": {
+          "prompt_tokens": 17,
+          "total_tokens": 369,
+          "completion_tokens": 352,
+          "prompt_tokens_details": null
+        },
+        "prompt_logprobs": null,
+        "prompt_token_ids": null,
+        "prompt_text": null,
+        "kv_transfer_params": null,
+        "metrics": null
+      }
+    },
+    "oai_chat_stream": {
+      "status_code": 200,
+      "headers": {
+        "date": "Tue, 21 Jul 2026 06:51:26 GMT",
+        "server": "uvicorn",
+        "content-type": "text/event-stream; charset=utf-8",
+        "transfer-encoding": "chunked"
+      },
+      "raw_lines": [
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"logprobs\":null,\"finish_reason\":null}],\"prompt_token_ids\":null,\"prompt_text\":null}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"Here\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"'s a thinking process\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\":\\n\\n1.\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"  **Analyze\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" User Input:**\\n\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"   - Task\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\": Count from \"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"1 to 5\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"\\n   - Format\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\": One number\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" per line\\n  \"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" - Input: \\\"\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"Count from 1\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" to 5,\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" one per line.\\\"\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"\\n\\n2. \"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" **Identify Key\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" Requirements:**\\n  \"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" - Sequence\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\": 1,\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" 2, \"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"3, 4\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\", 5\\n\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"   - Format:\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" Each number\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" on its\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" own line\\n  \"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" - No extra text\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" requested\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\",\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" but typically\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" just\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" output\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"ting the numbers is\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" fine.\\n\\n3\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\".  **Generate\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" Output:**\\n  \"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" 1\\n  \"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" 2\\n  \"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" 3\\n  \"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" 4\\n  \"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" 5\\n\\n4\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\".  **Verify\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" against Requirements\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\":**\\n   -\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" Counts from 1\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" to 5?\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" Yes.\\n  \"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" - One per line\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"? Yes.\\n\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"   - Matches exactly\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"? Yes.\\n\\n\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"5.  **\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"Final Output Generation:**\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" (Proceed\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"s\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" to output exactly\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" as verified\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\")✅\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"\\n\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\\n\\n1\\n2\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\\n3\\n4\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-97b58ca1e17ffd52\",\"object\":\"chat.completion.chunk\",\"created\":1784616686,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\\n5\"},\"logprobs\":null,\"finish_reason\":\"stop\",\"stop_reason\":null,\"token_ids\":null}],\"system_fingerprint\":\"vllm-0.25.1.dev0+ge12b91b03.d20260711-fa9da507\"}",
+        "",
+        "data: [DONE]",
+        ""
+      ],
+      "parsed_events": [
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "role": "assistant",
+                "content": ""
+              },
+              "logprobs": null,
+              "finish_reason": null
+            }
+          ],
+          "prompt_token_ids": null,
+          "prompt_text": null
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": "Here"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": "'s a thinking process"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": ":\n\n1."
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": "  **Analyze"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " User Input:**\n"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": "   - Task"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": ": Count from "
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": "1 to 5"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": "\n   - Format"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": ": One number"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " per line\n  "
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " - Input: \""
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": "Count from 1"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " to 5,"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " one per line.\""
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": "\n\n2. "
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " **Identify Key"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " Requirements:**\n  "
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " - Sequence"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": ": 1,"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " 2, "
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": "3, 4"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": ", 5\n"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": "   - Format:"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " Each number"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " on its"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " own line\n  "
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " - No extra text"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " requested"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": ","
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " but typically"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " just"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " output"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": "ting the numbers is"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " fine.\n\n3"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": ".  **Generate"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " Output:**\n  "
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " 1\n  "
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " 2\n  "
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " 3\n  "
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " 4\n  "
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " 5\n\n4"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": ".  **Verify"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " against Requirements"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": ":**\n   -"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " Counts from 1"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " to 5?"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " Yes.\n  "
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " - One per line"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": "? Yes.\n"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": "   - Matches exactly"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": "? Yes.\n\n"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": "5.  **"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": "Final Output Generation:**"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " (Proceed"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": "s"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " to output exactly"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " as verified"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": ")✅"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": "\n"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": "\n\n1\n2"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": "\n3\n4"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-97b58ca1e17ffd52",
+          "object": "chat.completion.chunk",
+          "created": 1784616686,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": "\n5"
+              },
+              "logprobs": null,
+              "finish_reason": "stop",
+              "stop_reason": null,
+              "token_ids": null
+            }
+          ],
+          "system_fingerprint": "vllm-0.25.1.dev0+ge12b91b03.d20260711-fa9da507"
+        },
+        {
+          "raw": "[DONE]"
+        }
+      ]
+    },
+    "oai_tool": {
+      "status_code": 200,
+      "headers": {
+        "date": "Tue, 21 Jul 2026 06:51:28 GMT",
+        "server": "uvicorn",
+        "content-length": "1744",
+        "content-type": "application/json"
+      },
+      "body": {
+        "id": "chatcmpl-a08fef360808c740",
+        "object": "chat.completion",
+        "created": 1784616688,
+        "model": "qwen3.6",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": null,
+              "refusal": null,
+              "annotations": null,
+              "audio": null,
+              "function_call": null,
+              "tool_calls": [
+                {
+                  "id": "chatcmpl-tool-b13d7adb7de29a10",
+                  "type": "function",
+                  "function": {
+                    "name": "get_weather",
+                    "arguments": "{\"location\": \"Tokyo\"}"
+                  }
+                }
+              ],
+              "reasoning": "Here's a thinking process:\n\n1.  **Analyze User Input:** The user is asking for the current weather in Tokyo.\n2.  **Identify Required Tool:** The `get_weather` function is available and matches the request.\n3.  **Check Parameters:** The `get_weather` function requires one parameter: `location` (string). The user specified \"Tokyo\".\n4.  **Execute Tool Call:** Call `get_weather` with `location` set to \"Tokyo\".\n5.  **Process Response:** (I will simulate the tool call and then generate the response based on the expected output format, but since I'm an AI, I'll actually make the call now.)\n   - Tool: `get_weather`\n   - Parameters: `{\"location\": \"Tokyo\"}`\n6.  **Formulate Response:** Wait for the tool output, then present the weather information clearly to the user.\n\nLet's make the tool call. \n*Self-Correction/Verification during thought:* \nI need to actually call the tool. I'll generate the tool call block now.✅\n"
+            },
+            "logprobs": null,
+            "finish_reason": "tool_calls",
+            "stop_reason": null,
+            "token_ids": null,
+            "routed_experts": null
+          }
+        ],
+        "service_tier": null,
+        "system_fingerprint": "vllm-0.25.1.dev0+ge12b91b03.d20260711-fa9da507",
+        "usage": {
+          "prompt_tokens": 284,
+          "total_tokens": 547,
+          "completion_tokens": 263,
+          "prompt_tokens_details": null
+        },
+        "prompt_logprobs": null,
+        "prompt_token_ids": null,
+        "prompt_text": null,
+        "kv_transfer_params": null,
+        "metrics": null
+      }
+    },
+    "oai_tool_stream": {
+      "status_code": 200,
+      "headers": {
+        "date": "Tue, 21 Jul 2026 06:51:31 GMT",
+        "server": "uvicorn",
+        "content-type": "text/event-stream; charset=utf-8",
+        "transfer-encoding": "chunked"
+      },
+      "raw_lines": [
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"logprobs\":null,\"finish_reason\":null}],\"prompt_token_ids\":null,\"prompt_text\":null}",
+        "",
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"Thinking\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" Process:\\n1\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\".  Identify\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" user\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" intent: User\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" wants to know the\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" current weather in Beijing\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\".\\n2.\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"  Identify required\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" tool\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\": `get_weather\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"`\\n3.\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"  Check parameters\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\": `location`\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" is required. User\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" provided \\\"Beijing\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"\\\".\\n4.\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"  Call tool\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\": `get_weather\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"(location=\\\"Beijing\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"\\\")`\\n\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"5.  Form\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"ulate response based\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" on tool\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" output. (\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"I\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" will simulate\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" the tool call first\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\")\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"\\nWait, I\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" need to generate the\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" tool call exactly\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\".\\nFunction\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\": get\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"_weather\\nArguments\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\": {\\\"\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"location\\\": \\\"Be\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"ijing\\\"}\\nProceed\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\". \\n\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"Output matches requested\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" format.✅\\n\"},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"id\":\"chatcmpl-tool-86b3e382eed2598e\",\"type\":\"function\",\"index\":0,\"function\":{\"name\":\"get_weather\"}}]},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"location\\\": \\\"\"}}]},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"Beijing\"}}]},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"}\"}}]},\"logprobs\":null,\"finish_reason\":null,\"token_ids\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-98f3efecc9963b3c\",\"object\":\"chat.completion.chunk\",\"created\":1784616691,\"model\":\"qwen3.6\",\"choices\":[{\"index\":0,\"delta\":{},\"logprobs\":null,\"finish_reason\":\"tool_calls\",\"stop_reason\":null,\"token_ids\":null}],\"system_fingerprint\":\"vllm-0.25.1.dev0+ge12b91b03.d20260711-fa9da507\"}",
+        "",
+        "data: [DONE]",
+        ""
+      ],
+      "parsed_events": [
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "role": "assistant",
+                "content": ""
+              },
+              "logprobs": null,
+              "finish_reason": null
+            }
+          ],
+          "prompt_token_ids": null,
+          "prompt_text": null
+        },
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": "Thinking"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " Process:\n1"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": ".  Identify"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " user"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " intent: User"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " wants to know the"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " current weather in Beijing"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": ".\n2."
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": "  Identify required"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " tool"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": ": `get_weather"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": "`\n3."
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": "  Check parameters"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": ": `location`"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " is required. User"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " provided \"Beijing"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": "\".\n4."
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": "  Call tool"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": ": `get_weather"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": "(location=\"Beijing"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": "\")`\n"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": "5.  Form"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": "ulate response based"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " on tool"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " output. ("
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": "I"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " will simulate"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " the tool call first"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": ")"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": "\nWait, I"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " need to generate the"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " tool call exactly"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": ".\nFunction"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": ": get"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": "_weather\nArguments"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": ": {\""
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": "location\": \"Be"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": "ijing\"}\nProceed"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": ". \n"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": "Output matches requested"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning": " format.✅\n"
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "tool_calls": [
+                  {
+                    "id": "chatcmpl-tool-86b3e382eed2598e",
+                    "type": "function",
+                    "index": 0,
+                    "function": {
+                      "name": "get_weather"
+                    }
+                  }
+                ]
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "tool_calls": [
+                  {
+                    "index": 0,
+                    "function": {
+                      "arguments": "{\"location\": \""
+                    }
+                  }
+                ]
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "tool_calls": [
+                  {
+                    "index": 0,
+                    "function": {
+                      "arguments": "Beijing"
+                    }
+                  }
+                ]
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "tool_calls": [
+                  {
+                    "index": 0,
+                    "function": {
+                      "arguments": "\"}"
+                    }
+                  }
+                ]
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "token_ids": null
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-98f3efecc9963b3c",
+          "object": "chat.completion.chunk",
+          "created": 1784616691,
+          "model": "qwen3.6",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {},
+              "logprobs": null,
+              "finish_reason": "tool_calls",
+              "stop_reason": null,
+              "token_ids": null
+            }
+          ],
+          "system_fingerprint": "vllm-0.25.1.dev0+ge12b91b03.d20260711-fa9da507"
+        },
+        {
+          "raw": "[DONE]"
+        }
+      ]
+    },
+    "oai_multi_turn": {
+      "status_code": 200,
+      "headers": {
+        "date": "Tue, 21 Jul 2026 06:51:33 GMT",
+        "server": "uvicorn",
+        "content-length": "2759",
+        "content-type": "application/json"
+      },
+      "body": {
+        "id": "chatcmpl-846066ea5f7dc563",
+        "object": "chat.completion",
+        "created": 1784616693,
+        "model": "qwen3.6",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": null,
+              "refusal": null,
+              "annotations": null,
+              "audio": null,
+              "function_call": null,
+              "reasoning": "Thinking Process:\n\n1.  **Analyze the User's Query:** The user is asking if they should bring an umbrella today.\n2.  **Review the Context:**\n    *   User previously asked about the weather in Paris.\n    *   Tool output for Paris: \"22C, sunny, light breeze\".\n3.  **Determine the Answer:**\n    *   Current weather condition: \"sunny\".\n    *   Precipitation chance implied: Very low/none (since it is sunny).\n    *   Conclusion: It is likely *not* necessary to bring an umbrella, though personal preference applies.\n4.  **Formulate the Response:**\n    *   State the current weather (sunny, 22°C).\n    *   Advise based on the weather: No need for an umbrella since it's sunny, but maybe keep it in mind if plans change (standard weather disclaimer, though usually direct is better).\n    *   Direct answer: \"Since it's sunny in Paris today, you likely won't need an umbrella.\"\n\n*Self-Correction/Refinement:* Ensure I specify the location (Paris) since the first turn established the location.\n\nDraft: Based on the current sunny weather in Paris (22°C), you probably won't need an umbrella today. Enjoy the sunshine!\n\nFinal check: Is it too absolute? \"Probably won't need\" is safer than \"Don't bring\". The user didn't specify Paris in the second prompt, but it's implied by context. I will assume Paris.\n\nFinal Output Construction:\n\"Given that it's sunny in Paris today, you likely won't need an umbrella. Enjoy the nice weather!\" or similar.\n\nLet's check the constraints.\n- User: \"Should I bring an umbrella today?\"\n- Context: Paris is 22C, sunny.\n- Answer: No.\n\nResponse: Based on the current sunny weather in Paris, you likely won't need an umbrella today. Enjoy the sunshine!\n\nWait, I should double check if the user is *in* Paris or asking *about* Paris. Usually, if they ask \"What is the weather in Paris?\" then \"Should I bring an umbrella?\", they are asking for the location previously mentioned.\n\nOkay, sticking to the context.\n\nResponse: Since it is currently sunny in Paris, you likely won't need an umbrella today. Enjoy the 22°C weather!\n\nOne more"
+            },
+            "logprobs": null,
+            "finish_reason": "length",
+            "stop_reason": null,
+            "token_ids": null,
+            "routed_experts": null
+          }
+        ],
+        "service_tier": null,
+        "system_fingerprint": "vllm-0.25.1.dev0+ge12b91b03.d20260711-fa9da507",
+        "usage": {
+          "prompt_tokens": 79,
+          "total_tokens": 591,
+          "completion_tokens": 512,
+          "prompt_tokens_details": null
+        },
+        "prompt_logprobs": null,
+        "prompt_token_ids": null,
+        "prompt_text": null,
+        "kv_transfer_params": null,
+        "metrics": null
+      }
+    },
+    "ant_chat": {
+      "status_code": 200,
+      "headers": {
+        "date": "Tue, 21 Jul 2026 06:51:40 GMT",
+        "server": "uvicorn",
+        "content-length": "2224",
+        "content-type": "application/json"
+      },
+      "body": {
+        "id": "chatcmpl-99e11be90801ffcd",
+        "type": "message",
+        "role": "assistant",
+        "content": [
+          {
+            "type": "thinking",
+            "thinking": "Here's a thinking process:\n\n1.  **Analyze User Input:**\n   - **Request:** \"Say hello in exactly one word.\"\n   - **Constraint:** Exactly one word.\n   - **Content:** Must convey \"hello\" or a greeting.\n\n2.  **Identify Key Constraints:**\n   - Must be exactly one word.\n   - Must function as a greeting/hello.\n\n3.  **Brainstorm Options:**\n   - Hello\n   - Hi\n   - Greetings\n   - Hey\n   - Salutations\n   - Bonjour\n   - Hola\n   - Ciao\n\n4.  **Select Best Option:**\n   - \"Hello\" is direct, matches the prompt's intent, and is exactly one word.\n   - \"Hi\" also works but is slightly more informal.\n   - I'll go with \"Hello.\" as it perfectly matches the request.\n\n5.  **Verify Constraint:**\n   - Is it exactly one word? Yes.\n   - Does it say hello? Yes.\n\n6.  **Formulate Output:**\n   - Hello. (Just the word, as requested)\n\n   Wait, should I include punctuation? The prompt says \"exactly one word.\" Punctuation isn't a word, but to be strictly compliant, I'll just output the word itself without extra punctuation if possible, though standard capitalization is fine. \"Hello\" is safe.\n\n   Let's output: Hello\n\n   Double-check: Exactly one word? Yes. Says hello? Yes. Meets all constraints.✅\n   Proceed. \n   Output: Hello\n   (Note: I'll just output \"Hello\" as requested.) \n   Self-Correction/Refinement during thought: Sometimes AI adds punctuation automatically. I'll just write \"Hello\" without a period to be strictly one word, though a period doesn't change word count. I'll stick with \"Hello\".✅\n   Final answer: Hello\n   Output matches.✅\n   Proceeds. \n   [Output Generation] -> Hello\n   [Done.] \n   *Self-Correction/Verification during process*: \n   The prompt says \"Say hello in exactly one word.\" \n   \"Hello\" is exactly one word. It fulfills the request perfectly. No extra text. \n   Ready. \n   Output: Hello\n   *(Note: I will output just the word as requested.)*\n   [Final Check] Word count: 1",
+            "signature": "af906b35b4f04f4ba60260dfc9bec54b"
+          }
+        ],
+        "model": "qwen3.6",
+        "stop_reason": "max_tokens",
+        "usage": {
+          "input_tokens": 17,
+          "output_tokens": 512
+        }
+      }
+    },
+    "ant_chat_stream": {
+      "status_code": 200,
+      "headers": {
+        "date": "Tue, 21 Jul 2026 06:51:45 GMT",
+        "server": "uvicorn",
+        "content-type": "text/event-stream; charset=utf-8",
+        "transfer-encoding": "chunked"
+      },
+      "raw_lines": [
+        "event: message_start",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"chatcmpl-a711ba89d3fc63df\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"qwen3.6\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":22,\"output_tokens\":0}}}",
+        "",
+        "event: content_block_start",
+        "data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Here\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"'s a thinking process\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\":\\n\\n1.\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"  **Analyze\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" User Input:**\\n\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"   - Task\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\": Count from \"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"1 to 5\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"\\n   - Format\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\": One number\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" per line\\n  \"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" - Range\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\": 1,\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" 2, \"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"3, 4\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\", 5\\n\\n\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"2.  **\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Identify Key Requirements\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\":**\\n   -\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" Output exactly\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" \"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"5 lines\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"\\n   - Each\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" line contains\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" a single integer\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"\\n\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"   - Sequence\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\": 1,\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" 2, \"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"3, 4\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\", 5\\n\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"   - No extra\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" text or\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" formatting requested\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"\\n\\n3. \"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" **Generate Output:**\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"\\n   \"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"1\\n   \"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"2\\n   \"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"3\\n   \"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"4\\n   \"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"5\\n\\n4.\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"  **Verify Against\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" Requirements:**\\n  \"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" - Counts from \"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"1 to 5\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"? Yes.\\n\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"   - One per\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" line? Yes.\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"\\n   - Matches\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" exactly? Yes.\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"\\n\\n  \"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" Ready\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\". Output matches the\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" generated response.✅\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"\\n\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"signature_delta\",\"signature\":\"1b8e1307d0744199ad418ffc29c41f30\"},\"index\":0}",
+        "",
+        "event: content_block_stop",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}",
+        "",
+        "event: content_block_start",
+        "data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"text\",\"text\":\"\"},\"index\":1}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"\\n\\n1\"},\"index\":1}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"\\n2\\n3\"},\"index\":1}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"\\n4\\n5\"},\"index\":1}",
+        "",
+        "event: content_block_stop",
+        "data: {\"type\":\"content_block_stop\",\"index\":1}",
+        "",
+        "event: message_delta",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":22,\"output_tokens\":202}}",
+        "",
+        "event: message_stop",
+        "data: {\"type\":\"message_stop\"}",
+        ""
+      ],
+      "parsed_events": [
+        {
+          "event_type": "message_start"
+        },
+        {
+          "type": "message_start",
+          "message": {
+            "id": "chatcmpl-a711ba89d3fc63df",
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "model": "qwen3.6",
+            "stop_reason": null,
+            "stop_sequence": null,
+            "usage": {
+              "input_tokens": 22,
+              "output_tokens": 0
+            }
+          }
+        },
+        {
+          "event_type": "content_block_start"
+        },
+        {
+          "type": "content_block_start",
+          "content_block": {
+            "type": "thinking",
+            "thinking": ""
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": "Here"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": "'s a thinking process"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": ":\n\n1."
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": "  **Analyze"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": " User Input:**\n"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": "   - Task"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": ": Count from "
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": "1 to 5"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": "\n   - Format"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": ": One number"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": " per line\n  "
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": " - Range"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": ": 1,"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": " 2, "
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": "3, 4"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": ", 5\n\n"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": "2.  **"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": "Identify Key Requirements"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": ":**\n   -"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": " Output exactly"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": " "
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": "5 lines"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": "\n   - Each"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": " line contains"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": " a single integer"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": "\n"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": "   - Sequence"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": ": 1,"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": " 2, "
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": "3, 4"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": ", 5\n"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": "   - No extra"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": " text or"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": " formatting requested"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": "\n\n3. "
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": " **Generate Output:**"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": "\n   "
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": "1\n   "
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": "2\n   "
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": "3\n   "
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": "4\n   "
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": "5\n\n4."
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": "  **Verify Against"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": " Requirements:**\n  "
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": " - Counts from "
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": "1 to 5"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": "? Yes.\n"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": "   - One per"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": " line? Yes."
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": "\n   - Matches"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": " exactly? Yes."
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": "\n\n  "
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": " Ready"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": ". Output matches the"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": " generated response.✅"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": "\n"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "signature_delta",
+            "signature": "1b8e1307d0744199ad418ffc29c41f30"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_stop"
+        },
+        {
+          "type": "content_block_stop",
+          "index": 0
+        },
+        {
+          "event_type": "content_block_start"
+        },
+        {
+          "type": "content_block_start",
+          "content_block": {
+            "type": "text",
+            "text": ""
+          },
+          "index": 1
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "text_delta",
+            "text": "\n\n1"
+          },
+          "index": 1
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "text_delta",
+            "text": "\n2\n3"
+          },
+          "index": 1
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "text_delta",
+            "text": "\n4\n5"
+          },
+          "index": 1
+        },
+        {
+          "event_type": "content_block_stop"
+        },
+        {
+          "type": "content_block_stop",
+          "index": 1
+        },
+        {
+          "event_type": "message_delta"
+        },
+        {
+          "type": "message_delta",
+          "delta": {
+            "stop_reason": "end_turn"
+          },
+          "usage": {
+            "input_tokens": 22,
+            "output_tokens": 202
+          }
+        },
+        {
+          "event_type": "message_stop"
+        },
+        {
+          "type": "message_stop"
+        }
+      ]
+    },
+    "ant_tool": {
+      "status_code": 200,
+      "headers": {
+        "date": "Tue, 21 Jul 2026 06:51:47 GMT",
+        "server": "uvicorn",
+        "content-length": "543",
+        "content-type": "application/json"
+      },
+      "body": {
+        "id": "chatcmpl-b58cb7e0181d2cad",
+        "type": "message",
+        "role": "assistant",
+        "content": [
+          {
+            "type": "thinking",
+            "thinking": "The user is asking for the current weather in Tokyo.\nI have a tool `get_weather` that takes a `location` parameter.\nI should call `get_weather` with `location` set to \"Tokyo\".\n",
+            "signature": "cf5d9fa14b2943708b9057016967d863"
+          },
+          {
+            "type": "tool_use",
+            "id": "chatcmpl-tool-b844ed9b10863470",
+            "name": "get_weather",
+            "input": {
+              "location": "Tokyo"
+            }
+          }
+        ],
+        "model": "qwen3.6",
+        "stop_reason": "tool_use",
+        "usage": {
+          "input_tokens": 284,
+          "output_tokens": 76
+        }
+      }
+    },
+    "ant_tool_stream": {
+      "status_code": 200,
+      "headers": {
+        "date": "Tue, 21 Jul 2026 06:51:48 GMT",
+        "server": "uvicorn",
+        "content-type": "text/event-stream; charset=utf-8",
+        "transfer-encoding": "chunked"
+      },
+      "raw_lines": [
+        "event: message_start",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"chatcmpl-91490de8bb481af3\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"qwen3.6\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":284,\"output_tokens\":0}}}",
+        "",
+        "event: content_block_start",
+        "data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Thinking\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" Process:\\n1\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\".  Identify\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" user\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" intent: User\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" wants to know the\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" current weather in Beijing\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\".\\n2.\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"  Identify required\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" tool\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\": `get_weather\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"`\\n3.\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"  Check parameters\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\": `location`\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" (\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"string\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\") -\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" \\\"\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Beijing\\\"\\n\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"4.  Call\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" tool: `get\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"_weather(location=\\\"Be\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"ijing\\\")`\\n\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"5.  Form\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"ulate response based\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" on tool output.\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" (Wait\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" for\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" tool output\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\") -> I will\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" generate the tool call\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" now.✅\\n\"},\"index\":0}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"signature_delta\",\"signature\":\"f03b3a6f8cc146998e571cf9bb81bf05\"},\"index\":0}",
+        "",
+        "event: content_block_stop",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}",
+        "",
+        "event: content_block_start",
+        "data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"tool_use\",\"id\":\"chatcmpl-tool-aa3e6e200a0dc972\",\"name\":\"get_weather\",\"input\":{}},\"index\":1}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"location\\\": \\\"\"},\"index\":1}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"Beijing\"},\"index\":1}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"}\"},\"index\":1}",
+        "",
+        "event: content_block_stop",
+        "data: {\"type\":\"content_block_stop\",\"index\":1}",
+        "",
+        "event: message_delta",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"input_tokens\":284,\"output_tokens\":125}}",
+        "",
+        "event: message_stop",
+        "data: {\"type\":\"message_stop\"}",
+        ""
+      ],
+      "parsed_events": [
+        {
+          "event_type": "message_start"
+        },
+        {
+          "type": "message_start",
+          "message": {
+            "id": "chatcmpl-91490de8bb481af3",
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "model": "qwen3.6",
+            "stop_reason": null,
+            "stop_sequence": null,
+            "usage": {
+              "input_tokens": 284,
+              "output_tokens": 0
+            }
+          }
+        },
+        {
+          "event_type": "content_block_start"
+        },
+        {
+          "type": "content_block_start",
+          "content_block": {
+            "type": "thinking",
+            "thinking": ""
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": "Thinking"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": " Process:\n1"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": ".  Identify"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": " user"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": " intent: User"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": " wants to know the"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": " current weather in Beijing"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": ".\n2."
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": "  Identify required"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": " tool"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": ": `get_weather"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": "`\n3."
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": "  Check parameters"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": ": `location`"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": " ("
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": "string"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": ") -"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": " \""
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": "Beijing\"\n"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": "4.  Call"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": " tool: `get"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": "_weather(location=\"Be"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": "ijing\")`\n"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": "5.  Form"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": "ulate response based"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": " on tool output."
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": " (Wait"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": " for"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": " tool output"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": ") -> I will"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": " generate the tool call"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "thinking_delta",
+            "thinking": " now.✅\n"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "signature_delta",
+            "signature": "f03b3a6f8cc146998e571cf9bb81bf05"
+          },
+          "index": 0
+        },
+        {
+          "event_type": "content_block_stop"
+        },
+        {
+          "type": "content_block_stop",
+          "index": 0
+        },
+        {
+          "event_type": "content_block_start"
+        },
+        {
+          "type": "content_block_start",
+          "content_block": {
+            "type": "tool_use",
+            "id": "chatcmpl-tool-aa3e6e200a0dc972",
+            "name": "get_weather",
+            "input": {}
+          },
+          "index": 1
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "input_json_delta",
+            "partial_json": "{\"location\": \""
+          },
+          "index": 1
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "input_json_delta",
+            "partial_json": "Beijing"
+          },
+          "index": 1
+        },
+        {
+          "event_type": "content_block_delta"
+        },
+        {
+          "type": "content_block_delta",
+          "delta": {
+            "type": "input_json_delta",
+            "partial_json": "\"}"
+          },
+          "index": 1
+        },
+        {
+          "event_type": "content_block_stop"
+        },
+        {
+          "type": "content_block_stop",
+          "index": 1
+        },
+        {
+          "event_type": "message_delta"
+        },
+        {
+          "type": "message_delta",
+          "delta": {
+            "stop_reason": "tool_use"
+          },
+          "usage": {
+            "input_tokens": 284,
+            "output_tokens": 125
+          }
+        },
+        {
+          "event_type": "message_stop"
+        },
+        {
+          "type": "message_stop"
+        }
+      ]
+    },
+    "ant_multi_turn": {
+      "status_code": 200,
+      "headers": {
+        "date": "Tue, 21 Jul 2026 06:51:50 GMT",
+        "server": "uvicorn",
+        "content-length": "1630",
+        "content-type": "application/json"
+      },
+      "body": {
+        "id": "chatcmpl-8e94c54bd301124e",
+        "type": "message",
+        "role": "assistant",
+        "content": [
+          {
+            "type": "thinking",
+            "thinking": "The user is asking whether they should bring an umbrella today.\nI have the weather information for Paris from the previous turn: \"22C, sunny, light breeze\".\nThe forecast says it is sunny.\nTherefore, there is no mention of rain.\nI should advise the user that an umbrella is likely not needed based on the sunny forecast, but maybe for sun protection.\n\n1.  **Analyze the weather**: It is sunny (22C, light breeze).\n2.  **Determine need for umbrella**: No rain predicted.\n3.  **Formulate response**: No need for a rain umbrella, but maybe a parasol for the sun, though likely not strictly necessary. Stick to the direct answer based on the \"sunny\" condition.\n\nResult: No, it's sunny.\n\nWait, looking at the previous turn, the function output was `Paris: 22C, sunny, light breeze`.\nThe user is asking \"Should I bring an umbrella today?\".\nThe answer is no, it's sunny.\n\nI don't need to call a function again. The weather data is already available.\n\nAnswer: Based on the forecast of sunny skies, you likely won't need an umbrella for rain. However, if you want shade from the sun, that's up to you.\n\nLet's keep it simple. \"No, it's sunny.\" or similar.\n",
+            "signature": "838ceed39a824db3b2880464cb65abd9"
+          },
+          {
+            "type": "text",
+            "text": "\n\nBased on the forecast, it is sunny with a light breeze, so you probably won't need an umbrella for rain. However, if you burn easily, you might want one for sun protection!"
+          }
+        ],
+        "model": "qwen3.6",
+        "stop_reason": "end_turn",
+        "usage": {
+          "input_tokens": 91,
+          "output_tokens": 332
+        }
+      }
+    }
+  }
+}

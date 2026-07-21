@@ -112,7 +112,6 @@ def build_response(
         "content": content_blocks,
         "model": model,
         "stop_reason": stop_reason,
-        "stop_sequence": None,
         "usage": {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
@@ -169,3 +168,4 @@ def build_sse_events(
     msg_delta = {"type": "message_delta", "delta": {"stop_reason": stop_reason, "stop_sequence": None}, "usage": {"output_tokens": output_tokens}}
     yield f"event: message_delta\ndata: {json.dumps(msg_delta)}\n\n"
     yield f"event: message_stop\ndata: " + json.dumps({"type": "message_stop"}) + "\n\n"
+    msg_delta = {"type": "message_delta", "delta": {"stop_reason": stop_reason}, "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}}

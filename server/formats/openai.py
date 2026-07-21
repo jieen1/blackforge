@@ -72,6 +72,7 @@ def build_response(
         finish_reason = "tool_calls"
     else:
         message["content"] = visible_text
+    message["refusal"] = None
 
     resp: dict[str, Any] = {
         "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
