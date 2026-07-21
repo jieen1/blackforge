@@ -1,11 +1,11 @@
 # BlackForge
 
-**Hand-crafted CUDA inference engine for Qwen3.6-27B on Blackwell (SM120) GPUs.**
+**Hand-forged CUDA inference engine for Blackwell (SM120) GPUs — 56% faster attention decode, 256K context, single GPU.**
 
 BlackForge is a specialized, single-GPU inference runtime that squeezes maximum
 performance out of NVIDIA Blackwell workstation GPUs (RTX PRO 6000, RTX 5090)
-for the Qwen3.6-27B model. Instead of being a general-purpose serving framework,
-it takes a "one model, one GPU, do it extremely well" approach — with a
+for large language models. Instead of being a general-purpose serving framework,
+it takes a "one GPU architecture, do it extremely well" approach — with a
 hand-written CUDA attention kernel, FP8 KV cache, MTP speculative decoding,
 and CUDA Graph capture, all co-designed for the SM120 architecture.
 
@@ -106,8 +106,7 @@ blackforge/
 │   ├── quality_eval.py          # HumanEval+ parallel evaluation
 │   └── mtp_multiround_check.py  # MTP correctness verification
 ├── tests/                    # Unit tests (27 tests, CPU-only)
-├── oracle/                   # vLLM reference comparison utilities
-└── notes/                    # Design docs and optimization logs
+└── oracle/                   # vLLM reference comparison utilities
 ```
 
 The CUDA attention kernel lives in a separate repository
@@ -149,10 +148,6 @@ python setup.py build_ext --inplace
 ### Running the Server
 
 ```bash
-# Start with the management script (recommended)
-./vllm_ctl.sh start qwen3.6-rt
-
-# Or directly:
 QSR_SERVER_PRODUCTION=1 \
 QSR_SERVER_CAPACITY=3 \
 QSR_SERVER_NUM_SLOTS=6 \
@@ -196,6 +191,7 @@ python -m pytest tests/ -q
 | `QSR_SERVED_MODEL_NAME` | model ID | Advertised model name(s), space-separated |
 | `QSR_SERVER_ENABLE_CUDAGRAPH` | `1` | Enable CUDA Graph capture |
 | `QSR_SERVER_ENABLE_PREFIX_CACHE` | `1` | Enable prefix caching |
+| `SM120_VLLM_INTEGRATION` | (auto) | Path to sm120-flash-attention vllm_integration dir |
 
 ### Context Length vs Concurrency
 
