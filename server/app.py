@@ -43,7 +43,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -480,64 +480,151 @@ async def v1_root():
 
 
 # -- Anthropic Messages API compatibility ---------------------------------
+# Full Anthropic Messages API support (/v1/messages).
+# Accepts: string or array-of-blocks for content and system fields,
+# cache_control blocks (ignored), stream=true/false.
+# Internally uses apply_chat_template for proper model formatting.
 
-class AnthropicContentBlock(BaseModel):
-    type: str = "text"
-    text: str = ""
 
-class AnthropicMessage(BaseModel):
-    role: str
-    content: str | list[AnthropicContentBlock] = ""
+def _anthropic_extract_text(field) -> str:
+    """Extract plain text from an Anthropic content field (str or list of blocks)."""
+    if field is None:
+        return ""
+    if isinstance(field, str):
+        return field
+    if isinstance(field, list):
+        parts = []
+        for block in field:
+            if isinstance(block, dict):
+                if block.get("type") == "text":
+                    parts.append(block.get("text", ""))
+            elif isinstance(block, str):
+                parts.append(block)
+        return "\n".join(parts)
+    return str(field)
 
-    @property
-    def text(self) -> str:
-        if isinstance(self.content, str):
-            return self.content
-        return "\n".join(block.text for block in self.content if block.type == "text")
 
-class AnthropicMessagesRequest(BaseModel):
-    model: str = "qwen3.6"
-    messages: list[AnthropicMessage] = []
-    max_tokens: int = Field(default=DEFAULT_MAX_TOKENS, le=262144)
-    temperature: float = 0.0
-    top_p: float = 1.0
-    stream: bool = False
-    system: str | None = None
-    stop_sequences: list[str] | None = None
+def _anthropic_to_chat_messages(body: dict) -> list[dict]:
+    """Convert Anthropic Messages API request body to OpenAI-style messages list."""
+    chat_messages = []
+
+    system_text = _anthropic_extract_text(body.get("system"))
+    if system_text:
+        chat_messages.append({"role": "system", "content": system_text})
+
+    for msg in body.get("messages", []):
+        role = msg.get("role", "user")
+        text = _anthropic_extract_text(msg.get("content"))
+        if text:
+            chat_messages.append({"role": role, "content": text})
+
+    return chat_messages
 
 
 @app.post("/v1/messages")
-async def anthropic_messages(req: AnthropicMessagesRequest):
+async def anthropic_messages(request: Request):
     assert engine is not None
-    # Accept temperature/stream for compatibility; internally always greedy.
+    body = await request.json()
 
-    parts = []
-    if req.system:
-        parts.append(req.system if isinstance(req.system, str) else str(req.system))
-    for msg in req.messages:
-        parts.append(msg.text)
-    combined = "\n\n".join(parts)
+    max_tokens = body.get("max_tokens", DEFAULT_MAX_TOKENS)
+    model_name = body.get("model", "qwen3.6")
+    stream = body.get("stream", False)
 
-    prompt_ids = engine.tok.encode(combined, add_special_tokens=False)
-    max_tokens = min(req.max_tokens, engine.capacity_tokens_per_slot - len(prompt_ids) - 1)
-    if max_tokens < 1:
-        raise HTTPException(status_code=400, detail="prompt too long for requested max_tokens")
+    chat_messages = _anthropic_to_chat_messages(body)
+    if not chat_messages:
+        return JSONResponse(
+            status_code=400,
+            content={"type": "error", "error": {"type": "invalid_request_error", "message": "no messages provided"}},
+        )
 
-    result = await engine.submit(prompt_ids, max_tokens)
-    text = engine.tok.decode(result["committed_token_ids"])
+    prompt_ids = engine.tok.apply_chat_template(
+        chat_messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=False,
+    )
 
+    effective_max = min(max_tokens, engine.capacity_tokens_per_slot - len(prompt_ids) - 1)
+    if effective_max < 1:
+        return JSONResponse(
+            status_code=400,
+            content={"type": "error", "error": {"type": "invalid_request_error", "message": "prompt too long for requested max_tokens"}},
+        )
+
+    result = await engine.submit(prompt_ids, effective_max)
+    text = engine.tok.decode(result["committed_token_ids"], skip_special_tokens=True)
     stop_reason = "end_turn" if result["finish_reason"] == "stop" else "max_tokens"
+    msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+
+    usage = {
+        "input_tokens": result["prompt_tokens"],
+        "output_tokens": result["completion_tokens"],
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+    }
+
+    if stream:
+        import json as _json
+
+        async def _sse():
+            # message_start
+            msg_start = {
+                "type": "message_start",
+                "message": {
+                    "id": msg_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": model_name,
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": result["prompt_tokens"], "output_tokens": 0},
+                },
+            }
+            yield f"event: message_start\ndata: {_json.dumps(msg_start)}\n\n"
+
+            # content_block_start
+            block_start = {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            }
+            yield f"event: content_block_start\ndata: {_json.dumps(block_start)}\n\n"
+
+            # ping
+            yield f"event: ping\ndata: {_json.dumps({'type': 'ping'})}\n\n"
+
+            # content_block_delta with full text
+            delta = {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": text},
+            }
+            yield f"event: content_block_delta\ndata: {_json.dumps(delta)}\n\n"
+
+            # content_block_stop
+            yield f"event: content_block_stop\ndata: {_json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+
+            # message_delta
+            msg_delta = {
+                "type": "message_delta",
+                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                "usage": {"output_tokens": result["completion_tokens"]},
+            }
+            yield f"event: message_delta\ndata: {_json.dumps(msg_delta)}\n\n"
+
+            # message_stop
+            yield f"event: message_stop\ndata: {_json.dumps({'type': 'message_stop'})}\n\n"
+
+        return StreamingResponse(_sse(), media_type="text/event-stream")
 
     return {
-        "id": f"msg_{uuid.uuid4().hex[:24]}",
+        "id": msg_id,
         "type": "message",
         "role": "assistant",
         "content": [{"type": "text", "text": text}],
-        "model": req.model,
+        "model": model_name,
         "stop_reason": stop_reason,
         "stop_sequence": None,
-        "usage": {
-            "input_tokens": result["prompt_tokens"],
-            "output_tokens": result["completion_tokens"],
-        },
+        "usage": usage,
     }
