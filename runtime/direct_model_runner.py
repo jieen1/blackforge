@@ -464,10 +464,13 @@ class BlockPool:
                 )
             block = self.blocks[block_id]
             if block.ref_cnt <= 0:
-                raise RuntimeError(
-                    f"cannot reference block {block_id} with ref_cnt={block.ref_cnt} "
-                    "(not currently allocated -- it may already be back in the free queue)"
-                )
+                try:
+                    self._free_queue.remove(block)
+                except ValueError:
+                    raise RuntimeError(
+                        f"cannot reference block {block_id} with ref_cnt={block.ref_cnt} "
+                        "(not currently allocated -- it may already be back in the free queue)"
+                    )
             block.ref_cnt += 1
 
     def cache_block(self, block_id: int, block_hash: BlockHash) -> None:
@@ -523,6 +526,99 @@ def _ensure_sm120_backend_registered() -> None:
     register_backend(AttentionBackendEnum.CUSTOM, _SM120_BACKEND_PATH)
 
 
+def profile_kv_cache_blocks(
+    static_forward_context: dict,
+    vllm_config: VllmConfig,
+    device: torch.device,
+    *,
+    num_slots: int,
+    block_size: int,
+    gpu_memory_utilization: float = 0.85,
+    num_speculative_tokens: int = 0,
+) -> int:
+    """Profile available GPU memory and return the maximum number of KV
+    cache blocks that fit, following vLLM's memory-profiling approach.
+
+    After model loading, measures free GPU memory and calculates how many
+    attention KV blocks fit within the ``gpu_memory_utilization`` budget.
+    GDN state (conv + ssm) is allocated per-physical-slot (not per-block),
+    so its cost is subtracted separately.
+
+    Returns the total number of attention KV blocks (including reserved).
+    """
+    free_mem, total_mem = torch.cuda.mem_get_info(device)
+    budget = int(total_mem * gpu_memory_utilization)
+    already_used = total_mem - free_mem
+    reserved_for_kv = budget - already_used
+    # Reserve 15% of the KV budget for forward-pass activations, temporary
+    # tensors, and CUDA allocator overhead. Without this margin the first
+    # forward pass OOMs because all GPU memory is consumed by KV cache.
+    activation_margin = int(reserved_for_kv * 0.30) + 5 * 2**30
+    reserved_for_kv -= activation_margin
+    if reserved_for_kv <= 0:
+        raise RuntimeError(
+            f"GPU memory budget exhausted after model load: "
+            f"used={already_used / 2**30:.1f} GiB, budget={budget / 2**30:.1f} GiB, "
+            f"free={free_mem / 2**30:.1f} GiB (utilization={gpu_memory_utilization})"
+        )
+
+    attn_layer_names = []
+    gdn_layer_names = []
+    for name, layer in static_forward_context.items():
+        if hasattr(layer, "get_state_shape"):
+            gdn_layer_names.append(name)
+        else:
+            attn_layer_names.append(name)
+
+    gdn_bytes = 0
+    total_physical_slots = num_slots + RESERVED_PHYSICAL_SLOTS
+    if gdn_layer_names:
+        layer = static_forward_context[gdn_layer_names[0]]
+        conv_shape, ssm_shape = layer.get_state_shape()
+        conv_dtype, ssm_dtype = layer.get_state_dtype()
+        conv_elem = torch.tensor([], dtype=conv_dtype).element_size()
+        ssm_elem = torch.tensor([], dtype=ssm_dtype).element_size()
+        conv_size = 1
+        for d in conv_shape:
+            conv_size *= d
+        ssm_size = 1
+        for d in ssm_shape:
+            ssm_size *= d
+        ssm_rows_per_slot = 1 + num_speculative_tokens
+        gdn_bytes = len(gdn_layer_names) * (
+            total_physical_slots * conv_size * conv_elem
+            + total_physical_slots * ssm_rows_per_slot * ssm_size * ssm_elem
+        )
+
+    attn_budget = reserved_for_kv - gdn_bytes
+    if attn_budget <= 0:
+        raise RuntimeError(
+            f"GDN state alone ({gdn_bytes / 2**30:.1f} GiB) exceeds KV budget "
+            f"({reserved_for_kv / 2**30:.1f} GiB)"
+        )
+
+    if not attn_layer_names:
+        raise RuntimeError("no attention layers found for KV cache profiling")
+
+    any_attn = static_forward_context[attn_layer_names[0]]
+    backend_cls = any_attn.get_attn_backend()
+    num_kv_heads = any_attn.num_kv_heads
+    head_size = any_attn.head_size
+    cache_dtype_str = vllm_config.cache_config.cache_dtype
+    shape = backend_cls.get_kv_cache_shape(
+        1, block_size, num_kv_heads, head_size, cache_dtype_str
+    )
+    torch_dtype = any_attn.kv_cache_torch_dtype
+    elem_size = torch.tensor([], dtype=torch_dtype).element_size()
+    per_block_elems = 1
+    for d in shape:
+        per_block_elems *= d
+    per_block_bytes = per_block_elems * elem_size * len(attn_layer_names)
+
+    num_blocks = max(1, attn_budget // per_block_bytes)
+    return num_blocks
+
+
 def allocate_fixed_slot_kv_caches(
     static_forward_context: dict,
     vllm_config: VllmConfig,
@@ -532,6 +628,7 @@ def allocate_fixed_slot_kv_caches(
     block_size: int,
     blocks_per_slot: int,
     num_speculative_tokens: int = 0,
+    num_blocks_override: int | None = None,
 ) -> dict[str, object]:
     """Allocate our own num_slots-fixed-slot KV (attention) and state (GDN)
     tensors and bind them via vLLM's own real ``bind_kv_cache()`` -- shared
@@ -558,7 +655,10 @@ def allocate_fixed_slot_kv_caches(
         num_kv_heads = any_attn.num_kv_heads
         head_size = any_attn.head_size
         cache_dtype_str = vllm_config.cache_config.cache_dtype
-        num_blocks = (num_slots + RESERVED_PHYSICAL_SLOTS) * blocks_per_slot
+        if num_blocks_override is not None:
+            num_blocks = num_blocks_override
+        else:
+            num_blocks = (num_slots + RESERVED_PHYSICAL_SLOTS) * blocks_per_slot
         shape = backend_cls.get_kv_cache_shape(
             num_blocks, block_size, num_kv_heads, head_size, cache_dtype_str
         )
@@ -1316,6 +1416,9 @@ class DirectModelRunner:
         num_slots: int = NUM_SLOTS,
         block_size: int = 16,
         blocks_per_slot: int = 128,
+        num_blocks: int | None = None,
+        auto_profile_blocks: bool = False,
+        gpu_memory_utilization: float = 0.85,
         enable_cudagraph: bool = False,
         enable_block_table: bool = False,
         enable_prefix_cache: bool = False,
@@ -1353,6 +1456,8 @@ class DirectModelRunner:
         self.num_slots = num_slots
         self.block_size = block_size
         self.blocks_per_slot = blocks_per_slot
+        self._auto_profile_blocks = auto_profile_blocks
+        self._gpu_memory_utilization = gpu_memory_utilization
         self.device = torch.device("cuda:0")
         torch.cuda.set_device(self.device)
 
@@ -1439,8 +1544,13 @@ class DirectModelRunner:
         self.kv_cache_dtype = vllm_config.cache_config.cache_dtype
         self.gdn_checkpoint_byte_budget = gdn_checkpoint_byte_budget
         self.block_table: list[list[int]] = [[] for _ in range(num_slots)]
+        self._num_blocks_override = num_blocks
+        _effective_num_blocks = (
+            num_blocks if num_blocks is not None
+            else (num_slots + RESERVED_PHYSICAL_SLOTS) * blocks_per_slot
+        )
         self.block_pool = BlockPool(
-            num_blocks=(num_slots + RESERVED_PHYSICAL_SLOTS) * blocks_per_slot,
+            num_blocks=_effective_num_blocks,
             reserved=RESERVED_PHYSICAL_SLOTS,
         )
 
@@ -1811,6 +1921,22 @@ class DirectModelRunner:
             self.reset_slot(0)
 
     def _allocate_and_bind_kv_caches(self) -> None:
+        num_blocks_override = self._num_blocks_override
+        if num_blocks_override is None and self._auto_profile_blocks:
+            num_blocks_override = profile_kv_cache_blocks(
+                self.static_forward_context,
+                self.vllm_config,
+                self.device,
+                num_slots=self.num_slots,
+                block_size=self.block_size,
+                gpu_memory_utilization=self._gpu_memory_utilization,
+                num_speculative_tokens=self.num_speculative_tokens or 0,
+            )
+            self._num_blocks_override = num_blocks_override
+            self.block_pool = BlockPool(
+                num_blocks=num_blocks_override,
+                reserved=RESERVED_PHYSICAL_SLOTS,
+            )
         self.kv_caches = allocate_fixed_slot_kv_caches(
             self.static_forward_context,
             self.vllm_config,
@@ -1819,6 +1945,7 @@ class DirectModelRunner:
             block_size=self.block_size,
             blocks_per_slot=self.blocks_per_slot,
             num_speculative_tokens=self.num_speculative_tokens or 0,
+            num_blocks_override=num_blocks_override,
         )
 
     def _allocate_gdn_snapshot_buffers(self) -> None:

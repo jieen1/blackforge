@@ -66,19 +66,16 @@ DEFAULT_MAX_TOKENS = 16384
 # (``uvicorn.run("server.app:app", ...)``) needs ``app`` importable with
 # no constructor arguments.
 SERVER_CAPACITY = int(os.environ.get("QSR_SERVER_CAPACITY", "4"))
-SERVER_NUM_SLOTS = int(os.environ.get("QSR_SERVER_NUM_SLOTS", "16"))
+SERVER_NUM_SLOTS = int(os.environ.get("QSR_SERVER_NUM_SLOTS", "8"))
 SERVER_BLOCK_SIZE = int(os.environ.get("QSR_SERVER_BLOCK_SIZE", "16"))
-# P4a (§25.10 follow-up): raised from 512 so a real >=64K request is
-# ADMISSIBLE -- capacity_ok gates on the per-slot ceiling blocks_per_slot *
-# block_size, and ceil((65536 + max_tokens)/16) ~= 4113, so 4200 (=> 67200-
-# token ceiling) admits a 64K prompt with ~1.6K of generation room. The KV
-# cache is allocated up front for the WHOLE shared BlockPool ((num_slots +
-# RESERVED) * blocks_per_slot blocks), so this is a fixed startup cost paid
-# regardless of how many slots are active; see server/README.md + notes/
-# prefix-cache-implementation-log.md (P4a) for the measured memory fit. The
-# E2E check sets its OWN smaller blocks_per_slot (its prompts are moderate),
+# 256K context support: blocks_per_slot = 262144 / block_size(16) = 16384.
+# The KV cache pool size is now determined by GPU memory profiling (see
+# server/engine.py _load_model → profile_kv_cache_blocks), NOT by the old
+# fixed formula (num_slots + 1) * blocks_per_slot. blocks_per_slot is the
+# per-slot MAXIMUM context ceiling; the actual pool is sized to fit the GPU.
+# The E2E check sets its OWN smaller blocks_per_slot (its prompts are moderate),
 # so it does not pay for the full long-context pool.
-SERVER_BLOCKS_PER_SLOT = int(os.environ.get("QSR_SERVER_BLOCKS_PER_SLOT", "4200"))
+SERVER_BLOCKS_PER_SLOT = int(os.environ.get("QSR_SERVER_BLOCKS_PER_SLOT", "16384"))
 SERVER_ENABLE_CUDAGRAPH = os.environ.get("QSR_SERVER_ENABLE_CUDAGRAPH", "1") != "0"
 # P4a (notes/prefix-cache-design.md sec 5-P4): the prefix-cache rollback
 # spine, plumbed straight into ServerEngine(enable_prefix_cache=...). Default
@@ -95,7 +92,7 @@ SERVER_ENABLE_SESSION_AFFINITY = os.environ.get("QSR_SERVER_ENABLE_SESSION_AFFIN
 SERVER_SESSION_TTL_S = float(os.environ.get("QSR_SERVER_SESSION_TTL_S", "30.0"))
 SERVER_KV_CACHE_DTYPE = os.environ.get("QSR_SERVER_KV_CACHE_DTYPE", "fp8_e4m3")
 SERVER_GPU_MEM_UTIL = float(os.environ.get("QSR_SERVER_GPU_MEM_UTIL", "0.85"))
-SERVER_PRODUCTION = os.environ.get("QSR_SERVER_PRODUCTION", "0") != "0"
+SERVER_PRODUCTION = os.environ.get("QSR_SERVER_PRODUCTION", "1") != "0"
 
 engine: ServerEngine | None = None
 

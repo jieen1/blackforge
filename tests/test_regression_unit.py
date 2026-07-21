@@ -1,0 +1,272 @@
+"""Regression unit tests for all historically reported issues.
+
+Run: python -m pytest tests/test_regression_unit.py -v
+"""
+
+import pytest, sys, os, json
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from server.formats.thinking import strip_thinking
+from server.formats.tools import (
+    parse_tool_calls, format_tool_calls_openai, format_tool_calls_anthropic,
+    find_tool_call_start, convert_tools_to_chat_template,
+)
+from server.formats.content import extract_text, extract_blocks
+from server.formats import openai as openai_format
+from server.formats import anthropic as anthropic_format
+from server.formats.stream import StreamProcessor
+
+THINK_OPEN = chr(60) + "think" + chr(62)
+THINK_CLOSE = chr(60) + "/think" + chr(62)
+TOOL_OPEN = chr(60) + "tool_call" + chr(62)
+TOOL_CLOSE = chr(60) + "/tool_call" + chr(62)
+FUNC_OPEN = chr(60) + "function=get_weather" + chr(62)
+FUNC_CLOSE = chr(60) + "/function" + chr(62)
+PARAM_OPEN = chr(60) + "parameter=location" + chr(62)
+PARAM_CLOSE = chr(60) + "/parameter" + chr(62)
+FFFD = chr(0xFFFD)
+NL = chr(10)
+
+
+class TestFFFDFiltering:
+    def test_removes_fffd(self):
+        assert FFFD not in strip_thinking("Hello" + FFFD)
+
+    def test_removes_multiple_fffd(self):
+        assert FFFD not in strip_thinking(FFFD + "Hi" + FFFD)
+
+    def test_fffd_in_think_block(self):
+        r = strip_thinking(THINK_OPEN + FFFD + "x" + FFFD + THINK_CLOSE + "Ans")
+        assert FFFD not in r and "Ans" in r and "x" not in r
+
+    def test_fffd_only_empty(self):
+        assert strip_thinking(FFFD * 3) == ""
+
+    def test_normal_unchanged(self):
+        assert strip_thinking("Hello!") == "Hello!"
+
+
+class TestThinkBlockStripping:
+    def test_paired(self):
+        r = strip_thinking(THINK_OPEN + "reason" + THINK_CLOSE + "Ans")
+        assert "reason" not in r and "Ans" in r
+
+    def test_orphan_close(self):
+        r = strip_thinking("Thinking Process:" + NL + "reason" + NL + THINK_CLOSE + NL + "Ans")
+        assert "reason" not in r and "Ans" in r
+
+    def test_unclosed(self):
+        assert strip_thinking(THINK_OPEN + "incomplete") == ""
+
+    def test_multiline(self):
+        r = strip_thinking(THINK_OPEN + NL + "L1" + NL + THINK_CLOSE + "Vis")
+        assert "L1" not in r and "Vis" in r
+
+    def test_passthrough(self):
+        assert strip_thinking("Normal") == "Normal"
+
+
+class TestOpenAIResponse:
+    def test_normal(self):
+        r = openai_format.build_response(model="t", text="Hi!", finish_reason="stop", prompt_tokens=10, completion_tokens=5)
+        assert r["choices"][0]["message"]["content"] == "Hi!"
+
+    def test_empty(self):
+        r = openai_format.build_response(model="t", text="", finish_reason="length", prompt_tokens=10, completion_tokens=100)
+        assert r["choices"][0]["message"]["content"] == ""
+
+    def test_tool_call(self):
+        text = "X " + TOOL_OPEN + FUNC_OPEN + PARAM_OPEN + "Paris" + PARAM_CLOSE + FUNC_CLOSE + TOOL_CLOSE
+        r = openai_format.build_response(model="t", text=text, finish_reason="stop", prompt_tokens=10, completion_tokens=20)
+        assert r["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "get_weather"
+        assert r["choices"][0]["finish_reason"] == "tool_calls"
+
+    def test_usage(self):
+        r = openai_format.build_response(model="t", text="Hi", finish_reason="stop", prompt_tokens=10, completion_tokens=5)
+        assert r["usage"]["total_tokens"] == 15
+
+
+class TestAnthropicResponse:
+    def test_required_fields(self):
+        r = anthropic_format.build_response(model="t", text="Hi", finish_reason="stop", input_tokens=10, output_tokens=5)
+        for f in ["id","type","role","content","model","stop_reason","stop_sequence","usage"]:
+            assert f in r, f"missing {f}"
+
+    def test_stop_sequence_always_present(self):
+        for reason in ["stop", "length"]:
+            r = anthropic_format.build_response(model="t", text="Hi", finish_reason=reason, input_tokens=5, output_tokens=3)
+            assert "stop_sequence" in r and r["stop_sequence"] is None
+
+    def test_empty_text(self):
+        r = anthropic_format.build_response(model="t", text="", finish_reason="length", input_tokens=10, output_tokens=100)
+        assert len(r["content"]) >= 1
+
+    def test_stop_reason_mapping(self):
+        assert anthropic_format.build_response(model="t", text="Hi", finish_reason="stop", input_tokens=1, output_tokens=1)["stop_reason"] == "end_turn"
+        assert anthropic_format.build_response(model="t", text="Hi", finish_reason="length", input_tokens=1, output_tokens=1)["stop_reason"] == "max_tokens"
+
+
+class TestToolCallParsing:
+    def test_single(self):
+        text = "X " + TOOL_OPEN + FUNC_OPEN + PARAM_OPEN + "Paris" + PARAM_CLOSE + FUNC_CLOSE + TOOL_CLOSE
+        vis, tools = parse_tool_calls(text)
+        assert len(tools) == 1 and tools[0]["name"] == "get_weather" and TOOL_OPEN not in vis
+
+    def test_none(self):
+        vis, tools = parse_tool_calls("Just text")
+        assert vis == "Just text" and tools == []
+
+    def test_multiple(self):
+        tc = TOOL_OPEN + FUNC_OPEN + PARAM_OPEN + "X" + PARAM_CLOSE + FUNC_CLOSE + TOOL_CLOSE
+        _, tools = parse_tool_calls("A " + tc + " B " + tc)
+        assert len(tools) == 2
+
+
+class TestStreamingToolDetection:
+    def test_full_tag(self):
+        assert find_tool_call_start("Hello " + TOOL_OPEN + "rest") == 6
+
+    def test_partial_prefix(self):
+        for i in range(1, len(TOOL_OPEN)):
+            assert find_tool_call_start("Hello " + TOOL_OPEN[:i]) == 6
+
+    def test_no_tool(self):
+        assert find_tool_call_start("Hello world") == -1
+
+
+class TestContentExtraction:
+    def test_none(self):
+        assert extract_text(None) == ""
+
+    def test_string(self):
+        assert extract_text("hello") == "hello"
+
+    def test_blocks(self):
+        assert extract_text([{"type":"text","text":"A"},{"type":"text","text":"B"}]) == "A" + NL + "B"
+
+    def test_strings(self):
+        assert extract_text(["A","B"]) == "A" + NL + "B"
+
+    def test_mixed(self):
+        assert extract_text([{"type":"text","text":"Hi"},{"type":"image"}]) == "Hi"
+
+    def test_extract_blocks_string(self):
+        assert extract_blocks("hi") == [{"type":"text","text":"hi"}]
+
+    def test_extract_blocks_none(self):
+        assert extract_blocks(None) == []
+
+
+class _FakeTok:
+    def decode(self, ids, skip_special_tokens=True):
+        return "".join(chr(i) for i in ids if 32 <= i < 127)
+
+
+class TestStreamProcessor:
+    def test_thinking_then_content(self):
+        p = StreamProcessor(_FakeTok())
+        p.add_tokens([ord(c) for c in "think stuff"])
+        assert len(p.drain_thinking()) > 0
+        assert p.drain_content() == []
+        close_tag = chr(60) + "/think" + chr(62)
+        p.add_tokens([ord(c) for c in close_tag + "Answer here"])
+        assert any("Answer" in c for c in p.drain_content())
+
+    def test_finalize(self):
+        p = StreamProcessor(_FakeTok())
+        close_tag = chr(60) + "/think" + chr(62)
+        p.add_tokens([ord(c) for c in close_tag + chr(10) + "Hello world"])
+        vis, tools = p.finalize()
+        assert "Hello world" in vis and tools == []
+
+
+class TestAnthropicParse:
+    def test_simple(self):
+        m = anthropic_format.parse_messages({"messages":[{"role":"user","content":"Hi"}]})
+        assert m[0]["content"] == "Hi"
+
+    def test_system_string(self):
+        m = anthropic_format.parse_messages({"system":"Help","messages":[{"role":"user","content":"Hi"}]})
+        assert m[0]["role"] == "system"
+
+    def test_system_array(self):
+        m = anthropic_format.parse_messages({"system":[{"type":"text","text":"A"}],"messages":[{"role":"user","content":"Hi"}]})
+        assert "A" in m[0]["content"]
+
+    def test_tool_use(self):
+        m = anthropic_format.parse_messages({"messages":[
+            {"role":"user","content":"W?"},
+            {"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"gw","input":{"l":"P"}}]},
+        ]})
+        assert [x for x in m if x["role"]=="assistant"][0]["tool_calls"][0]["function"]["name"] == "gw"
+
+    def test_tool_result(self):
+        m = anthropic_format.parse_messages({"messages":[
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"22C"}]},
+        ]})
+        assert [x for x in m if x["role"]=="tool"][0]["content"] == "22C"
+
+
+class TestContextCapacity:
+    def test_256k_blocks_per_slot(self):
+        from server.engine import ServerEngine
+        import inspect
+        sig = inspect.signature(ServerEngine.__init__)
+        bps = sig.parameters["blocks_per_slot"].default
+        bs = sig.parameters["block_size"].default
+        assert bps * bs == 262144, f"{bps}*{bs}={bps*bs} != 262144"
+
+    def test_default_max_tokens_16384(self):
+        from server.app import DEFAULT_MAX_TOKENS
+        assert DEFAULT_MAX_TOKENS == 16384
+
+
+class TestOpenAIParse:
+    def test_string(self):
+        m = openai_format.parse_chat_messages({"messages":[{"role":"user","content":"Hi"}]})
+        assert m[0]["content"] == "Hi"
+
+    def test_array(self):
+        m = openai_format.parse_chat_messages({"messages":[{"role":"user","content":[{"type":"text","text":"Hi"}]}]})
+        assert m[0]["content"] == "Hi"
+
+    def test_tool_role(self):
+        m = openai_format.parse_chat_messages({"messages":[{"role":"tool","content":"22C","tool_call_id":"c1"}]})
+        assert m[0]["tool_call_id"] == "c1"
+
+    def test_assistant_tool_calls(self):
+        m = openai_format.parse_chat_messages({"messages":[{"role":"assistant","content":"X",
+            "tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":json.dumps({"x":1})}}]}]})
+        assert isinstance(m[0]["tool_calls"][0]["function"]["arguments"], dict)
+
+
+class TestConvertTools:
+    def test_openai_passthrough(self):
+        t = [{"type":"function","function":{"name":"f","parameters":{}}}]
+        assert convert_tools_to_chat_template(t) == t
+
+    def test_anthropic_converted(self):
+        t = [{"name":"f","description":"d","input_schema":{"type":"object"}}]
+        assert convert_tools_to_chat_template(t)[0]["type"] == "function"
+
+    def test_none(self):
+        assert convert_tools_to_chat_template(None) is None
+
+
+class TestSSE:
+    def test_openai_done(self):
+        chunks = list(openai_format.build_sse_chunks("id","m","Hi","stop",1))
+        assert chunks[-1] == "data: [DONE]" + NL + NL
+
+    def test_openai_finish(self):
+        chunks = list(openai_format.build_sse_chunks("id","m","Hi","stop",1))
+        assert json.loads(chunks[-2][6:])["choices"][0]["finish_reason"] == "stop"
+
+    def test_anthropic_stop(self):
+        evts = list(anthropic_format.build_sse_events("m","Hi","stop",10,5))
+        assert any("message_stop" in e for e in evts)
+
+    def test_anthropic_start(self):
+        evts = list(anthropic_format.build_sse_events("m","Hi","stop",10,5))
+        assert evts[0].startswith("event: message_start")
+

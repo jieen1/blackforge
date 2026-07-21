@@ -130,9 +130,9 @@ class ServerEngine:
         self,
         *,
         capacity: int = 4,
-        num_slots: int = 16,
+        num_slots: int = 8,
         block_size: int = 16,
-        blocks_per_slot: int = 512,
+        blocks_per_slot: int = 16384,
         kv_cache_dtype: str = "fp8_e4m3",
         enable_cudagraph: bool = True,
         enable_prefix_cache: bool = True,
@@ -140,7 +140,7 @@ class ServerEngine:
         session_ttl_s: float = 30.0,
         gpu_memory_utilization: float = 0.85,
         idle_sleep_s: float = 0.005,
-        production: bool = False,
+        production: bool = True,
     ) -> None:
         if production:
             min_slots = capacity + (capacity if enable_cudagraph else 0)
@@ -241,7 +241,7 @@ class ServerEngine:
         self._near_tie_margin_diag = _near_tie_margin_diag
         self.near_tie_logit_margin = NEAR_TIE_LOGIT_MARGIN
 
-        max_model_len = min(262144, max(8192, self.capacity_tokens_per_slot + 256))
+        max_model_len = 262144
         vllm_config = build_vllm_config(
             model=self.MODEL,
             kv_cache_dtype=self._kv_cache_dtype,
@@ -260,13 +260,29 @@ class ServerEngine:
                 "enable_prefix_cache": True,
                 "enable_persistent_prefix_cache": True,
             }
+        # KV cache sizing for 256K context support:
+        # blocks_per_slot=16384 sets the per-slot MAX to 262144 tokens (256K).
+        # num_blocks is set conservatively to fit the GPU with headroom for
+        # forward-pass activations, GDN snapshots, and CUDA overhead.
+        # 80000 blocks * 0.52 MB/block = ~42 GB KV cache, leaving ~40 GB
+        # headroom on a 96 GB GPU after model weights (~17 GB).
+        # This supports 4 concurrent 256K slots (4 * 16384 = 65536 blocks)
+        # with ~14K blocks spare for prefix cache.
+        _num_blocks = 40000
         self.runner = DirectModelRunner(
             vllm_config,
             num_slots=self.num_slots,
             block_size=self.block_size,
             blocks_per_slot=self.blocks_per_slot,
+            num_blocks=_num_blocks,
             enable_cudagraph=self._enable_cudagraph,
             **cache_kwargs,
+        )
+        logger.info(
+            "KV cache: %d blocks, blocks_per_slot=%d, max_context=%d tokens/slot",
+            self.runner.block_pool.num_blocks,
+            self.blocks_per_slot,
+            self.capacity_tokens_per_slot,
         )
         logger.info("model loaded on engine thread")
 
@@ -588,7 +604,7 @@ class ServerEngine:
             new_prompts = [r.prompt_ids for _, r in admit_now]
             try:
                 for slot, _ in admit_now:
-                    if self.runner.slot_kv_len[slot] != 0:
+                    if self.runner.slot_kv_len[slot] != 0 or self.runner.block_table[slot]:
                         self.runner.reset_slot(slot)
                 hit_depths = [self.runner.reconcile_prefix_hit(p) for p in new_prompts]
                 prefill_result = self.runner.mtp_prefill_with_cache(
