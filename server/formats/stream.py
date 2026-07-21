@@ -7,16 +7,15 @@ Handles the two-phase nature of Qwen3.6 streaming output:
 The processor buffers tokens and emits safe content deltas while
 suppressing thinking blocks and tool-call XML from the content stream.
 Tool calls are extracted at the end and emitted as structured chunks.
-
-Design: this module is format-agnostic. It produces intermediate
-representations (content deltas, tool call lists) that the OpenAI and
-Anthropic formatters then serialize into their respective SSE formats.
 """
 
 from __future__ import annotations
 
 from server.formats.thinking import strip_thinking
 from server.formats.tools import parse_tool_calls, find_tool_call_start
+
+_THINK_OPEN = chr(60) + "think" + chr(62)
+_THINK_CLOSE = chr(60) + "/think" + chr(62)
 
 
 class StreamProcessor:
@@ -38,7 +37,9 @@ class StreamProcessor:
         self._all_ids: list[int] = []
         self._thinking_done = False
         self._tool_call_started = False
-        self._emitted_len = 0  # how many chars of visible text already emitted
+        self._emitted_len = 0
+        self._last_decode_len = 0
+        self._cached_raw = ""
 
     def add_tokens(self, token_ids: list[int]) -> None:
         self._all_ids.extend(token_ids)
@@ -47,8 +48,14 @@ class StreamProcessor:
     def all_ids(self) -> list[int]:
         return self._all_ids
 
-    def _decode_all(self) -> str:
-        return self._tok.decode(self._all_ids, skip_special_tokens=True)
+    def _get_raw(self) -> str:
+        """Decode all accumulated tokens (cached when unchanged)."""
+        n = len(self._all_ids)
+        if n == self._last_decode_len:
+            return self._cached_raw
+        self._cached_raw = self._tok.decode(self._all_ids, skip_special_tokens=True)
+        self._last_decode_len = n
+        return self._cached_raw
 
     def drain_content(self) -> list[str]:
         """Return list of safe content deltas since last call.
@@ -59,15 +66,18 @@ class StreamProcessor:
         if self._tool_call_started:
             return []
 
-        raw = self._decode_all()
+        raw = self._get_raw()
 
-        # Phase 1: still in thinking
+        # Phase 1: detect thinking completion
         if not self._thinking_done:
-            close_tag = chr(60) + "/think" + chr(62)
-            if close_tag in raw:
+            if _THINK_CLOSE in raw:
+                # Normal case: think block closed
                 self._thinking_done = True
-            elif len(raw) > 200 and raw == strip_thinking(raw):
-                # Heuristic: long text with no think tags at all
+            elif _THINK_OPEN in raw:
+                # Think block opened but not yet closed -- still thinking
+                return []
+            elif len(raw) > 50:
+                # No think tags at all after 50 chars -- no thinking phase
                 self._thinking_done = True
             else:
                 return []
@@ -78,7 +88,6 @@ class StreamProcessor:
         tc_start = find_tool_call_start(visible)
         if tc_start >= 0:
             self._tool_call_started = True
-            # Emit any content before the tool call
             safe = visible[:tc_start]
             if len(safe) > self._emitted_len:
                 delta = safe[self._emitted_len:]
@@ -95,7 +104,7 @@ class StreamProcessor:
 
     def finalize(self) -> tuple[str, list[dict]]:
         """Called after stream ends. Returns (visible_text, tool_calls)."""
-        raw = self._decode_all()
+        raw = self._tok.decode(self._all_ids, skip_special_tokens=True)
         visible = strip_thinking(raw)
         visible_text, tool_calls = parse_tool_calls(visible)
         return visible_text, tool_calls

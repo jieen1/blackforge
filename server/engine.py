@@ -53,6 +53,7 @@ import sys
 import time
 import uuid
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -195,6 +196,7 @@ class ServerEngine:
         self.blocks_per_slot = blocks_per_slot
         self.capacity_tokens_per_slot = block_size * blocks_per_slot
         self.idle_sleep_s = idle_sleep_s
+        self._gpu_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpu")
 
         self.tok = AutoTokenizer.from_pretrained(self.MODEL)
         self.eos_token_id = self.tok.eos_token_id
@@ -648,6 +650,13 @@ class ServerEngine:
         self.free_slots.append(slot)
 
     # -- the engine loop --------------------------------------------------
+    async def _gpu(self, fn, *args, **kwargs):
+        """Run a blocking GPU call in the dedicated GPU thread pool."""
+        import asyncio
+        loop = asyncio.get_event_loop()
+        import functools
+        return await loop.run_in_executor(self._gpu_executor, functools.partial(fn, *args, **kwargs))
+
     async def _loop(self) -> None:
         while not self._stop:
             try:
@@ -708,7 +717,7 @@ class ServerEngine:
                     self.waiting.insert(0, req)
                     continue
                 try:
-                    res = self.runner.mtp_prefill_warm_continue(slot, req.prompt_ids, prior_len)
+                    res = await self._gpu(self.runner.mtp_prefill_warm_continue, slot, req.prompt_ids, prior_len)
                 except Exception:
                     logger.exception(
                         "warm-continue failed for session %s; falling back", req.session_id
@@ -761,7 +770,7 @@ class ServerEngine:
                 # old output for it. The surrounding admission error-recovery
                 # block below is unchanged (still resets slots + fails futures +
                 # returns slots to free_slots on raise).
-                prefill_result = self.runner.mtp_prefill_with_cache(new_slots, new_prompts, chunk_size=self._prefill_chunk_size)
+                prefill_result = await self._gpu(self.runner.mtp_prefill_with_cache, new_slots, new_prompts, chunk_size=self._prefill_chunk_size)
             except Exception as exc:
                 # A real gap this task's own E2E run caught empirically:
                 # ``admit_now``'s slots/requests were already popped out of
@@ -803,7 +812,8 @@ class ServerEngine:
             return
 
         active_slots = list(self.active.keys())
-        decisions = self.runner.mtp_verify_and_commit_batch(
+        decisions = await self._gpu(
+            self.runner.mtp_verify_and_commit_batch,
             active_slots,
             {s: self.active[s]["anchor"] for s in active_slots},
             {s: self.active[s]["drafts"] for s in active_slots},
