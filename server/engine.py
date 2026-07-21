@@ -111,6 +111,9 @@ class GenerationRequest:
     # of the same session continues in place with zero restore. None (or affinity
     # off) => byte-for-byte the P4a path.
     session_id: str | None = None
+    # True streaming: when set, the engine pushes each round's committed tokens
+    # to this queue as they are produced. A None sentinel signals completion.
+    stream_queue: "asyncio.Queue[list[int] | None] | None" = None
 
 
 class ServerEngine:
@@ -368,6 +371,28 @@ class ServerEngine:
         self.pending.append(req)
         return await fut
 
+    async def submit_stream(
+        self, prompt_ids: list[int], max_tokens: int, session_id: str | None = None
+    ):
+        """Enqueue a streaming generation request. Yields lists of token ids
+        as each MTP round commits them. The final yield is the result dict
+        (same shape as submit()'s return) -- caller checks isinstance(item, dict)."""
+        loop = asyncio.get_running_loop()
+        fut: "asyncio.Future[dict]" = loop.create_future()
+        q: "asyncio.Queue[list[int] | None]" = asyncio.Queue()
+        req = GenerationRequest(
+            request_id=str(uuid.uuid4()), prompt_ids=list(prompt_ids), max_tokens=max_tokens,
+            future=fut, session_id=session_id, stream_queue=q,
+        )
+        self.pending.append(req)
+        while True:
+            item = await q.get()
+            if item is None:
+                break
+            if item:
+                yield item
+        yield await fut
+
     # -- internal admission-time correctness check -----------------------
     def _admission_bootstrap_check(self, slot: int, req: GenerationRequest, anchor: int) -> None:
         """Same technique ``_run_sustained``'s admission block uses for
@@ -550,9 +575,13 @@ class ServerEngine:
         # edge cases below (anchor itself is EOS; max_tokens==1)
         # that a bare append doesn't handle.
         if anchor == self.eos_token_id:
+            if req.stream_queue is not None:
+                req.stream_queue.put_nowait(None)
             self._finish_request(slot, req, committed_tokens=[], finish_reason="stop")
             return
         committed_tokens = [anchor]
+        if req.stream_queue is not None:
+            req.stream_queue.put_nowait([anchor])
         if len(committed_tokens) >= req.max_tokens:
             self._finish_request(slot, req, committed_tokens=committed_tokens, finish_reason="length")
             return
@@ -575,6 +604,8 @@ class ServerEngine:
             "prompt_tokens": len(req.prompt_ids),
             "completion_tokens": len(committed_tokens),
         }
+        if req.stream_queue is not None:
+            req.stream_queue.put_nowait(None)
         if not req.future.done():
             req.future.set_result(result)
         self.stats["requests_completed"] += 1
@@ -798,6 +829,8 @@ class ServerEngine:
                     break
                 kept.append(t)
             st["committed_tokens"].extend(kept)
+            if kept and req.stream_queue is not None:
+                req.stream_queue.put_nowait(kept)
             if finish_reason is None and len(st["committed_tokens"]) >= req.max_tokens:
                 finish_reason = "length"
 
