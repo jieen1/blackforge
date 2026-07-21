@@ -196,7 +196,7 @@ class ServerEngine:
         self.tok = AutoTokenizer.from_pretrained(self.MODEL)
         self.eos_token_id = self.tok.eos_token_id
 
-        max_model_len = max(8192, self.capacity_tokens_per_slot + 256)
+        max_model_len = min(262144, max(8192, self.capacity_tokens_per_slot + 256))
         vllm_config = build_vllm_config(
             model=self.MODEL,
             kv_cache_dtype=kv_cache_dtype,
