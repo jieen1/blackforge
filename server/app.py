@@ -89,6 +89,7 @@ SERVER_ENABLE_SESSION_AFFINITY = os.environ.get("QSR_SERVER_ENABLE_SESSION_AFFIN
 SERVER_SESSION_TTL_S = float(os.environ.get("QSR_SERVER_SESSION_TTL_S", "30.0"))
 SERVER_KV_CACHE_DTYPE = os.environ.get("QSR_SERVER_KV_CACHE_DTYPE", "fp8_e4m3")
 SERVER_GPU_MEM_UTIL = float(os.environ.get("QSR_SERVER_GPU_MEM_UTIL", "0.85"))
+SERVER_PRODUCTION = os.environ.get("QSR_SERVER_PRODUCTION", "0") != "0"
 
 engine: ServerEngine | None = None
 
@@ -108,6 +109,7 @@ async def lifespan(app: FastAPI):
         enable_session_affinity=SERVER_ENABLE_SESSION_AFFINITY,
         session_ttl_s=SERVER_SESSION_TTL_S,
         gpu_memory_utilization=SERVER_GPU_MEM_UTIL,
+        production=SERVER_PRODUCTION,
     )
     engine.start()
     logger.info(

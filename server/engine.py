@@ -135,6 +135,7 @@ class ServerEngine:
         session_ttl_s: float = 30.0,
         gpu_memory_utilization: float = 0.85,
         idle_sleep_s: float = 0.005,
+        production: bool = False,
     ) -> None:
         # Slot layout (matches mtp_sustained_realistic_workload_check.py's
         # _run_sustained exactly): capacity production slots [0, capacity),
@@ -148,7 +149,10 @@ class ServerEngine:
         # suffix of [num_slots - capacity, num_slots), so as long as that
         # whole top range is otherwise unused, any real batch_size <=
         # capacity graph stays confined to it.
-        min_slots = 3 * capacity + (capacity if enable_cudagraph else 0)
+        if production:
+            min_slots = capacity + (capacity if enable_cudagraph else 0)
+        else:
+            min_slots = 3 * capacity + (capacity if enable_cudagraph else 0)
         if num_slots < min_slots:
             raise ValueError(
                 f"num_slots={num_slots} must be >= {min_slots} for capacity={capacity}, "
@@ -182,6 +186,7 @@ class ServerEngine:
         self.near_tie_logit_margin = NEAR_TIE_LOGIT_MARGIN
 
         self.capacity = capacity
+        self.production = production
         self.num_slots = num_slots
         self.block_size = block_size
         self.blocks_per_slot = blocks_per_slot
@@ -509,7 +514,8 @@ class ServerEngine:
         EOS; max_tokens==1), seed committed_tokens with [anchor], and record the
         slot as active. Factored out of _step so the committed-token seeding logic
         is NOT duplicated (behavior-preserving refactor)."""
-        self._admission_bootstrap_check(slot, req, anchor)
+        if not self.production:
+            self._admission_bootstrap_check(slot, req, anchor)
 
         # 2026-07-19, real bug found by this task's own E2E
         # validation run (a genuine first-token content
