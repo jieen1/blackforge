@@ -60,7 +60,7 @@ os.environ.setdefault("USE_LIBUV", "0")
 os.environ.setdefault("SM120_GQA_USE_V2_DECODE_KERNEL", "1")
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
-SM120_VLLM_INTEGRATION = os.environ.get("SM120_VLLM_INTEGRATION", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "sm120-flash-attention", "vllm_integration"))
+SM120_VLLM_INTEGRATION = os.environ.get("SM120_VLLM_INTEGRATION", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "sm120-flash-attention", "vllm_integration"))
 
 logger = logging.getLogger("qwen_sm120_server.engine")
 

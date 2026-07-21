@@ -461,7 +461,7 @@ async def metrics():
     return PlainTextResponse("\n".join(lines) + "\n", media_type="text/plain; charset=utf-8")
 
 
-@app.get("/v1")
+@app.api_route("/v1", methods=["GET", "POST"])
 async def v1_root():
     return {
         "object": "api_info",
