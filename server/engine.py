@@ -682,3 +682,8 @@ class ServerEngine:
 
         for s in newly_finished:
             del self.active[s]
+
+        # Yield GIL to asyncio event loop so HTTP requests (health, SSE)
+        # can be processed between GPU rounds. Without this, the engine
+        # thread starves the event loop during long generations.
+        time.sleep(0)
