@@ -366,3 +366,40 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+@app.get("/v1/models")
+async def list_models():
+    served = os.environ.get("QSR_SERVED_MODEL_NAME", ServerEngine.MODEL)
+    names = served.split()
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": name,
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": "qwen-sm120-runtime",
+                "root": ServerEngine.MODEL,
+                "parent": None,
+                "max_model_len": engine.capacity_tokens_per_slot if engine else 0,
+                "permission": [
+                    {
+                        "id": f"modelperm-{uuid.uuid4().hex[:24]}",
+                        "object": "model_permission",
+                        "created": int(time.time()),
+                        "allow_create_engine": False,
+                        "allow_sampling": True,
+                        "allow_logprobs": False,
+                        "allow_search_indices": False,
+                        "allow_view": True,
+                        "allow_fine_tuning": False,
+                        "organization": "*",
+                        "group": None,
+                        "is_blocking": False,
+                    }
+                ],
+            }
+            for name in names
+        ],
+    }
