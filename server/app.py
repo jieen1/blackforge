@@ -468,3 +468,63 @@ async def v1_root():
         "endpoints": ["/v1/models", "/v1/chat/completions", "/v1/completions", "/metrics"],
         "model": ServerEngine.MODEL,
     }
+
+
+# -- Anthropic Messages API compatibility ---------------------------------
+
+class AnthropicMessage(BaseModel):
+    role: str
+    content: str
+
+class AnthropicMessagesRequest(BaseModel):
+    model: str = "qwen3.6"
+    messages: list[AnthropicMessage] = []
+    max_tokens: int = Field(default=DEFAULT_MAX_TOKENS, le=262144)
+    temperature: float = 0.0
+    top_p: float = 1.0
+    stream: bool = False
+    system: str | None = None
+    stop_sequences: list[str] | None = None
+
+
+@app.post("/v1/messages")
+async def anthropic_messages(req: AnthropicMessagesRequest):
+    assert engine is not None
+    if req.stream:
+        raise HTTPException(status_code=400, detail="stream=true is not supported")
+    if req.temperature != 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"temperature={req.temperature!r} is not supported: greedy-decode only",
+        )
+
+    parts = []
+    if req.system:
+        parts.append(req.system)
+    for msg in req.messages:
+        parts.append(msg.content)
+    combined = "\n\n".join(parts)
+
+    prompt_ids = engine.tok.encode(combined, add_special_tokens=False)
+    max_tokens = min(req.max_tokens, engine.capacity_tokens_per_slot - len(prompt_ids) - 1)
+    if max_tokens < 1:
+        raise HTTPException(status_code=400, detail="prompt too long for requested max_tokens")
+
+    result = await engine.submit(prompt_ids, max_tokens)
+    text = engine.tok.decode(result["committed_token_ids"])
+
+    stop_reason = "end_turn" if result["finish_reason"] == "stop" else "max_tokens"
+
+    return {
+        "id": f"msg_{uuid.uuid4().hex[:24]}",
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "text", "text": text}],
+        "model": req.model,
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": result["prompt_tokens"],
+            "output_tokens": result["completion_tokens"],
+        },
+    }
