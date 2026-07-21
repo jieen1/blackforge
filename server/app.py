@@ -57,7 +57,7 @@ from server.formats.stream import StreamProcessor
 
 logger = logging.getLogger("qwen_sm120_server.app")
 
-DEFAULT_MAX_TOKENS = 256
+DEFAULT_MAX_TOKENS = 16384
 
 # CLI/launcher (``python -m server.app``) sets these via env vars before
 # ``uvicorn.run`` triggers the lifespan startup below -- kept as module-
