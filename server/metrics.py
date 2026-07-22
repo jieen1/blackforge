@@ -224,3 +224,82 @@ def render(model_name: str) -> list[str]:
         ("endpoint", "code"),
     )
     return lines
+
+
+# ---------------------------------------------------------------------------
+# D2: Runtime-internal metrics (MTP acceptance, prefix cache, KV usage)
+# ---------------------------------------------------------------------------
+
+MTP_ACCEPT_BUCKETS = (0, 1, 2, 3, 4, 5, 6, 7, 8)  # 0..K accepted tokens
+
+# MTP acceptance per round (histogram of num_accepted per verify round)
+mtp_acceptance_histogram = _Histogram(MTP_ACCEPT_BUCKETS)
+
+# Prefix cache counters
+_prefix_cache_hits = 0
+_prefix_cache_misses = 0
+_prefix_cache_hit_depth_sum = 0  # cumulative blocks matched on hits
+
+# Per-slot KV usage (gauge: fraction of blocks_per_slot used)
+_slot_kv_usage: dict[int, float] = {}
+
+
+def record_mtp_acceptance(num_accepted: int) -> None:
+    """Record one MTP verify round's acceptance count."""
+    mtp_acceptance_histogram.observe(float(num_accepted))
+
+
+def record_prefix_cache_hit(depth_blocks: int) -> None:
+    """Record a prefix cache hit with the number of blocks matched."""
+    global _prefix_cache_hits, _prefix_cache_hit_depth_sum
+    with _LOCK:
+        _prefix_cache_hits += 1
+        _prefix_cache_hit_depth_sum += depth_blocks
+
+
+def record_prefix_cache_miss() -> None:
+    """Record a prefix cache miss (cold start)."""
+    global _prefix_cache_misses
+    with _LOCK:
+        _prefix_cache_misses += 1
+
+
+def record_slot_kv_usage(slot: int, used_blocks: int, total_blocks: int) -> None:
+    """Record per-slot KV cache utilization."""
+    with _LOCK:
+        _slot_kv_usage[slot] = used_blocks / max(total_blocks, 1)
+
+
+def render_d2_metrics(model_name: str = "qwen3.6-27b") -> str:
+    """Render D2 metrics in Prometheus exposition format."""
+    lines: list[str] = []
+    # MTP acceptance
+    _render_histogram(
+        lines, "vllm:mtp_accepted_tokens",
+        "MTP accepted tokens per verify round",
+        model_name, mtp_acceptance_histogram,
+    )
+    # Prefix cache
+    with _LOCK:
+        hits = _prefix_cache_hits
+        misses = _prefix_cache_misses
+        depth_sum = _prefix_cache_hit_depth_sum
+    lines.append("# HELP vllm:prefix_cache_hits_total Prefix cache hit count")
+    lines.append("# TYPE vllm:prefix_cache_hits_total counter")
+    lines.append(f"vllm:prefix_cache_hits_total {hits}")
+    lines.append("# HELP vllm:prefix_cache_misses_total Prefix cache miss count")
+    lines.append("# TYPE vllm:prefix_cache_misses_total counter")
+    lines.append(f"vllm:prefix_cache_misses_total {misses}")
+    if hits > 0:
+        lines.append("# HELP vllm:prefix_cache_avg_hit_depth Average blocks matched on hit")
+        lines.append("# TYPE vllm:prefix_cache_avg_hit_depth gauge")
+        lines.append(f"vllm:prefix_cache_avg_hit_depth {depth_sum / hits:.1f}")
+    # Per-slot KV usage
+    with _LOCK:
+        slot_usage = dict(_slot_kv_usage)
+    if slot_usage:
+        lines.append("# HELP vllm:slot_kv_usage_fraction Per-slot KV cache utilization")
+        lines.append("# TYPE vllm:slot_kv_usage_fraction gauge")
+        for slot, frac in sorted(slot_usage.items()):
+            lines.append(f'vllm:slot_kv_usage_fraction{{slot="{slot}"}} {frac:.3f}')
+    return "\n".join(lines)
