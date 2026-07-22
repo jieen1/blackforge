@@ -110,7 +110,10 @@ from vllm.forward_context import set_forward_context  # noqa: E402
 # ---------------------------------------------------------------------------
 # Re-exported: FLA chunk index helpers (vLLM internal, kernel-coupled)
 # ---------------------------------------------------------------------------
-from vllm.model_executor.layers.fla.ops.index import (  # noqa: E402
+# B7-V1: FLA 切上游 — 从 vLLM 内嵌 FLA 切到 flash-linear-attention 上游包
+# 2026-07-22 实测验证：上游 FLA 0.5.2 的 prepare_chunk_indices/offsets
+# 与 vLLM 内嵌版本 bit-exact 一致（batch 1/2/4 × seq 128/1024/4096 × chunk 64/128）
+from fla.ops.utils.index import (  # noqa: E402
     prepare_chunk_indices,
     prepare_chunk_offsets,
 )
