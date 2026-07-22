@@ -37,22 +37,22 @@ server section for the honest capability/limitation record):
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import logging
 import os
 import time
 import uuid
 from contextlib import asynccontextmanager
 
-import asyncio
-import functools
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from server.engine import ServerEngine
-from server.formats import strip_thinking, extract_text, convert_tools_to_chat_template
-from server.formats import openai as openai_format
 from server.formats import anthropic as anthropic_format
+from server.formats import convert_tools_to_chat_template, strip_thinking
+from server.formats import openai as openai_format
 from server.formats.stream import StreamProcessor
 
 logger = logging.getLogger("qwen_sm120_server.app")
@@ -96,13 +96,17 @@ SERVER_PRODUCTION = os.environ.get("QSR_SERVER_PRODUCTION", "1") != "0"
 
 engine: ServerEngine | None = None
 
+
 async def _tokenize_chat(engine_ref, messages, tools=None):
     """Run apply_chat_template in a thread to avoid blocking the event loop."""
     loop = asyncio.get_running_loop()
     fn = functools.partial(
         engine_ref.tok.apply_chat_template,
-        messages, tools=tools, tokenize=True,
-        add_generation_prompt=True, return_dict=False,
+        messages,
+        tools=tools,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=False,
     )
     return await loop.run_in_executor(None, fn)
 
@@ -119,7 +123,6 @@ async def _tokenize_decode(engine_ref, token_ids):
     loop = asyncio.get_running_loop()
     fn = functools.partial(engine_ref.tok.decode, token_ids, skip_special_tokens=True)
     return await loop.run_in_executor(None, fn)
-
 
 
 @asynccontextmanager
@@ -141,10 +144,15 @@ async def lifespan(app: FastAPI):
     )
     engine.start()
     logger.info(
-        "engine ready: capacity=%d num_slots=%d capacity_tokens_per_slot=%d cudagraph=%s prefix_cache=%s "
-        "session_affinity=%s ttl=%.1fs",
-        engine.capacity, engine.num_slots, engine.capacity_tokens_per_slot, SERVER_ENABLE_CUDAGRAPH,
-        SERVER_ENABLE_PREFIX_CACHE, SERVER_ENABLE_SESSION_AFFINITY, SERVER_SESSION_TTL_S,
+        "engine ready: capacity=%d num_slots=%d capacity_tokens_per_slot=%d "
+        "cudagraph=%s prefix_cache=%s session_affinity=%s ttl=%.1fs",
+        engine.capacity,
+        engine.num_slots,
+        engine.capacity_tokens_per_slot,
+        SERVER_ENABLE_CUDAGRAPH,
+        SERVER_ENABLE_PREFIX_CACHE,
+        SERVER_ENABLE_SESSION_AFFINITY,
+        SERVER_SESSION_TTL_S,
     )
     try:
         yield
@@ -153,6 +161,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="qwen-sm120-runtime server", lifespan=lifespan)
+
 
 @app.head("/")
 @app.get("/")
@@ -163,14 +172,19 @@ async def root():
 @app.middleware("http")
 async def log_request_timing(request: Request, call_next):
     import time as _time
+
     t0 = _time.perf_counter()
     response = await call_next(request)
     elapsed_ms = (_time.perf_counter() - t0) * 1000
     if elapsed_ms > 100:
-        logger.info("SLOW %s %s -> %d (%.0fms)", request.method, request.url.path, response.status_code, elapsed_ms)
+        logger.info(
+            "SLOW %s %s -> %d (%.0fms)",
+            request.method,
+            request.url.path,
+            response.status_code,
+            elapsed_ms,
+        )
     return response
-
-
 
 
 # -- schemas (loose OpenAI-compatible subset -- see module docstring for
@@ -204,14 +218,20 @@ class CompletionRequest(BaseModel):
 
 
 def _invalid_request(message: str) -> HTTPException:
-    return HTTPException(status_code=400, detail={"error": {"message": message, "type": "invalid_request_error"}})
+    return HTTPException(
+        status_code=400, detail={"error": {"message": message, "type": "invalid_request_error"}}
+    )
 
 
-def _validate_sampling_params(temperature: float | None, top_p: float | None, n: int | None, stream: bool | None) -> None:
+def _validate_sampling_params(
+    temperature: float | None, top_p: float | None, n: int | None, stream: bool | None
+) -> None:
     # Accept temperature/top_p/stream for client compatibility.
     # Internally always greedy decode (MTP verify requires greedy match).
     if n is not None and n != 1:
-        raise _invalid_request(f"n={n!r} is not supported: only a single completion (n=1) per request.")
+        raise _invalid_request(
+            f"n={n!r} is not supported: only a single completion (n=1) per request."
+        )
 
 
 def _validate_and_resolve_max_tokens(max_tokens: int | None) -> int:
@@ -230,8 +250,6 @@ def _validate_capacity(prompt_ids: list[int], max_tokens: int) -> None:
             f"{engine.capacity_tokens_per_slot} tokens (blocks_per_slot * block_size). "
             "Reduce the prompt length or max_tokens and retry."
         )
-
-
 
 
 @app.exception_handler(Exception)
@@ -288,19 +306,31 @@ async def chat_completions(req: ChatCompletionRequest):
 
     if req.stream:
         import json as _json
+
         cmpl_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created = int(time.time())
+
         async def _sse():
             proc = StreamProcessor(engine.tok)
             final_result = None
             # First chunk: role announcement (matches vLLM format)
             first_chunk = {
-                "id": cmpl_id, "object": "chat.completion.chunk", "created": created,
+                "id": cmpl_id,
+                "object": "chat.completion.chunk",
+                "created": created,
                 "model": model_name,
-                "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}],
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": ""},
+                        "finish_reason": None,
+                    }
+                ],
             }
             yield f"data: {_json.dumps(first_chunk)}\n\n"
-            async for item in engine.submit_stream(prompt_ids, max_tokens, session_id=req.session_id):
+            async for item in engine.submit_stream(
+                prompt_ids, max_tokens, session_id=req.session_id
+            ):
                 if isinstance(item, dict):
                     final_result = item
                     break
@@ -308,16 +338,24 @@ async def chat_completions(req: ChatCompletionRequest):
                 # Stream thinking as reasoning_content (vLLM compatible)
                 for td in proc.drain_thinking():
                     chunk = {
-                        "id": cmpl_id, "object": "chat.completion.chunk", "created": created,
+                        "id": cmpl_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
                         "model": model_name,
-                        "choices": [{"index": 0, "delta": {"reasoning_content": td}, "finish_reason": None}],
+                        "choices": [
+                            {"index": 0, "delta": {"reasoning_content": td}, "finish_reason": None}
+                        ],
                     }
                     yield f"data: {_json.dumps(chunk)}\n\n"
                 for delta in proc.drain_content():
                     chunk = {
-                        "id": cmpl_id, "object": "chat.completion.chunk", "created": created,
+                        "id": cmpl_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
                         "model": model_name,
-                        "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
+                        "choices": [
+                            {"index": 0, "delta": {"content": delta}, "finish_reason": None}
+                        ],
                     }
                     yield f"data: {_json.dumps(chunk)}\n\n"
             finish = final_result["finish_reason"] if final_result else "stop"
@@ -325,35 +363,75 @@ async def chat_completions(req: ChatCompletionRequest):
             if tool_calls:
                 finish = "tool_calls"
                 from server.formats.tools import format_tool_calls_openai
+
                 for i, tc in enumerate(format_tool_calls_openai(tool_calls)):
                     # Chunk 1: id + type + function name (matches vLLM incremental format)
                     name_chunk = {
-                        "id": cmpl_id, "object": "chat.completion.chunk", "created": created,
+                        "id": cmpl_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
                         "model": model_name,
-                        "choices": [{"index": 0, "delta": {"tool_calls": [{"index": i, "id": tc["id"], "type": "function", "function": {"name": tc["function"]["name"]}}]}, "finish_reason": None}],
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
+                                    "tool_calls": [
+                                        {
+                                            "index": i,
+                                            "id": tc["id"],
+                                            "type": "function",
+                                            "function": {"name": tc["function"]["name"]},
+                                        }
+                                    ]
+                                },
+                                "finish_reason": None,
+                            }
+                        ],
                     }
                     yield f"data: {_json.dumps(name_chunk)}\n\n"
                     # Chunk 2: arguments (full string in one piece)
                     args_chunk = {
-                        "id": cmpl_id, "object": "chat.completion.chunk", "created": created,
+                        "id": cmpl_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
                         "model": model_name,
-                        "choices": [{"index": 0, "delta": {"tool_calls": [{"index": i, "function": {"arguments": tc["function"]["arguments"]}}]}, "finish_reason": None}],
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
+                                    "tool_calls": [
+                                        {
+                                            "index": i,
+                                            "function": {"arguments": tc["function"]["arguments"]},
+                                        }
+                                    ]
+                                },
+                                "finish_reason": None,
+                            }
+                        ],
                     }
                     yield f"data: {_json.dumps(args_chunk)}\n\n"
             done = {
-                "id": cmpl_id, "object": "chat.completion.chunk", "created": created,
+                "id": cmpl_id,
+                "object": "chat.completion.chunk",
+                "created": created,
                 "model": model_name,
                 "choices": [{"index": 0, "delta": {}, "finish_reason": finish, "logprobs": None}],
             }
             yield f"data: {_json.dumps(done)}\n\n"
             yield "data: [DONE]\n\n"
+
         return StreamingResponse(_sse(), media_type="text/event-stream")
 
     # Non-streaming path
     result = await engine.submit(prompt_ids, max_tokens, session_id=req.session_id)
     raw_text = await _tokenize_decode(engine, result["committed_token_ids"])
     # Prepend  for strip_thinking (chat template injects it in prompt)
-    _raw_for_strip = raw_text if raw_text.startswith(chr(60) + "think" + chr(62)) else (chr(60) + "think" + chr(62) + "\n" + raw_text)
+    _raw_for_strip = (
+        raw_text
+        if raw_text.startswith(chr(60) + "think" + chr(62))
+        else (chr(60) + "think" + chr(62) + "\n" + raw_text)
+    )
     text = strip_thinking(_raw_for_strip)
     # Extract reasoning_content (thinking) for non-streaming response
     # Generated tokens start with thinking content (no  prefix since
@@ -361,7 +439,9 @@ async def chat_completions(req: ChatCompletionRequest):
     reasoning_content = None
     _THINK_OPEN = chr(60) + "think" + chr(62)
     _THINK_CLOSE = chr(60) + "/think" + chr(62)
-    _raw_with_think = raw_text if raw_text.startswith(_THINK_OPEN) else _THINK_OPEN + "\n" + raw_text
+    _raw_with_think = (
+        raw_text if raw_text.startswith(_THINK_OPEN) else _THINK_OPEN + "\n" + raw_text
+    )
     if _THINK_CLOSE in _raw_with_think:
         start = _raw_with_think.index(_THINK_OPEN) + len(_THINK_OPEN)
         if start < len(_raw_with_think) and _raw_with_think[start] == "\n":
@@ -392,7 +472,11 @@ async def completions(req: CompletionRequest):
 
     result = await engine.submit(prompt_ids, max_tokens, session_id=req.session_id)
     _raw_comp = await _tokenize_decode(engine, result["committed_token_ids"])
-    _raw_comp_full = _raw_comp if _raw_comp.startswith(chr(60) + "think" + chr(62)) else (chr(60) + "think" + chr(62) + "\n" + _raw_comp)
+    _raw_comp_full = (
+        _raw_comp
+        if _raw_comp.startswith(chr(60) + "think" + chr(62))
+        else (chr(60) + "think" + chr(62) + "\n" + _raw_comp)
+    )
     text = strip_thinking(_raw_comp_full)
     return {
         "id": f"cmpl-{uuid.uuid4().hex[:24]}",
@@ -535,19 +619,24 @@ async def metrics():
         f'vllm:num_free_slots{{model_name="{ServerEngine.MODEL}"}} {num_free_slots}',
         "# HELP vllm:capacity_tokens_per_slot Max tokens per slot.",
         "# TYPE vllm:capacity_tokens_per_slot gauge",
-        f'vllm:capacity_tokens_per_slot{{model_name="{ServerEngine.MODEL}"}} {engine.capacity_tokens_per_slot}',
+        f'vllm:capacity_tokens_per_slot{{model_name="{ServerEngine.MODEL}"}} '
+        f"{engine.capacity_tokens_per_slot}",
         "# HELP vllm:requests_completed_total Total completed requests.",
         "# TYPE vllm:requests_completed_total counter",
-        f'vllm:requests_completed_total{{model_name="{ServerEngine.MODEL}"}} {engine.stats.get("requests_completed", 0)}',
+        f'vllm:requests_completed_total{{model_name="{ServerEngine.MODEL}"}} '
+        f"{engine.stats.get('requests_completed', 0)}",
         "# HELP vllm:prefix_cache_hit_rate Prefix cache hit rate.",
         "# TYPE vllm:prefix_cache_hit_rate gauge",
-        f'vllm:prefix_cache_hit_rate{{model_name="{ServerEngine.MODEL}"}} {engine.stats.get("prefix_cache_hit_rate", 0.0):.4f}',
+        f'vllm:prefix_cache_hit_rate{{model_name="{ServerEngine.MODEL}"}} '
+        f"{engine.stats.get('prefix_cache_hit_rate', 0.0):.4f}",
         "# HELP vllm:prefix_cache_hits_total Prefix cache hits.",
         "# TYPE vllm:prefix_cache_hits_total counter",
-        f'vllm:prefix_cache_hits_total{{model_name="{ServerEngine.MODEL}"}} {engine.stats.get("prefix_cache_hits", 0)}',
+        f'vllm:prefix_cache_hits_total{{model_name="{ServerEngine.MODEL}"}} '
+        f"{engine.stats.get('prefix_cache_hits', 0)}",
         "# HELP vllm:prefix_cache_misses_total Prefix cache misses.",
         "# TYPE vllm:prefix_cache_misses_total counter",
-        f'vllm:prefix_cache_misses_total{{model_name="{ServerEngine.MODEL}"}} {engine.stats.get("prefix_cache_misses", 0)}',
+        f'vllm:prefix_cache_misses_total{{model_name="{ServerEngine.MODEL}"}} '
+        f"{engine.stats.get('prefix_cache_misses', 0)}",
         "# HELP vllm:kv_cache_total_blocks Total KV cache blocks.",
         "# TYPE vllm:kv_cache_total_blocks gauge",
         f'vllm:kv_cache_total_blocks{{model_name="{ServerEngine.MODEL}"}} {total_blocks}',
@@ -556,6 +645,7 @@ async def metrics():
         f'vllm:kv_cache_used_blocks{{model_name="{ServerEngine.MODEL}"}} {used_blocks}',
     ]
     from fastapi.responses import PlainTextResponse
+
     return PlainTextResponse("\n".join(lines) + "\n", media_type="text/plain; charset=utf-8")
 
 
@@ -568,14 +658,14 @@ async def v1_root():
     }
 
 
-
 @app.post("/v1/messages/count_tokens")
 async def anthropic_count_tokens(request: Request):
     """Anthropic token counting endpoint (Claude Desktop requires this)."""
     assert engine is not None
     body = await request.json()
-    from server.formats.anthropic import parse_messages
     from server.formats import convert_tools_to_chat_template
+    from server.formats.anthropic import parse_messages
+
     chat_messages = parse_messages(body)
     tools = convert_tools_to_chat_template(body.get("tools"))
     prompt_ids = await _tokenize_chat(engine, chat_messages, tools=tools)
@@ -600,7 +690,11 @@ async def anthropic_messages(request: Request):
     _stream = body.get("stream", False)
     logger.info(
         "ANTHROPIC REQ: system_chars=%d msgs=%d tools=%d stream=%s max_tokens=%s qs=%s",
-        _sys_len, len(_msgs), _tools_n, _stream, body.get("max_tokens"),
+        _sys_len,
+        len(_msgs),
+        _tools_n,
+        _stream,
+        body.get("max_tokens"),
         str(request.url.query) if request.url.query else "-",
     )
 
@@ -613,7 +707,10 @@ async def anthropic_messages(request: Request):
     if not chat_messages:
         return JSONResponse(
             status_code=400,
-            content={"type": "error", "error": {"type": "invalid_request_error", "message": "no messages provided"}},
+            content={
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": "no messages provided"},
+            },
         )
 
     # Convert tools for the chat template
@@ -625,11 +722,18 @@ async def anthropic_messages(request: Request):
     if effective_max < 1:
         return JSONResponse(
             status_code=400,
-            content={"type": "error", "error": {"type": "invalid_request_error", "message": "prompt too long for requested max_tokens"}},
+            content={
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "prompt too long for requested max_tokens",
+                },
+            },
         )
 
     if stream:
         import json as _json
+
         async def _anthropic_sse():
             proc = StreamProcessor(engine.tok)
             final_result = None
@@ -637,14 +741,18 @@ async def anthropic_messages(request: Request):
             msg_start = {
                 "type": "message_start",
                 "message": {
-                    "id": msg_id, "type": "message", "role": "assistant",
-                    "content": [], "model": model_name,
-                    "stop_reason": None, "stop_sequence": None,
+                    "id": msg_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": model_name,
+                    "stop_reason": None,
+                    "stop_sequence": None,
                     "usage": {"input_tokens": len(prompt_ids), "output_tokens": 0},
                 },
             }
             yield f"event: message_start\ndata: {_json.dumps(msg_start)}\n\n"
-            yield f"event: ping\ndata: " + _json.dumps({"type": "ping"}) + "\n\n"
+            yield "event: ping\ndata: " + _json.dumps({"type": "ping"}) + "\n\n"
 
             block_index = 0
             thinking_open = False
@@ -660,33 +768,69 @@ async def anthropic_messages(request: Request):
                 for td in proc.drain_thinking():
                     if not thinking_open:
                         thinking_open = True
-                        bs = {"type": "content_block_start", "index": block_index, "content_block": {"type": "thinking", "thinking": ""}}
+                        bs = {
+                            "type": "content_block_start",
+                            "index": block_index,
+                            "content_block": {"type": "thinking", "thinking": ""},
+                        }
                         yield f"event: content_block_start\ndata: {_json.dumps(bs)}\n\n"
-                    d = {"type": "content_block_delta", "index": block_index, "delta": {"type": "thinking_delta", "thinking": td}}
+                    d = {
+                        "type": "content_block_delta",
+                        "index": block_index,
+                        "delta": {"type": "thinking_delta", "thinking": td},
+                    }
                     yield f"event: content_block_delta\ndata: {_json.dumps(d)}\n\n"
 
                 for delta in proc.drain_content():
                     if thinking_open and not thinking_closed:
                         thinking_closed = True
-                        yield f"event: content_block_stop\ndata: " + _json.dumps({"type": "content_block_stop", "index": block_index}) + "\n\n"
+                        yield (
+                            "event: content_block_stop\ndata: "
+                            + _json.dumps({"type": "content_block_stop", "index": block_index})
+                            + "\n\n"
+                        )
                         block_index += 1
                     if not text_open:
                         text_open = True
-                        bs = {"type": "content_block_start", "index": block_index, "content_block": {"type": "text", "text": ""}}
+                        bs = {
+                            "type": "content_block_start",
+                            "index": block_index,
+                            "content_block": {"type": "text", "text": ""},
+                        }
                         yield f"event: content_block_start\ndata: {_json.dumps(bs)}\n\n"
-                    d = {"type": "content_block_delta", "index": block_index, "delta": {"type": "text_delta", "text": delta}}
+                    d = {
+                        "type": "content_block_delta",
+                        "index": block_index,
+                        "delta": {"type": "text_delta", "text": delta},
+                    }
                     yield f"event: content_block_delta\ndata: {_json.dumps(d)}\n\n"
 
             if thinking_open and not thinking_closed:
-                yield f"event: content_block_stop\ndata: " + _json.dumps({"type": "content_block_stop", "index": block_index}) + "\n\n"
+                yield (
+                    "event: content_block_stop\ndata: "
+                    + _json.dumps({"type": "content_block_stop", "index": block_index})
+                    + "\n\n"
+                )
                 block_index += 1
             if text_open:
-                yield f"event: content_block_stop\ndata: " + _json.dumps({"type": "content_block_stop", "index": block_index}) + "\n\n"
+                yield (
+                    "event: content_block_stop\ndata: "
+                    + _json.dumps({"type": "content_block_stop", "index": block_index})
+                    + "\n\n"
+                )
                 block_index += 1
             if not thinking_open and not text_open:
-                bs = {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}
+                bs = {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                }
                 yield f"event: content_block_start\ndata: {_json.dumps(bs)}\n\n"
-                yield f"event: content_block_stop\ndata: " + _json.dumps({"type": "content_block_stop", "index": 0}) + "\n\n"
+                yield (
+                    "event: content_block_stop\ndata: "
+                    + _json.dumps({"type": "content_block_stop", "index": 0})
+                    + "\n\n"
+                )
                 block_index = 1
 
             finish = final_result["finish_reason"] if final_result else "stop"
@@ -696,22 +840,52 @@ async def anthropic_messages(request: Request):
             if tool_calls:
                 stop_reason = "tool_use"
                 from server.formats.tools import format_tool_calls_anthropic
+
                 for tc in format_tool_calls_anthropic(tool_calls):
-                    bs = {"type": "content_block_start", "index": block_index, "content_block": {"type": "tool_use", "id": tc["id"], "name": tc["name"], "input": {}}}
+                    bs = {
+                        "type": "content_block_start",
+                        "index": block_index,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": tc["id"],
+                            "name": tc["name"],
+                            "input": {},
+                        },
+                    }
                     yield f"event: content_block_start\ndata: {_json.dumps(bs)}\n\n"
-                    delta_ev = {"type": "content_block_delta", "index": block_index, "delta": {"type": "input_json_delta", "partial_json": _json.dumps(tc["input"])}}
+                    delta_ev = {
+                        "type": "content_block_delta",
+                        "index": block_index,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": _json.dumps(tc["input"]),
+                        },
+                    }
                     yield f"event: content_block_delta\ndata: {_json.dumps(delta_ev)}\n\n"
-                    yield f"event: content_block_stop\ndata: " + _json.dumps({"type": "content_block_stop", "index": block_index}) + "\n\n"
+                    yield (
+                        "event: content_block_stop\ndata: "
+                        + _json.dumps({"type": "content_block_stop", "index": block_index})
+                        + "\n\n"
+                    )
                     block_index += 1
-            msg_delta = {"type": "message_delta", "delta": {"stop_reason": stop_reason, "stop_sequence": None}, "usage": {"input_tokens": len(prompt_ids), "output_tokens": out_tokens}}
+            msg_delta = {
+                "type": "message_delta",
+                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                "usage": {"input_tokens": len(prompt_ids), "output_tokens": out_tokens},
+            }
             yield f"event: message_delta\ndata: {_json.dumps(msg_delta)}\n\n"
-            yield f"event: message_stop\ndata: " + _json.dumps({"type": "message_stop"}) + "\n\n"
+            yield "event: message_stop\ndata: " + _json.dumps({"type": "message_stop"}) + "\n\n"
+
         return StreamingResponse(_anthropic_sse(), media_type="text/event-stream")
 
     # Non-streaming path
     result = await engine.submit(prompt_ids, effective_max)
     _raw_anth = await _tokenize_decode(engine, result["committed_token_ids"])
-    _raw_anth_full = _raw_anth if _raw_anth.startswith(chr(60) + "think" + chr(62)) else (chr(60) + "think" + chr(62) + "\n" + _raw_anth)
+    _raw_anth_full = (
+        _raw_anth
+        if _raw_anth.startswith(chr(60) + "think" + chr(62))
+        else (chr(60) + "think" + chr(62) + "\n" + _raw_anth)
+    )
     text = strip_thinking(_raw_anth_full)
     return anthropic_format.build_response(
         model=model_name,

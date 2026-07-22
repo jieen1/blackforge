@@ -2,9 +2,16 @@
 Compares v2 (mxf4nvf4 MMA) vs scalar NVFP4 decode kernel (proven reference) and
 dequant-bf16 SDPA. Speed vs FP8 nativefp8 baseline (~1.69ms)."""
 from __future__ import annotations
-import argparse, os, sys, time
+
+import argparse
+import os
+import sys
+import time
+
 os.environ.setdefault("USE_LIBUV", "0")
-import torch, torch.nn.functional as F
+import torch
+import torch.nn.functional as F
+
 sys.path.insert(0, "/home/bot/project/sm120-flash-attention/kernel")
 sys.path.insert(0, "/home/bot/project/sm120-flash-attention/kernel/tests")
 QH, KVH, D, PAGE = 24, 4, 256, 16
@@ -27,8 +34,10 @@ def main():
     ap.add_argument("--split",type=int,default=4096); ap.add_argument("--num-iters",type=int,default=30)
     ap.add_argument("--warmup",type=int,default=10)
     args=ap.parse_args(); device="cuda"
-    from flash_attn_sm120 import (flash_attn_sm120_nvfp4_kv_decode_paged,
-                                   flash_attn_sm120_fwd_v2_decode_nvfp4kv_paged)
+    from flash_attn_sm120 import (
+        flash_attn_sm120_fwd_v2_decode_nvfp4kv_paged,
+        flash_attn_sm120_nvfp4_kv_decode_paged,
+    )
     from nvfp4_paged_test_utils import build_nvfp4_paged_cache, simulated_quantized_kv
     torch.manual_seed(2025*2026+27); torch.cuda.manual_seed(2025*2026+27)
     k_list=[torch.randn(args.kv_len,KVH,D,device=device).add(0.5).bfloat16() for _ in range(args.batch)]

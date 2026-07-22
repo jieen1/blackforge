@@ -362,7 +362,6 @@ def _run_sustained(runner, tok, pool: list[dict], capacity: int, duration_s: flo
 
     from benchmarks.mtp_async_arrival_check import (
         MAX_BENIGN_STREAK_ROUNDS,
-        NEAR_TIE_LOGIT_MARGIN,
         _looks_like_repetition_artifact,
         _near_tie_margin_diag,
         _ref_check,

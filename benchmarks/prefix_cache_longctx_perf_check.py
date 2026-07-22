@@ -182,6 +182,7 @@ def _run_correctness_hook(runner, prompt_ids: list[int], chunk_size: int) -> dic
     (slot 1, hits at G). Assert: hit engages, anchor match, GDN-layer-0
     committed-rows exact, decode near-tie."""
     import torch
+
     from runtime.direct_model_runner import _physical_slot
 
     result: dict = {"checks": {}, "prompt_len": len(prompt_ids)}
@@ -520,12 +521,11 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    import torch
 
     sys.path.insert(0, SM120_VLLM_INTEGRATION)
     import register_sm120_backend  # noqa: F401
 
-    from benchmarks.workloads import D1_CTX64K_FIXTURE, CTX128K_FIXTURE, load_prompt_token_ids
+    from benchmarks.workloads import CTX128K_FIXTURE, D1_CTX64K_FIXTURE, load_prompt_token_ids
     from runtime.direct_model_runner import DirectModelRunner, build_vllm_config
 
     fixture = {"ctx64k": D1_CTX64K_FIXTURE, "ctx128k": CTX128K_FIXTURE}[args.fixture]
@@ -615,8 +615,8 @@ def main() -> int:
     if not all(correctness["checks"].values()):
         print("\n*** CORRECTNESS FAILED — stopping before perf measurement ***")
         summary["passed"] = False
-        print(f"\npassed: false")
-        print(f"=== overall: FAIL ===")
+        print("\npassed: false")
+        print("=== overall: FAIL ===")
         print(json.dumps(summary, indent=2, default=str))
         return 1
 
@@ -746,7 +746,7 @@ def main() -> int:
     # -----------------------------------------------------------------------
     summary["passed"] = overall
     print(f"\n{'='*60}")
-    print(f"SUMMARY")
+    print("SUMMARY")
     print(f"{'='*60}")
     print(f"  Correctness: {'PASS' if all(correctness['checks'].values()) else 'FAIL'}")
     print(f"  Cold TTFT: {cold_ttft:.1f}ms")

@@ -73,7 +73,7 @@ class TestAcquireEdgeCases:
     def test_released_slot_is_reused_in_order(self):
         mgr = FixedSlotManager(capacity=2)
         a0 = mgr.acquire("first")
-        a1 = mgr.acquire("second")
+        mgr.acquire("second")
         mgr.release(a0)
         a2 = mgr.acquire("third")
         assert a2.slot_id == 0
@@ -94,7 +94,7 @@ class TestReleaseEdgeCases:
         mgr = FixedSlotManager(capacity=1)
         a0 = mgr.acquire("first")
         mgr.release(a0)
-        a1 = mgr.acquire("second")
+        mgr.acquire("second")
         stale = SlotAssignment(a0.slot_id, "second", a0.generation)
         with pytest.raises(SlotError, match="stale"):
             mgr.release(stale)

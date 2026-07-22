@@ -20,7 +20,7 @@ Also covers edge cases:
 import pytest
 
 from runtime.hybrid_cache import CacheGeometry, CacheView, HybridCache
-from runtime.slot_manager import SlotAssignment, SlotError
+from runtime.slot_manager import SlotAssignment
 
 
 def _assignment(view: CacheView) -> SlotAssignment:
@@ -194,7 +194,7 @@ class TestSlotIsolation:
     def test_append_to_one_slot_does_not_affect_another(self):
         cache = HybridCache(CacheGeometry(block_size=4, max_blocks_per_slot=4), capacity=2)
         v0 = cache.acquire("slot0")
-        v1 = cache.acquire("slot1")
+        cache.acquire("slot1")
         cache.append(_assignment(v0), token_count=10)
         active = cache.active()
         slot1_view = next(v for v in active if v.request_id == "slot1")

@@ -11,8 +11,8 @@ import json
 import uuid
 from typing import Any
 
-from server.formats.content import extract_text, extract_blocks
-from server.formats.tools import parse_tool_calls, format_tool_calls_anthropic
+from server.formats.content import extract_blocks, extract_text
+from server.formats.tools import format_tool_calls_anthropic, parse_tool_calls
 
 
 def parse_messages(body: dict) -> list[dict]:
@@ -43,14 +43,16 @@ def parse_messages(body: dict) -> list[dict]:
                 if btype == "text":
                     text_parts.append(block.get("text", ""))
                 elif btype == "tool_use":
-                    tool_calls.append({
-                        "id": block.get("id", ""),
-                        "type": "function",
-                        "function": {
-                            "name": block.get("name", ""),
-                            "arguments": block.get("input", {}),
-                        },
-                    })
+                    tool_calls.append(
+                        {
+                            "id": block.get("id", ""),
+                            "type": "function",
+                            "function": {
+                                "name": block.get("name", ""),
+                                "arguments": block.get("input", {}),
+                            },
+                        }
+                    )
             entry: dict[str, Any] = {"role": "assistant", "content": "\n".join(text_parts)}
             if tool_calls:
                 entry["tool_calls"] = tool_calls
@@ -67,11 +69,13 @@ def parse_messages(body: dict) -> list[dict]:
                     result_content = block.get("content", "")
                     if isinstance(result_content, list):
                         result_content = extract_text(result_content)
-                    tool_results.append({
-                        "role": "tool",
-                        "content": str(result_content),
-                        "tool_call_id": block.get("tool_use_id", ""),
-                    })
+                    tool_results.append(
+                        {
+                            "role": "tool",
+                            "content": str(result_content),
+                            "tool_call_id": block.get("tool_use_id", ""),
+                        }
+                    )
             # tool results go first (they respond to the previous assistant turn)
             for tr in tool_results:
                 chat_messages.append(tr)
@@ -140,9 +144,13 @@ def build_sse_events(
     msg_start = {
         "type": "message_start",
         "message": {
-            "id": msg_id, "type": "message", "role": "assistant",
-            "content": [], "model": model,
-            "stop_reason": None, "stop_sequence": None,
+            "id": msg_id,
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "model": model,
+            "stop_reason": None,
+            "stop_sequence": None,
             "usage": {"input_tokens": input_tokens, "output_tokens": 0},
         },
     }
@@ -150,23 +158,55 @@ def build_sse_events(
 
     block_index = 0
     if visible_text:
-        bs = {"type": "content_block_start", "index": block_index, "content_block": {"type": "text", "text": ""}}
+        bs = {
+            "type": "content_block_start",
+            "index": block_index,
+            "content_block": {"type": "text", "text": ""},
+        }
         yield f"event: content_block_start\ndata: {json.dumps(bs)}\n\n"
-        yield f"event: ping\ndata: " + json.dumps({"type": "ping"}) + "\n\n"
-        delta = {"type": "content_block_delta", "index": block_index, "delta": {"type": "text_delta", "text": visible_text}}
+        yield "event: ping\ndata: " + json.dumps({"type": "ping"}) + "\n\n"
+        delta = {
+            "type": "content_block_delta",
+            "index": block_index,
+            "delta": {"type": "text_delta", "text": visible_text},
+        }
         yield f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n"
-        yield f"event: content_block_stop\ndata: " + json.dumps({"type": "content_block_stop", "index": block_index}) + "\n\n"
+        yield (
+            "event: content_block_stop\ndata: "
+            + json.dumps({"type": "content_block_stop", "index": block_index})
+            + "\n\n"
+        )
         block_index += 1
 
     for tc in format_tool_calls_anthropic(tool_calls):
-        bs = {"type": "content_block_start", "index": block_index, "content_block": {"type": "tool_use", "id": tc["id"], "name": tc["name"], "input": {}}}
+        bs = {
+            "type": "content_block_start",
+            "index": block_index,
+            "content_block": {"type": "tool_use", "id": tc["id"], "name": tc["name"], "input": {}},
+        }
         yield f"event: content_block_start\ndata: {json.dumps(bs)}\n\n"
-        delta = {"type": "content_block_delta", "index": block_index, "delta": {"type": "input_json_delta", "partial_json": json.dumps(tc["input"])}}
+        delta = {
+            "type": "content_block_delta",
+            "index": block_index,
+            "delta": {"type": "input_json_delta", "partial_json": json.dumps(tc["input"])},
+        }
         yield f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n"
-        yield f"event: content_block_stop\ndata: " + json.dumps({"type": "content_block_stop", "index": block_index}) + "\n\n"
+        yield (
+            "event: content_block_stop\ndata: "
+            + json.dumps({"type": "content_block_stop", "index": block_index})
+            + "\n\n"
+        )
         block_index += 1
 
-    msg_delta = {"type": "message_delta", "delta": {"stop_reason": stop_reason, "stop_sequence": None}, "usage": {"output_tokens": output_tokens}}
+    msg_delta = {
+        "type": "message_delta",
+        "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+        "usage": {"output_tokens": output_tokens},
+    }
     yield f"event: message_delta\ndata: {json.dumps(msg_delta)}\n\n"
-    yield f"event: message_stop\ndata: " + json.dumps({"type": "message_stop"}) + "\n\n"
-    msg_delta = {"type": "message_delta", "delta": {"stop_reason": stop_reason}, "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}}
+    yield "event: message_stop\ndata: " + json.dumps({"type": "message_stop"}) + "\n\n"
+    msg_delta = {
+        "type": "message_delta",
+        "delta": {"stop_reason": stop_reason},
+        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+    }

@@ -26,7 +26,7 @@ import json
 import os
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
@@ -177,6 +177,7 @@ def _setup_short_scenario(runner, prompts: list[list[int]]) -> tuple[dict, dict]
 def _run_profiled_decode_steps(runner, slots, anchors, drafts, num_steps):
     """Run decode steps with per-component CUDA event timing via monkey-patching."""
     import torch
+
     from runtime.direct_model_runner import determine_accept_reject_batch
 
     timings: list[StepTimings] = []
@@ -266,7 +267,7 @@ def _run_profiled_decode_steps(runner, slots, anchors, drafts, num_steps):
 def _run_profiler_steps(runner, slots, anchors, drafts, num_steps):
     """Run a few steps under torch.profiler to get kernel-level breakdown."""
     import torch
-    from torch.profiler import profile, ProfilerActivity
+    from torch.profiler import ProfilerActivity, profile
 
     cur_anchors = dict(anchors)
     cur_drafts = dict(drafts)
@@ -435,7 +436,7 @@ def _report(timings: list[StepTimings], total_committed: int,
         print(f"  {'-'*47}")
         print(f"  {'TOTAL CUDA':<25} {ps.get('total_cuda_ms', 0):>12.4f} {'100.0':>9}%")
 
-        print(f"\n  --- Top 15 kernels by total CUDA time ---")
+        print("\n  --- Top 15 kernels by total CUDA time ---")
         for i, k in enumerate(profiler_analysis["top_15_kernels"]):
             print(f"  {i+1:>2}. [{k['total_ms']:>8.3f}ms, {k['count']:>4}x] {k['name']}")
 

@@ -132,7 +132,6 @@ def _fragment_pool_via_churn(
 
 
 def _run_once(enable_block_table: bool = False) -> dict:
-    import torch
 
     sys.path.insert(0, SM120_VLLM_INTEGRATION)
     import register_sm120_backend  # noqa: F401

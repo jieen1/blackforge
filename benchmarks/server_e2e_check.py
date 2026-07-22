@@ -128,7 +128,11 @@ async def _independent_reference_replay(
     reproducible from an independent pass through the identical model --
     the same technique this project's own async-arrival/sustained-
     workload benchmarks use to certify no cross-request state leakage."""
-    from benchmarks.mtp_async_arrival_check import NEAR_TIE_LOGIT_MARGIN, _near_tie_margin_diag, _ref_check
+    from benchmarks.mtp_async_arrival_check import (
+        NEAR_TIE_LOGIT_MARGIN,
+        _near_tie_margin_diag,
+        _ref_check,
+    )
 
     runner = engine.runner
     prompt_ids = tok.encode(prompt_text, add_special_tokens=False)
@@ -174,7 +178,6 @@ async def _independent_reference_replay(
 async def _run() -> dict:
     import httpx
     import uvicorn
-    from transformers import AutoTokenizer
 
     import server.app as app_module
 
@@ -216,12 +219,12 @@ async def _run() -> dict:
             # /v1/completions (raw prompt, avoids chat-template ambiguity
             # for the reference replay), independently verified. Reuses
             # this project's own realistic-prompt generator verbatim. --
+            import random
+
             from benchmarks.mtp_sustained_realistic_workload_check import (
-                REQUEST_CLASSES,
                 _build_coding_prompt,
                 _build_filler_ids,
             )
-            import random
 
             rng = random.Random(20260719)
             filler_ids = _build_filler_ids(tok)

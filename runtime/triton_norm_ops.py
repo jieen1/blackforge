@@ -18,13 +18,12 @@ from __future__ import annotations
 
 import torch
 from torch import Tensor
-
 from vllm.triton_utils import tl, triton
-
 
 # ---------------------------------------------------------------------------
 # Triton kernels
 # ---------------------------------------------------------------------------
+
 
 @triton.jit
 def _rms_norm_triton_kernel(
@@ -55,8 +54,10 @@ def _rms_norm_triton_kernel(
         mask = idx < n_cols
         vals = tl.load(row_start + idx, mask=mask, other=0.0).to(tl.float32)
         w = tl.load(weight_ptr + idx, mask=mask, other=1.0).to(tl.float32)
-        out = (vals * inv_rms * w)
-        tl.store(out_start + idx, out.to(tl.load(row_start + idx, mask=mask, other=0.0).dtype), mask=mask)
+        out = vals * inv_rms * w
+        tl.store(
+            out_start + idx, out.to(tl.load(row_start + idx, mask=mask, other=0.0).dtype), mask=mask
+        )
 
 
 @triton.jit
@@ -82,7 +83,9 @@ def _fused_add_rms_norm_triton_kernel(
         x = tl.load(inp_start + idx, mask=mask, other=0.0).to(tl.float32)
         r = tl.load(res_start + idx, mask=mask, other=0.0).to(tl.float32)
         s = x + r
-        tl.store(res_start + idx, s.to(tl.load(res_start + idx, mask=mask, other=0.0).dtype), mask=mask)
+        tl.store(
+            res_start + idx, s.to(tl.load(res_start + idx, mask=mask, other=0.0).dtype), mask=mask
+        )
         sum_sq += tl.sum(tl.where(mask, s * s, 0.0))
 
     inv_rms = tl.rsqrt(sum_sq / n_cols + eps)
@@ -92,13 +95,16 @@ def _fused_add_rms_norm_triton_kernel(
         mask = idx < n_cols
         r = tl.load(res_start + idx, mask=mask, other=0.0).to(tl.float32)
         w = tl.load(weight_ptr + idx, mask=mask, other=1.0).to(tl.float32)
-        out = (r * inv_rms * w)
-        tl.store(inp_start + idx, out.to(tl.load(inp_start + idx, mask=mask, other=0.0).dtype), mask=mask)
+        out = r * inv_rms * w
+        tl.store(
+            inp_start + idx, out.to(tl.load(inp_start + idx, mask=mask, other=0.0).dtype), mask=mask
+        )
 
 
 # ---------------------------------------------------------------------------
 # Python wrappers (match IR op signatures)
 # ---------------------------------------------------------------------------
+
 
 def _triton_rms_norm(
     x: Tensor, weight: Tensor | None, epsilon: float, variance_size: int | None = None
@@ -108,20 +114,31 @@ def _triton_rms_norm(
     x_2d = x.reshape(-1, x.shape[-1]).contiguous()
     n_rows, n_cols = x_2d.shape
     output = torch.empty_like(x_2d)
-    w = weight.contiguous() if weight is not None else torch.ones(n_cols, device=x.device, dtype=torch.float32)
+    w = (
+        weight.contiguous()
+        if weight is not None
+        else torch.ones(n_cols, device=x.device, dtype=torch.float32)
+    )
     BLOCK = min(triton.next_power_of_2(n_cols), 4096)
     _rms_norm_triton_kernel[(n_rows,)](
-        x_2d, w, output,
-        x_2d.stride(0), output.stride(0),
-        n_cols, epsilon,
+        x_2d,
+        w,
+        output,
+        x_2d.stride(0),
+        output.stride(0),
+        n_cols,
+        epsilon,
         BLOCK_SIZE=BLOCK,
     )
     return output.view(orig_shape)
 
 
 def _triton_fused_add_rms_norm(
-    x: Tensor, x_residual: Tensor, weight: Tensor | None,
-    epsilon: float, variance_size: int | None = None,
+    x: Tensor,
+    x_residual: Tensor,
+    weight: Tensor | None,
+    epsilon: float,
+    variance_size: int | None = None,
 ) -> tuple[Tensor, Tensor]:
     assert variance_size is None
     assert x.shape == x_residual.shape
@@ -133,12 +150,20 @@ def _triton_fused_add_rms_norm(
     if not r_2d.is_contiguous():
         r_2d = r_2d.contiguous()
     n_rows, n_cols = x_2d.shape
-    w = weight.contiguous() if weight is not None else torch.ones(n_cols, device=x.device, dtype=torch.float32)
+    w = (
+        weight.contiguous()
+        if weight is not None
+        else torch.ones(n_cols, device=x.device, dtype=torch.float32)
+    )
     BLOCK = min(triton.next_power_of_2(n_cols), 4096)
     _fused_add_rms_norm_triton_kernel[(n_rows,)](
-        x_2d, r_2d, w,
-        x_2d.stride(0), r_2d.stride(0),
-        n_cols, epsilon,
+        x_2d,
+        r_2d,
+        w,
+        x_2d.stride(0),
+        r_2d.stride(0),
+        n_cols,
+        epsilon,
         BLOCK_SIZE=BLOCK,
     )
     return x_2d.view(orig_shape), r_2d.view(orig_shape)
@@ -164,19 +189,23 @@ def install_triton_norm_ops() -> None:
 
     from vllm import ir
 
-    _no_var = lambda x, weight, epsilon, variance_size=None: (
-        variance_size is None
-    )
-    _no_var_add = lambda x, x_residual, weight, epsilon, variance_size=None: (
-        variance_size is None
-    )
+    def _no_var(x, weight, epsilon, variance_size=None):
+        return variance_size is None
+
+    def _no_var_add(x, x_residual, weight, epsilon, variance_size=None):
+        return variance_size is None
 
     ir.ops.rms_norm.register_impl(
-        "triton", supports_args=_no_var, supported=True,
+        "triton",
+        supports_args=_no_var,
+        supported=True,
     )(_triton_rms_norm)
 
     ir.ops.fused_add_rms_norm.register_impl(
-        "triton", supports_args=_no_var_add, supported=True, inplace=True,
+        "triton",
+        supports_args=_no_var_add,
+        supported=True,
+        inplace=True,
     )(_triton_fused_add_rms_norm)
 
     ir.ops.rms_norm.set_default(["triton", "native"])
@@ -186,6 +215,7 @@ def install_triton_norm_ops() -> None:
 # ---------------------------------------------------------------------------
 # Triton SiluAndMul (fused SwiGLU activation)
 # ---------------------------------------------------------------------------
+
 
 @triton.jit
 def _silu_and_mul_triton_kernel(
@@ -221,8 +251,10 @@ def triton_silu_and_mul(x: torch.Tensor) -> torch.Tensor:
     output = torch.empty(n_rows, d, device=x.device, dtype=x.dtype)
     BLOCK = min(triton.next_power_of_2(d), 4096)
     _silu_and_mul_triton_kernel[(n_rows,)](
-        x_2d, output,
-        x_2d.stride(0), output.stride(0),
+        x_2d,
+        output,
+        x_2d.stride(0),
+        output.stride(0),
         d,
         BLOCK_SIZE=BLOCK,
     )

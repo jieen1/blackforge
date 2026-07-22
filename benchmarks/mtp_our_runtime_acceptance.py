@@ -67,7 +67,6 @@ def _random_prompt(allowed_tokens: list[int], length: int, offset: int) -> list[
 
 
 def _run_once(workload: str, target_output_len: int, blocks_per_slot: int) -> dict:
-    import torch
 
     sys.path.insert(0, SM120_VLLM_INTEGRATION)
     import register_sm120_backend  # noqa: F401

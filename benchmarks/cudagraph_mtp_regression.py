@@ -81,7 +81,6 @@ def _signal_check(text: str, own_number: int, other_numbers: list[int], qo_len: 
 
 
 def _run_once() -> dict:
-    import torch
 
     sys.path.insert(0, SM120_VLLM_INTEGRATION)
     import register_sm120_backend  # noqa: F401

@@ -26,9 +26,7 @@ _ORPHAN_CLOSE_RE = re.compile(r"\A.*?</think>\s*", re.DOTALL)
 _UNCLOSED_THINK_RE = re.compile(r"<think>.*\Z", re.DOTALL)
 
 # Pattern 4: Plain-text thinking prefix (no XML tags at all)
-_THINKING_PREFIX_RE = re.compile(
-    r"\A(?:Here.s a thinking process|Thinking Process):.*", re.DOTALL
-)
+_THINKING_PREFIX_RE = re.compile(r"\A(?:Here.s a thinking process|Thinking Process):.*", re.DOTALL)
 
 # Pattern 5: <usage>...</usage> metadata blocks (model artifact from
 # training data that included Claude sub-agent output format).

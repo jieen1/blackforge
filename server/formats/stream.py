@@ -20,7 +20,7 @@ For API compatibility:
 from __future__ import annotations
 
 from server.formats.thinking import strip_thinking
-from server.formats.tools import parse_tool_calls, find_tool_call_start
+from server.formats.tools import find_tool_call_start, parse_tool_calls
 
 _THINK_OPEN = chr(60) + "think" + chr(62)
 _THINK_CLOSE = chr(60) + "/think" + chr(62)
@@ -108,7 +108,7 @@ class StreamProcessor:
         else:
             thinking = raw[start:]
         if len(thinking) > self._thinking_emitted_len:
-            delta = thinking[self._thinking_emitted_len:]
+            delta = thinking[self._thinking_emitted_len :]
             self._thinking_emitted_len = len(thinking)
             return [delta]
         return []
@@ -145,7 +145,7 @@ class StreamProcessor:
             self._tool_call_started = True
             safe = visible[:tc_start]
             if len(safe) > self._emitted_len:
-                delta = safe[self._emitted_len:]
+                delta = safe[self._emitted_len :]
                 self._emitted_len = len(safe)
                 return [delta]
             return []
@@ -155,7 +155,7 @@ class StreamProcessor:
         if usage_idx >= 0:
             safe = visible[:usage_idx]
             if len(safe) > self._emitted_len:
-                delta = safe[self._emitted_len:]
+                delta = safe[self._emitted_len :]
                 self._emitted_len = len(safe)
                 return [delta]
             return []
@@ -164,14 +164,14 @@ class StreamProcessor:
             if visible.endswith(_USAGE_OPEN[:plen]):
                 safe = visible[: len(visible) - plen]
                 if len(safe) > self._emitted_len:
-                    delta = safe[self._emitted_len:]
+                    delta = safe[self._emitted_len :]
                     self._emitted_len = len(safe)
                     return [delta]
                 return []
 
         # Normal content delta
         if len(visible) > self._emitted_len:
-            delta = visible[self._emitted_len:]
+            delta = visible[self._emitted_len :]
             self._emitted_len = len(visible)
             return [delta]
         return []

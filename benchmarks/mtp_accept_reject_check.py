@@ -42,7 +42,6 @@ K = 3  # num_speculative_tokens, matching this project's real production MTP K=3
 
 
 def _run_once() -> dict:
-    import torch
 
     sys.path.insert(0, SM120_VLLM_INTEGRATION)
     import register_sm120_backend  # noqa: F401

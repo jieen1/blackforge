@@ -62,7 +62,6 @@ def _run_once() -> dict:
     from runtime.direct_model_runner import (
         DirectModelRunner,
         build_vllm_config,
-        determine_accept_reject,
     )
 
     tok = AutoTokenizer.from_pretrained(MODEL)

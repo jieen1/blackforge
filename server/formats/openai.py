@@ -12,7 +12,7 @@ import uuid
 from typing import Any
 
 from server.formats.content import extract_text
-from server.formats.tools import parse_tool_calls, format_tool_calls_openai
+from server.formats.tools import format_tool_calls_openai, parse_tool_calls
 
 
 def parse_chat_messages(body: dict) -> list[dict]:
@@ -79,11 +79,13 @@ def build_response(
         "object": "chat.completion",
         "created": int(time.time()),
         "model": model,
-        "choices": [{
-            "index": 0,
-            "message": message,
-            "finish_reason": finish_reason,
-        }],
+        "choices": [
+            {
+                "index": 0,
+                "message": message,
+                "finish_reason": finish_reason,
+            }
+        ],
         "usage": {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
@@ -111,28 +113,54 @@ def build_sse_chunks(
         finish_reason = "tool_calls"
         if visible_text:
             chunk = {
-                "id": cmpl_id, "object": "chat.completion.chunk", "created": created,
+                "id": cmpl_id,
+                "object": "chat.completion.chunk",
+                "created": created,
                 "model": model,
-                "choices": [{"index": 0, "delta": {"role": "assistant", "content": visible_text}, "finish_reason": None}],
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": visible_text},
+                        "finish_reason": None,
+                    }
+                ],
             }
             yield f"data: {json.dumps(chunk)}\n\n"
         for i, tc in enumerate(format_tool_calls_openai(tool_calls)):
             chunk = {
-                "id": cmpl_id, "object": "chat.completion.chunk", "created": created,
+                "id": cmpl_id,
+                "object": "chat.completion.chunk",
+                "created": created,
                 "model": model,
-                "choices": [{"index": 0, "delta": {"tool_calls": [{"index": i, **tc}]}, "finish_reason": None}],
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"tool_calls": [{"index": i, **tc}]},
+                        "finish_reason": None,
+                    }
+                ],
             }
             yield f"data: {json.dumps(chunk)}\n\n"
     else:
         chunk = {
-            "id": cmpl_id, "object": "chat.completion.chunk", "created": created,
+            "id": cmpl_id,
+            "object": "chat.completion.chunk",
+            "created": created,
             "model": model,
-            "choices": [{"index": 0, "delta": {"role": "assistant", "content": visible_text}, "finish_reason": None}],
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": visible_text},
+                    "finish_reason": None,
+                }
+            ],
         }
         yield f"data: {json.dumps(chunk)}\n\n"
 
     done = {
-        "id": cmpl_id, "object": "chat.completion.chunk", "created": created,
+        "id": cmpl_id,
+        "object": "chat.completion.chunk",
+        "created": created,
         "model": model,
         "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
     }

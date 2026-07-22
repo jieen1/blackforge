@@ -16,9 +16,7 @@ Usage::
 
 from __future__ import annotations
 
-import torch
 from torch import Tensor
-
 
 _patched = False
 
@@ -30,8 +28,8 @@ def patch_gemma_rms_norm() -> None:
         return
     _patched = True
 
-    from vllm.model_executor.layers.layernorm import GemmaRMSNorm
     from vllm import ir
+    from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 
     def _forward_native(
         self,

@@ -11,7 +11,11 @@ Usage:
       --kv-len 141312 --batch 4 --qo-len 4 --split 4096 --max-splits 64
 """
 from __future__ import annotations
-import argparse, os, sys, time
+
+import argparse
+import os
+import time
+
 os.environ.setdefault("USE_LIBUV", "0")
 import torch
 import torch.nn.functional as F

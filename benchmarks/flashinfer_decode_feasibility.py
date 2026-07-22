@@ -122,7 +122,7 @@ def main() -> int:
     num_pages_total = num_pages_per_req * batch
     last_page_len = kv_len - (num_pages_per_req - 1) * PAGE_SIZE
 
-    print(f"=== FlashInfer vs SM120 GQA NATIVEFP8 decode ===")
+    print("=== FlashInfer vs SM120 GQA NATIVEFP8 decode ===")
     print(f"kv_len={kv_len}, batch={batch}, qo_len={qo_len}, page_size={PAGE_SIZE}")
     print(f"num_pages_per_req={num_pages_per_req}, total_pages={num_pages_total}")
     print(f"GQA {NUM_QO_HEADS}:{NUM_KV_HEADS}, head_dim={HEAD_DIM}")
@@ -193,7 +193,7 @@ def main() -> int:
 
     # --- Speedup ---
     if t_sm120 < float("inf") and t_fi < float("inf"):
-        print(f"\n=== RESULT ===")
+        print("\n=== RESULT ===")
         print(f"SM120 GQA NATIVEFP8: {t_sm120:.3f} ms")
         print(f"FlashInfer:          {t_fi:.3f} ms")
         print(f"Speedup (SM120/FI):  {t_sm120/t_fi:.3f}x")

@@ -110,8 +110,7 @@ class VLLMBridgeBackend:
                     "usage": data.get("usage", {}),
                 }
             raise VLLMBridgeError(
-                f"empty completion for request {request_id!r} "
-                f"(finish_reason={finish_reason!r})"
+                f"empty completion for request {request_id!r} (finish_reason={finish_reason!r})"
             )
         # `max_tokens=1` means the server emitted exactly one real token, and
         # `new_text` is that one token's own decoded string, so re-encoding

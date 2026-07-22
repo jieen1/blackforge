@@ -23,7 +23,6 @@ import asyncio
 import collections
 import logging
 import os
-import select
 import sys
 import threading
 import time
@@ -37,7 +36,13 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
 SM120_VLLM_INTEGRATION = os.environ.get(
     "SM120_VLLM_INTEGRATION",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "sm120-flash-attention", "vllm_integration"),
+    os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..",
+        "..",
+        "sm120-flash-attention",
+        "vllm_integration",
+    ),
 )
 
 logger = logging.getLogger("qwen_sm120_server.engine")
@@ -73,7 +78,7 @@ class GenerationRequest:
     max_tokens: int
     future: Any
     session_id: str | None = None
-    stream_channel: "StreamChannel | None" = None
+    stream_channel: StreamChannel | None = None
 
 
 class StreamChannel:
@@ -84,6 +89,7 @@ class StreamChannel:
     call_soon_threadsafe(event.set). The asyncio consumer awaits the event
     and drains the deque.
     """
+
     __slots__ = ("_buf", "_event", "_closed")
 
     def __init__(self) -> None:
@@ -152,9 +158,7 @@ class ServerEngine:
                 f"enable_cudagraph={enable_cudagraph}"
             )
         if enable_session_affinity and not enable_prefix_cache:
-            raise ValueError(
-                "enable_session_affinity requires enable_prefix_cache"
-            )
+            raise ValueError("enable_session_affinity requires enable_prefix_cache")
 
         # -- config --
         self.capacity = capacity
@@ -173,6 +177,7 @@ class ServerEngine:
 
         # -- tokenizer (CPU-only, thread-safe for reads) --
         from transformers import AutoTokenizer
+
         self.tok = AutoTokenizer.from_pretrained(self.MODEL)
         self.eos_token_id = self.tok.eos_token_id
 
@@ -180,7 +185,9 @@ class ServerEngine:
         # deque is GIL-atomic for append/popleft; pipe provides instant wakeup
         self._req_deque: collections.deque[GenerationRequest] = collections.deque()
         self._req_pipe_r, self._req_pipe_w = os.pipe()
-        os.set_blocking(self._req_pipe_r, False)  # non-blocking by default; set blocking only for idle wait
+        os.set_blocking(
+            self._req_pipe_r, False
+        )  # non-blocking by default; set blocking only for idle wait
         os.set_blocking(self._req_pipe_w, False)  # asyncio thread never blocks on write
 
         # -- engine thread state --
@@ -197,7 +204,9 @@ class ServerEngine:
         self.ref_slot_for = {p: capacity + p for p in range(capacity)}
         self.diag_slot_for = {p: 2 * capacity + p for p in range(capacity)}
 
-        self._recent_prompts: collections.deque[tuple[str, list[int]]] = collections.deque(maxlen=_PREFIX_OVERLAP_HISTORY)
+        self._recent_prompts: collections.deque[tuple[str, list[int]]] = collections.deque(
+            maxlen=_PREFIX_OVERLAP_HISTORY
+        )
 
         self.stats: dict[str, Any] = {
             "rounds": 0,
@@ -234,10 +243,16 @@ class ServerEngine:
         sys.path.insert(0, SM120_VLLM_INTEGRATION)
         import register_sm120_backend  # noqa: F401
 
-        from runtime.direct_model_runner import DirectModelRunner, build_vllm_config, _DEFAULT_PREFILL_CHUNK_SIZE
+        from runtime.direct_model_runner import (
+            _DEFAULT_PREFILL_CHUNK_SIZE,
+            DirectModelRunner,
+            build_vllm_config,
+        )
+
         self._prefill_chunk_size = _DEFAULT_PREFILL_CHUNK_SIZE
 
         from benchmarks.mtp_async_arrival_check import NEAR_TIE_LOGIT_MARGIN, _near_tie_margin_diag
+
         self._near_tie_margin_diag = _near_tie_margin_diag
         self.near_tie_logit_margin = NEAR_TIE_LOGIT_MARGIN
 
@@ -320,8 +335,11 @@ class ServerEngine:
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[dict] = loop.create_future()
         req = GenerationRequest(
-            request_id=str(uuid.uuid4()), prompt_ids=list(prompt_ids),
-            max_tokens=max_tokens, future=fut, session_id=session_id,
+            request_id=str(uuid.uuid4()),
+            prompt_ids=list(prompt_ids),
+            max_tokens=max_tokens,
+            future=fut,
+            session_id=session_id,
         )
         self._req_deque.append(req)
         try:
@@ -339,8 +357,11 @@ class ServerEngine:
         fut: asyncio.Future[dict] = loop.create_future()
         channel = StreamChannel()
         req = GenerationRequest(
-            request_id=str(uuid.uuid4()), prompt_ids=list(prompt_ids),
-            max_tokens=max_tokens, future=fut, session_id=session_id,
+            request_id=str(uuid.uuid4()),
+            prompt_ids=list(prompt_ids),
+            max_tokens=max_tokens,
+            future=fut,
+            session_id=session_id,
             stream_channel=channel,
         )
         self._req_deque.append(req)
@@ -401,7 +422,9 @@ class ServerEngine:
             for j, (_, other_prompt) in enumerate(new_prompts):
                 if j == i:
                     continue
-                same_round_best = max(same_round_best, _longest_common_prefix_len(prompt, other_prompt))
+                same_round_best = max(
+                    same_round_best, _longest_common_prefix_len(prompt, other_prompt)
+                )
             history_best = 0
             history_best_rid: str | None = None
             for other_rid, other_prompt in self._recent_prompts:
@@ -409,12 +432,15 @@ class ServerEngine:
                 if overlap > history_best:
                     history_best = overlap
                     history_best_rid = other_rid
-            self.stats["prefix_overlap_samples"].append({
-                "request_id": rid, "prompt_tokens": len(prompt),
-                "same_round_overlap_tokens": same_round_best,
-                "history_overlap_tokens": history_best,
-                "history_overlap_source": history_best_rid,
-            })
+            self.stats["prefix_overlap_samples"].append(
+                {
+                    "request_id": rid,
+                    "prompt_tokens": len(prompt),
+                    "same_round_overlap_tokens": same_round_best,
+                    "history_overlap_tokens": history_best,
+                    "history_overlap_source": history_best_rid,
+                }
+            )
             if len(self.stats["prefix_overlap_samples"]) > _PREFIX_OVERLAP_SAMPLES_KEPT:
                 self.stats["prefix_overlap_samples"].pop(0)
             if same_round_best >= self.block_size:
@@ -439,7 +465,9 @@ class ServerEngine:
             else:
                 self.stats["prefix_cache_misses"] += 1
         total = self.stats["prefix_cache_hits"] + self.stats["prefix_cache_misses"]
-        self.stats["prefix_cache_hit_rate"] = (self.stats["prefix_cache_hits"] / total) if total else 0.0
+        self.stats["prefix_cache_hit_rate"] = (
+            (self.stats["prefix_cache_hits"] / total) if total else 0.0
+        )
 
     def _expire_retained_slots(self) -> None:
         now = time.perf_counter()
@@ -461,7 +489,9 @@ class ServerEngine:
                 logger.exception("reset_slot(%d) failed releasing session %s", ret["slot"], sid)
 
     # -- slot lifecycle (engine thread) --------------------------------------
-    def _activate_slot(self, slot: int, req: GenerationRequest, anchor: int, drafts: list[int]) -> None:
+    def _activate_slot(
+        self, slot: int, req: GenerationRequest, anchor: int, drafts: list[int]
+    ) -> None:
         if not self.production:
             self._admission_bootstrap_check(slot, req, anchor)
 
@@ -474,13 +504,20 @@ class ServerEngine:
         if req.stream_channel is not None:
             self._stream_put(req.stream_channel, [anchor])
         if len(committed_tokens) >= req.max_tokens:
-            self._finish_request(slot, req, committed_tokens=committed_tokens, finish_reason="length")
+            self._finish_request(
+                slot, req, committed_tokens=committed_tokens, finish_reason="length"
+            )
             return
         self.active[slot] = {
-            "req": req, "anchor": anchor, "drafts": drafts, "committed_tokens": committed_tokens,
+            "req": req,
+            "anchor": anchor,
+            "drafts": drafts,
+            "committed_tokens": committed_tokens,
         }
 
-    def _finish_request(self, slot: int, req: GenerationRequest, committed_tokens: list[int], finish_reason: str) -> None:
+    def _finish_request(
+        self, slot: int, req: GenerationRequest, committed_tokens: list[int], finish_reason: str
+    ) -> None:
         result = {
             "committed_token_ids": committed_tokens,
             "finish_reason": finish_reason,
@@ -586,13 +623,20 @@ class ServerEngine:
                     self.waiting.insert(0, req)
                     continue
                 self.stats["session_warm_continuations"] += 1
-                self.stats["session_warm_continuation_samples"].append({
-                    "request_id": req.request_id, "session_id": req.session_id,
-                    "slot": slot, "prior_len": prior_len,
-                    "prompt_tokens": len(req.prompt_ids),
-                    "suffix_len": len(req.prompt_ids) - prior_len,
-                })
-                if len(self.stats["session_warm_continuation_samples"]) > _SESSION_WARM_CONTINUATION_SAMPLES_KEPT:
+                self.stats["session_warm_continuation_samples"].append(
+                    {
+                        "request_id": req.request_id,
+                        "session_id": req.session_id,
+                        "slot": slot,
+                        "prior_len": prior_len,
+                        "prompt_tokens": len(req.prompt_ids),
+                        "suffix_len": len(req.prompt_ids) - prior_len,
+                    }
+                )
+                if (
+                    len(self.stats["session_warm_continuation_samples"])
+                    > _SESSION_WARM_CONTINUATION_SAMPLES_KEPT
+                ):
                     self.stats["session_warm_continuation_samples"].pop(0)
                 self._activate_slot(slot, req, res["anchor"], res["draft_tokens"])
 

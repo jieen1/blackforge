@@ -10,7 +10,12 @@ Sends 10 scenarios (5 OpenAI + 5 Anthropic) covering:
 Records complete raw JSON (non-stream) or raw SSE event list (stream).
 Usage: python3 tests/format_audit.py --base-url URL --output FILE
 """
-import argparse, json, sys, time, requests
+
+import argparse
+import json
+import time
+
+import requests
 
 WEATHER_TOOL_OAI = {
     "type": "function",
@@ -97,11 +102,25 @@ SCENARIOS = [
             "model": "qwen3.6",
             "messages": [
                 {"role": "user", "content": "What is the weather in Paris?"},
-                {"role": "assistant", "content": None, "tool_calls": [
-                    {"id": "call_0001", "type": "function",
-                     "function": {"name": "get_weather", "arguments": "{\"location\": \"Paris\"}"}}
-                ]},
-                {"role": "tool", "tool_call_id": "call_0001", "content": "Paris: 22C, sunny, light breeze"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_0001",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": '{"location": "Paris"}',
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_0001",
+                    "content": "Paris: 22C, sunny, light breeze",
+                },
                 {"role": "user", "content": "Should I bring an umbrella today?"},
             ],
             "max_tokens": 512,
@@ -169,16 +188,43 @@ SCENARIOS = [
         "body": {
             "model": "qwen3.6",
             "max_tokens": 512,
-            "system": [{"type": "text", "text": "You are a helpful weather assistant.", "cache_control": {"type": "ephemeral"}}],
+            "system": [
+                {
+                    "type": "text",
+                    "text": "You are a helpful weather assistant.",
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
             "messages": [
-                {"role": "user", "content": [{"type": "text", "text": "What is the weather in Paris?"}]},
-                {"role": "assistant", "content": [
-                    {"type": "tool_use", "id": "toolu_0001", "name": "get_weather", "input": {"location": "Paris"}}
-                ]},
-                {"role": "user", "content": [
-                    {"type": "tool_result", "tool_use_id": "toolu_0001", "content": "Paris: 22C, sunny, light breeze"}
-                ]},
-                {"role": "user", "content": [{"type": "text", "text": "Should I bring an umbrella today?"}]},
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "What is the weather in Paris?"}],
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_0001",
+                            "name": "get_weather",
+                            "input": {"location": "Paris"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_0001",
+                            "content": "Paris: 22C, sunny, light breeze",
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "Should I bring an umbrella today?"}],
+                },
             ],
         },
         "stream": False,
@@ -192,7 +238,9 @@ def record_non_stream(base_url, scenario):
     return {
         "status_code": resp.status_code,
         "headers": dict(resp.headers),
-        "body": resp.json() if resp.headers.get("content-type", "").startswith("application/json") else resp.text,
+        "body": resp.json()
+        if resp.headers.get("content-type", "").startswith("application/json")
+        else resp.text,
     }
 
 
@@ -232,11 +280,20 @@ def main():
     args = parser.parse_args()
     base = args.base_url.rstrip("/")
 
-    results = {"label": args.label, "base_url": base, "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"), "scenarios": {}}
+    results = {
+        "label": args.label,
+        "base_url": base,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "scenarios": {},
+    }
 
     for sc in SCENARIOS:
         sid = sc["id"]
-        print("  [{}/{}] {} ...".format(SCENARIOS.index(sc) + 1, len(SCENARIOS), sc["label"]), end=" ", flush=True)
+        print(
+            "  [{}/{}] {} ...".format(SCENARIOS.index(sc) + 1, len(SCENARIOS), sc["label"]),
+            end=" ",
+            flush=True,
+        )
         try:
             if sc["stream"]:
                 rec = record_stream(base, sc)
@@ -246,11 +303,11 @@ def main():
             print("OK (status={})".format(rec["status_code"]))
         except Exception as exc:
             results["scenarios"][sid] = {"error": str(exc)}
-            print("ERROR: {}".format(exc))
+            print(f"ERROR: {exc}")
 
     with open(args.output, "w") as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
-    print("\nSaved to {}".format(args.output))
+    print(f"\nSaved to {args.output}")
 
 
 if __name__ == "__main__":

@@ -131,7 +131,11 @@ def _run_numeric_equivalence() -> dict:
     import register_sm120_backend  # noqa: F401
     from transformers import AutoTokenizer
 
-    from runtime.direct_model_runner import CapturedBatchDecodeGraph, DirectModelRunner, build_vllm_config
+    from runtime.direct_model_runner import (
+        CapturedBatchDecodeGraph,
+        DirectModelRunner,
+        build_vllm_config,
+    )
 
     vllm_config = build_vllm_config(
         model=MODEL, kv_cache_dtype="fp8_e4m3", max_model_len=2048, gpu_memory_utilization=0.5

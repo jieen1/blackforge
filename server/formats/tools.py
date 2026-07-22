@@ -49,14 +49,16 @@ def format_tool_calls_openai(tool_calls: list[dict], start_id: int = 0) -> list[
     """Format parsed tool calls for OpenAI chat completion response."""
     result = []
     for i, tc in enumerate(tool_calls):
-        result.append({
-            "id": f"call_{start_id + i:04d}",
-            "type": "function",
-            "function": {
-                "name": tc["name"],
-                "arguments": json.dumps(tc["arguments"], ensure_ascii=False),
-            },
-        })
+        result.append(
+            {
+                "id": f"call_{start_id + i:04d}",
+                "type": "function",
+                "function": {
+                    "name": tc["name"],
+                    "arguments": json.dumps(tc["arguments"], ensure_ascii=False),
+                },
+            }
+        )
     return result
 
 
@@ -64,12 +66,14 @@ def format_tool_calls_anthropic(tool_calls: list[dict], start_id: int = 0) -> li
     """Format parsed tool calls as Anthropic tool_use content blocks."""
     result = []
     for i, tc in enumerate(tool_calls):
-        result.append({
-            "type": "tool_use",
-            "id": f"toolu_{start_id + i:04d}",
-            "name": tc["name"],
-            "input": tc["arguments"],
-        })
+        result.append(
+            {
+                "type": "tool_use",
+                "id": f"toolu_{start_id + i:04d}",
+                "name": tc["name"],
+                "input": tc["arguments"],
+            }
+        )
     return result
 
 
@@ -87,14 +91,16 @@ def convert_tools_to_chat_template(tools: list[dict] | None) -> list[dict] | Non
         if "function" in tool:
             converted.append(tool)
         elif "name" in tool:
-            converted.append({
-                "type": "function",
-                "function": {
-                    "name": tool["name"],
-                    "description": tool.get("description", ""),
-                    "parameters": tool.get("input_schema", tool.get("parameters", {})),
-                },
-            })
+            converted.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool["name"],
+                        "description": tool.get("description", ""),
+                        "parameters": tool.get("input_schema", tool.get("parameters", {})),
+                    },
+                }
+            )
         else:
             converted.append(tool)
     return converted
@@ -102,7 +108,7 @@ def convert_tools_to_chat_template(tools: list[dict] | None) -> list[dict] | Non
 
 # -- Streaming tool-call detection ------------------------------------------
 
-_TOOL_CALL_OPEN = chr(60) + 'tool_call' + chr(62)
+_TOOL_CALL_OPEN = chr(60) + "tool_call" + chr(62)
 
 
 def find_tool_call_start(text: str) -> int:

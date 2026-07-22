@@ -152,7 +152,7 @@ def main():
               f"  live_delta={e['delta_mib']:>10.1f} MiB")
 
     print(f"\nanchors returned: {[result[s]['anchor'] for s in slots]}")
-    print(f"\n=== post-run GPU check (process still alive) ===")
+    print("\n=== post-run GPU check (process still alive) ===")
     print(f"nvidia-smi memory.used: {_nvidia_smi_mib()} MiB")
 
 

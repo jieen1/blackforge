@@ -14,18 +14,18 @@ Design principle: app.py handles routing and engine interaction only.
 All format parsing/serialization lives in this package.
 """
 
+from server.formats import anthropic as anthropic_format
+from server.formats import openai as openai_format
+from server.formats.content import extract_blocks, extract_text
+from server.formats.stream import StreamProcessor
 from server.formats.thinking import strip_thinking
-from server.formats.content import extract_text, extract_blocks
 from server.formats.tools import (
-    parse_tool_calls,
-    format_tool_calls_openai,
-    format_tool_calls_anthropic,
     convert_tools_to_chat_template,
     find_tool_call_start,
+    format_tool_calls_anthropic,
+    format_tool_calls_openai,
+    parse_tool_calls,
 )
-from server.formats.stream import StreamProcessor
-from server.formats import openai as openai_format
-from server.formats import anthropic as anthropic_format
 
 __all__ = [
     "strip_thinking",

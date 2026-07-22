@@ -565,8 +565,6 @@ def _run_gpu_checks() -> dict:
     import register_sm120_backend  # noqa: F401
     from transformers import AutoTokenizer
 
-    from runtime.direct_model_runner import DirectModelRunner, build_vllm_config
-
     # Reuse the methodology helpers from the checks this gate consolidates
     # (imported lazily so a pure-import of this module stays GPU-free).
     from benchmarks.prefix_cache_eviction_check import (
@@ -578,6 +576,7 @@ def _run_gpu_checks() -> dict:
         _run_inv1_case,
         _run_inv3_mismatched_prefix,
     )
+    from runtime.direct_model_runner import DirectModelRunner, build_vllm_config
 
     vllm_config = build_vllm_config(
         model=MODEL,

@@ -1,0 +1,17 @@
+# Local pre-commit hooks: keep the repo lint-clean and formatted before
+# each commit, matching the CI gate in .github/workflows/ci.yml.
+#
+#   python -m pip install pre-commit
+#   pre-commit install
+#
+# The ruff lint hook runs repo-wide (benchmarks/ is style-relaxed via
+# pyproject per-file-ignores); the format hook is scoped to the production
+# packages, mirroring `make format`.
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.2
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+        files: '^(runtime|server|loader|model|oracle|tests|tools)/'

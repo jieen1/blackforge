@@ -4,7 +4,10 @@ state concerns), across several suffix lengths, to pinpoint whether the 10K
 warm-suffix decode degeneration is a harness artifact or a real runtime
 characteristic of the unchunked hit continue-prefill."""
 from __future__ import annotations
-import os, sys
+
+import os
+import sys
+
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)

@@ -59,14 +59,10 @@ class CheckpointIndex:
                 ) from error
         unexpected = {}
         for shard_name, header in actual_by_shard.items():
-            indexed_names = {
-                name for name, shard in self.weight_map.items() if shard == shard_name
-            }
+            indexed_names = {name for name, shard in self.weight_map.items() if shard == shard_name}
             unexpected[shard_name] = sorted(set(header) - indexed_names)
         extras = [
-            f"{shard}: {', '.join(names[:3])}"
-            for shard, names in unexpected.items()
-            if names
+            f"{shard}: {', '.join(names[:3])}" for shard, names in unexpected.items() if names
         ]
         if extras:
             raise CheckpointError(f"shard headers contain unindexed tensors: {'; '.join(extras)}")
@@ -141,8 +137,7 @@ def load_checkpoint_index(model_dir: Path) -> CheckpointIndex:
     if not isinstance(metadata, dict) or not isinstance(weight_map, dict):
         raise CheckpointError("safetensors index must contain object metadata and weight_map")
     valid_weight_map = all(
-        isinstance(name, str) and isinstance(shard, str)
-        for name, shard in weight_map.items()
+        isinstance(name, str) and isinstance(shard, str) for name, shard in weight_map.items()
     )
     if not valid_weight_map:
         raise CheckpointError("safetensors weight_map must map tensor names to shard names")

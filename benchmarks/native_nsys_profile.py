@@ -19,7 +19,6 @@ import asyncio
 import glob
 import json
 import os
-import re
 import signal
 import subprocess
 import sys
@@ -73,7 +72,7 @@ def _build_suffix(length: int) -> list[int]:
 def _find_vllm_processes(port: int) -> list[int]:
     """Find all vLLM processes related to our server."""
     result = subprocess.run(
-        ["pgrep", "-f", f"vllm"],
+        ["pgrep", "-f", "vllm"],
         capture_output=True, text=True,
     )
     pids = []
@@ -306,7 +305,7 @@ def main() -> int:
         print(f"\n--- Cold populate {CONCURRENCY}x{P} prefixes ---")
         asyncio.run(_cold_populate(port, prefixes))
 
-        print(f"\n--- Finding GPU worker process ---")
+        print("\n--- Finding GPU worker process ---")
         worker_pid = _find_gpu_worker_pid(port)
         print(f"  Worker PID: {worker_pid}")
 
@@ -336,7 +335,7 @@ def main() -> int:
         warm_result = asyncio.run(_warm_decode(port, prefixes, suffix))
         print(f"  Aggregate: {warm_result['aggregate_tok_s']:.1f} tok/s")
 
-        print(f"\n  Waiting for nsys to finish...")
+        print("\n  Waiting for nsys to finish...")
         try:
             nsys_proc.wait(timeout=args.nsys_duration + 60)
         except subprocess.TimeoutExpired:
@@ -352,7 +351,7 @@ def main() -> int:
             print(f"  nsys stderr: {stderr[:500]}")
             return 1
 
-        print(f"\n--- Parsing nsys kernel breakdown ---")
+        print("\n--- Parsing nsys kernel breakdown ---")
         csv_path = NSYS_OUTPUT + "_cuda_gpu_kern_sum.csv"
         stats_proc = subprocess.run(
             ["nsys", "stats",
@@ -369,7 +368,7 @@ def main() -> int:
                 break
 
         if not os.path.exists(csv_path):
-            print(f"ERROR: nsys stats CSV not found")
+            print("ERROR: nsys stats CSV not found")
             print(f"  stats stderr: {stats_proc.stderr[:500]}")
             return 1
 
@@ -380,11 +379,11 @@ def main() -> int:
         print(f"{'='*78}")
         print(f"Aggregate throughput: {warm_result['aggregate_tok_s']:.1f} tok/s")
         print(f"Total CUDA time captured: {kernel_analysis.get('total_cuda_ms', 0):.1f} ms")
-        print(f"\nKernel breakdown:")
+        print("\nKernel breakdown:")
         for cat, ms in kernel_analysis.get("categories", {}).items():
             pct = kernel_analysis.get("pct", {}).get(cat, 0)
             print(f"  {cat:>15s}: {ms:>10.1f} ms  ({pct:>5.1f}%)")
-        print(f"\nTop 15 kernels:")
+        print("\nTop 15 kernels:")
         for i, k in enumerate(kernel_analysis.get("top_15_kernels", [])):
             print(f"  {i+1:>2}. [{k['total_ms']:>8.1f}ms, {k['count']:>5}x] [{k['category']:>12s}] {k['name'][:80]}")
 

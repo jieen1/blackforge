@@ -3,18 +3,22 @@
 Run: python -m pytest tests/test_regression_unit.py -v
 """
 
-import pytest, sys, os, json
+import json
+import os
+import sys
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from server.formats import anthropic as anthropic_format
+from server.formats import openai as openai_format
+from server.formats.content import extract_blocks, extract_text
+from server.formats.stream import StreamProcessor
 from server.formats.thinking import strip_thinking
 from server.formats.tools import (
-    parse_tool_calls, format_tool_calls_openai, format_tool_calls_anthropic,
-    find_tool_call_start, convert_tools_to_chat_template,
+    convert_tools_to_chat_template,
+    find_tool_call_start,
+    parse_tool_calls,
 )
-from server.formats.content import extract_text, extract_blocks
-from server.formats import openai as openai_format
-from server.formats import anthropic as anthropic_format
-from server.formats.stream import StreamProcessor
 
 THINK_OPEN = chr(60) + "think" + chr(62)
 THINK_CLOSE = chr(60) + "/think" + chr(62)
@@ -68,47 +72,98 @@ class TestThinkBlockStripping:
 
 class TestOpenAIResponse:
     def test_normal(self):
-        r = openai_format.build_response(model="t", text="Hi!", finish_reason="stop", prompt_tokens=10, completion_tokens=5)
+        r = openai_format.build_response(
+            model="t", text="Hi!", finish_reason="stop", prompt_tokens=10, completion_tokens=5
+        )
         assert r["choices"][0]["message"]["content"] == "Hi!"
 
     def test_empty(self):
-        r = openai_format.build_response(model="t", text="", finish_reason="length", prompt_tokens=10, completion_tokens=100)
+        r = openai_format.build_response(
+            model="t", text="", finish_reason="length", prompt_tokens=10, completion_tokens=100
+        )
         assert r["choices"][0]["message"]["content"] == ""
 
     def test_tool_call(self):
-        text = "X " + TOOL_OPEN + FUNC_OPEN + PARAM_OPEN + "Paris" + PARAM_CLOSE + FUNC_CLOSE + TOOL_CLOSE
-        r = openai_format.build_response(model="t", text=text, finish_reason="stop", prompt_tokens=10, completion_tokens=20)
+        text = (
+            "X "
+            + TOOL_OPEN
+            + FUNC_OPEN
+            + PARAM_OPEN
+            + "Paris"
+            + PARAM_CLOSE
+            + FUNC_CLOSE
+            + TOOL_CLOSE
+        )
+        r = openai_format.build_response(
+            model="t", text=text, finish_reason="stop", prompt_tokens=10, completion_tokens=20
+        )
         assert r["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "get_weather"
         assert r["choices"][0]["finish_reason"] == "tool_calls"
 
     def test_usage(self):
-        r = openai_format.build_response(model="t", text="Hi", finish_reason="stop", prompt_tokens=10, completion_tokens=5)
+        r = openai_format.build_response(
+            model="t", text="Hi", finish_reason="stop", prompt_tokens=10, completion_tokens=5
+        )
         assert r["usage"]["total_tokens"] == 15
 
 
 class TestAnthropicResponse:
     def test_required_fields(self):
-        r = anthropic_format.build_response(model="t", text="Hi", finish_reason="stop", input_tokens=10, output_tokens=5)
-        for f in ["id","type","role","content","model","stop_reason","stop_sequence","usage"]:
+        r = anthropic_format.build_response(
+            model="t", text="Hi", finish_reason="stop", input_tokens=10, output_tokens=5
+        )
+        for f in [
+            "id",
+            "type",
+            "role",
+            "content",
+            "model",
+            "stop_reason",
+            "stop_sequence",
+            "usage",
+        ]:
             assert f in r, f"missing {f}"
 
     def test_stop_sequence_always_present(self):
         for reason in ["stop", "length"]:
-            r = anthropic_format.build_response(model="t", text="Hi", finish_reason=reason, input_tokens=5, output_tokens=3)
+            r = anthropic_format.build_response(
+                model="t", text="Hi", finish_reason=reason, input_tokens=5, output_tokens=3
+            )
             assert "stop_sequence" in r and r["stop_sequence"] is None
 
     def test_empty_text(self):
-        r = anthropic_format.build_response(model="t", text="", finish_reason="length", input_tokens=10, output_tokens=100)
+        r = anthropic_format.build_response(
+            model="t", text="", finish_reason="length", input_tokens=10, output_tokens=100
+        )
         assert len(r["content"]) >= 1
 
     def test_stop_reason_mapping(self):
-        assert anthropic_format.build_response(model="t", text="Hi", finish_reason="stop", input_tokens=1, output_tokens=1)["stop_reason"] == "end_turn"
-        assert anthropic_format.build_response(model="t", text="Hi", finish_reason="length", input_tokens=1, output_tokens=1)["stop_reason"] == "max_tokens"
+        assert (
+            anthropic_format.build_response(
+                model="t", text="Hi", finish_reason="stop", input_tokens=1, output_tokens=1
+            )["stop_reason"]
+            == "end_turn"
+        )
+        assert (
+            anthropic_format.build_response(
+                model="t", text="Hi", finish_reason="length", input_tokens=1, output_tokens=1
+            )["stop_reason"]
+            == "max_tokens"
+        )
 
 
 class TestToolCallParsing:
     def test_single(self):
-        text = "X " + TOOL_OPEN + FUNC_OPEN + PARAM_OPEN + "Paris" + PARAM_CLOSE + FUNC_CLOSE + TOOL_CLOSE
+        text = (
+            "X "
+            + TOOL_OPEN
+            + FUNC_OPEN
+            + PARAM_OPEN
+            + "Paris"
+            + PARAM_CLOSE
+            + FUNC_CLOSE
+            + TOOL_CLOSE
+        )
         vis, tools = parse_tool_calls(text)
         assert len(tools) == 1 and tools[0]["name"] == "get_weather" and TOOL_OPEN not in vis
 
@@ -142,16 +197,19 @@ class TestContentExtraction:
         assert extract_text("hello") == "hello"
 
     def test_blocks(self):
-        assert extract_text([{"type":"text","text":"A"},{"type":"text","text":"B"}]) == "A" + NL + "B"
+        assert (
+            extract_text([{"type": "text", "text": "A"}, {"type": "text", "text": "B"}])
+            == "A" + NL + "B"
+        )
 
     def test_strings(self):
-        assert extract_text(["A","B"]) == "A" + NL + "B"
+        assert extract_text(["A", "B"]) == "A" + NL + "B"
 
     def test_mixed(self):
-        assert extract_text([{"type":"text","text":"Hi"},{"type":"image"}]) == "Hi"
+        assert extract_text([{"type": "text", "text": "Hi"}, {"type": "image"}]) == "Hi"
 
     def test_extract_blocks_string(self):
-        assert extract_blocks("hi") == [{"type":"text","text":"hi"}]
+        assert extract_blocks("hi") == [{"type": "text", "text": "hi"}]
 
     def test_extract_blocks_none(self):
         assert extract_blocks(None) == []
@@ -182,71 +240,118 @@ class TestStreamProcessor:
 
 class TestAnthropicParse:
     def test_simple(self):
-        m = anthropic_format.parse_messages({"messages":[{"role":"user","content":"Hi"}]})
+        m = anthropic_format.parse_messages({"messages": [{"role": "user", "content": "Hi"}]})
         assert m[0]["content"] == "Hi"
 
     def test_system_string(self):
-        m = anthropic_format.parse_messages({"system":"Help","messages":[{"role":"user","content":"Hi"}]})
+        m = anthropic_format.parse_messages(
+            {"system": "Help", "messages": [{"role": "user", "content": "Hi"}]}
+        )
         assert m[0]["role"] == "system"
 
     def test_system_array(self):
-        m = anthropic_format.parse_messages({"system":[{"type":"text","text":"A"}],"messages":[{"role":"user","content":"Hi"}]})
+        m = anthropic_format.parse_messages(
+            {
+                "system": [{"type": "text", "text": "A"}],
+                "messages": [{"role": "user", "content": "Hi"}],
+            }
+        )
         assert "A" in m[0]["content"]
 
     def test_tool_use(self):
-        m = anthropic_format.parse_messages({"messages":[
-            {"role":"user","content":"W?"},
-            {"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"gw","input":{"l":"P"}}]},
-        ]})
-        assert [x for x in m if x["role"]=="assistant"][0]["tool_calls"][0]["function"]["name"] == "gw"
+        m = anthropic_format.parse_messages(
+            {
+                "messages": [
+                    {"role": "user", "content": "W?"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "tool_use", "id": "t1", "name": "gw", "input": {"l": "P"}}
+                        ],
+                    },
+                ]
+            }
+        )
+        assert [x for x in m if x["role"] == "assistant"][0]["tool_calls"][0]["function"][
+            "name"
+        ] == "gw"
 
     def test_tool_result(self):
-        m = anthropic_format.parse_messages({"messages":[
-            {"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"22C"}]},
-        ]})
-        assert [x for x in m if x["role"]=="tool"][0]["content"] == "22C"
+        m = anthropic_format.parse_messages(
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "22C"}],
+                    },
+                ]
+            }
+        )
+        assert [x for x in m if x["role"] == "tool"][0]["content"] == "22C"
 
 
 class TestContextCapacity:
     def test_256k_blocks_per_slot(self):
-        from server.engine import ServerEngine
         import inspect
+
+        from server.engine import ServerEngine
+
         sig = inspect.signature(ServerEngine.__init__)
         bps = sig.parameters["blocks_per_slot"].default
         bs = sig.parameters["block_size"].default
-        assert bps * bs == 262144, f"{bps}*{bs}={bps*bs} != 262144"
+        assert bps * bs == 262144, f"{bps}*{bs}={bps * bs} != 262144"
 
     def test_default_max_tokens_16384(self):
         from server.app import DEFAULT_MAX_TOKENS
+
         assert DEFAULT_MAX_TOKENS == 16384
 
 
 class TestOpenAIParse:
     def test_string(self):
-        m = openai_format.parse_chat_messages({"messages":[{"role":"user","content":"Hi"}]})
+        m = openai_format.parse_chat_messages({"messages": [{"role": "user", "content": "Hi"}]})
         assert m[0]["content"] == "Hi"
 
     def test_array(self):
-        m = openai_format.parse_chat_messages({"messages":[{"role":"user","content":[{"type":"text","text":"Hi"}]}]})
+        m = openai_format.parse_chat_messages(
+            {"messages": [{"role": "user", "content": [{"type": "text", "text": "Hi"}]}]}
+        )
         assert m[0]["content"] == "Hi"
 
     def test_tool_role(self):
-        m = openai_format.parse_chat_messages({"messages":[{"role":"tool","content":"22C","tool_call_id":"c1"}]})
+        m = openai_format.parse_chat_messages(
+            {"messages": [{"role": "tool", "content": "22C", "tool_call_id": "c1"}]}
+        )
         assert m[0]["tool_call_id"] == "c1"
 
     def test_assistant_tool_calls(self):
-        m = openai_format.parse_chat_messages({"messages":[{"role":"assistant","content":"X",
-            "tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":json.dumps({"x":1})}}]}]})
+        m = openai_format.parse_chat_messages(
+            {
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": "X",
+                        "tool_calls": [
+                            {
+                                "id": "c1",
+                                "type": "function",
+                                "function": {"name": "f", "arguments": json.dumps({"x": 1})},
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
         assert isinstance(m[0]["tool_calls"][0]["function"]["arguments"], dict)
 
 
 class TestConvertTools:
     def test_openai_passthrough(self):
-        t = [{"type":"function","function":{"name":"f","parameters":{}}}]
+        t = [{"type": "function", "function": {"name": "f", "parameters": {}}}]
         assert convert_tools_to_chat_template(t) == t
 
     def test_anthropic_converted(self):
-        t = [{"name":"f","description":"d","input_schema":{"type":"object"}}]
+        t = [{"name": "f", "description": "d", "input_schema": {"type": "object"}}]
         assert convert_tools_to_chat_template(t)[0]["type"] == "function"
 
     def test_none(self):
@@ -255,33 +360,36 @@ class TestConvertTools:
 
 class TestSSE:
     def test_openai_done(self):
-        chunks = list(openai_format.build_sse_chunks("id","m","Hi","stop",1))
+        chunks = list(openai_format.build_sse_chunks("id", "m", "Hi", "stop", 1))
         assert chunks[-1] == "data: [DONE]" + NL + NL
 
     def test_openai_finish(self):
-        chunks = list(openai_format.build_sse_chunks("id","m","Hi","stop",1))
+        chunks = list(openai_format.build_sse_chunks("id", "m", "Hi", "stop", 1))
         assert json.loads(chunks[-2][6:])["choices"][0]["finish_reason"] == "stop"
 
     def test_anthropic_stop(self):
-        evts = list(anthropic_format.build_sse_events("m","Hi","stop",10,5))
+        evts = list(anthropic_format.build_sse_events("m", "Hi", "stop", 10, 5))
         assert any("message_stop" in e for e in evts)
 
     def test_anthropic_start(self):
-        evts = list(anthropic_format.build_sse_events("m","Hi","stop",10,5))
+        evts = list(anthropic_format.build_sse_events("m", "Hi", "stop", 10, 5))
         assert evts[0].startswith("event: message_start")
-
 
 
 # ============================================================
 # <usage> metadata block stripping (model artifact from training data)
 # ============================================================
 
+
 class TestUsageStripping:
     """Regression: model generates <usage>...</usage> blocks that must not
     leak into visible content (reported via Claude Desktop sub-agent output)."""
 
     def test_paired_usage_block_stripped(self):
-        text = "Here is the answer.<usage>subagent_tokens: 53407\ntool_uses: 146\nduration_ms: 353827</usage>"
+        text = (
+            "Here is the answer.<usage>subagent_tokens: 53407\n"
+            "tool_uses: 146\nduration_ms: 353827</usage>"
+        )
         result = strip_thinking(text)
         assert "<usage>" not in result
         assert "subagent_tokens" not in result
@@ -302,7 +410,10 @@ class TestUsageStripping:
         assert "Some output." in result
 
     def test_usage_after_thinking(self):
-        text = f"{THINK_OPEN}reasoning here{THINK_CLOSE}Visible answer.<usage>duration_ms: 1000</usage>"
+        text = (
+            f"{THINK_OPEN}reasoning here{THINK_CLOSE}Visible answer."
+            f"<usage>duration_ms: 1000</usage>"
+        )
         result = strip_thinking(text)
         assert "reasoning" not in result
         assert "<usage>" not in result
@@ -323,6 +434,7 @@ class TestUsageStripping:
     def test_usage_in_openai_response(self):
         """Ensure <usage> doesn't appear in OpenAI response content."""
         from server.formats import openai as openai_format
+
         raw = "Answer here.<usage>subagent_tokens: 100</usage>"
         cleaned = strip_thinking(raw)
         resp = openai_format.build_response("test", cleaned, "stop", 10, 5)
@@ -333,6 +445,7 @@ class TestUsageStripping:
     def test_usage_in_anthropic_response(self):
         """Ensure <usage> doesn't appear in Anthropic response content."""
         from server.formats import anthropic as anthropic_format
+
         raw = "Answer here.<usage>subagent_tokens: 100</usage>"
         cleaned = strip_thinking(raw)
         resp = anthropic_format.build_response("test", cleaned, "stop", 10, 5)

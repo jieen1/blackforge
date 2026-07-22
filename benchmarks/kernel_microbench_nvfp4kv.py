@@ -10,10 +10,16 @@ Usage:
   /home/bot/.venvs/vllm/bin/python -m benchmarks.kernel_microbench_nvfp4kv --kv-len 141312 --qo-len 4
 """
 from __future__ import annotations
-import argparse, os, sys, time
+
+import argparse
+import os
+import sys
+import time
+
 os.environ.setdefault("USE_LIBUV", "0")
 import torch
 import torch.nn.functional as F
+
 sys.path.insert(0, "/home/bot/project/sm120-flash-attention/kernel")
 sys.path.insert(0, "/home/bot/project/sm120-flash-attention/kernel/tests")
 

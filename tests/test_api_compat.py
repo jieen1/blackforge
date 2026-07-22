@@ -15,6 +15,7 @@ import argparse
 import json
 import sys
 import time
+
 import requests
 
 PASS_COUNT = 0
@@ -35,7 +36,7 @@ def report(name, ok, detail=""):
     else:
         FAIL_COUNT += 1
     RESULTS.append((name, status, detail))
-    msg = "  [{}] {}".format(status, name)
+    msg = f"  [{status}] {name}"
     if detail and not ok:
         msg += " -- " + detail
     print(msg)
@@ -74,9 +75,7 @@ WEATHER_TOOL_OPENAI = {
         "description": "Get the current weather in a given location",
         "parameters": {
             "type": "object",
-            "properties": {
-                "location": {"type": "string", "description": "City name"}
-            },
+            "properties": {"location": {"type": "string", "description": "City name"}},
             "required": ["location"],
         },
     },
@@ -87,9 +86,7 @@ WEATHER_TOOL_ANTHROPIC = {
     "description": "Get the current weather in a given location",
     "input_schema": {
         "type": "object",
-        "properties": {
-            "location": {"type": "string", "description": "City name"}
-        },
+        "properties": {"location": {"type": "string", "description": "City name"}},
         "required": ["location"],
     },
 }
@@ -97,14 +94,19 @@ WEATHER_TOOL_ANTHROPIC = {
 
 # ===== OpenAI Tests =====
 
+
 def test_openai_chat(base_url):
     print("")
     print("=== OpenAI: Normal Chat (non-streaming) ===")
-    resp = requests.post(base_url + "/v1/chat/completions", json={
-        "model": "qwen3.6-rt",
-        "messages": [{"role": "user", "content": "Say hello in one word."}],
-        "max_tokens": 512,
-    }, timeout=120)
+    resp = requests.post(
+        base_url + "/v1/chat/completions",
+        json={
+            "model": "qwen3.6-rt",
+            "messages": [{"role": "user", "content": "Say hello in one word."}],
+            "max_tokens": 512,
+        },
+        timeout=120,
+    )
     report("openai chat: status 200", resp.status_code == 200, "got " + str(resp.status_code))
     if resp.status_code != 200:
         return
@@ -120,12 +122,17 @@ def test_openai_chat(base_url):
 def test_openai_chat_stream(base_url):
     print("")
     print("=== OpenAI: Normal Chat (streaming) ===")
-    resp = requests.post(base_url + "/v1/chat/completions", json={
-        "model": "qwen3.6-rt",
-        "messages": [{"role": "user", "content": "Count from 1 to 5."}],
-        "max_tokens": 512,
-        "stream": True,
-    }, timeout=120, stream=True)
+    resp = requests.post(
+        base_url + "/v1/chat/completions",
+        json={
+            "model": "qwen3.6-rt",
+            "messages": [{"role": "user", "content": "Count from 1 to 5."}],
+            "max_tokens": 512,
+            "stream": True,
+        },
+        timeout=120,
+        stream=True,
+    )
     report("openai stream: status 200", resp.status_code == 200, "got " + str(resp.status_code))
     if resp.status_code != 200:
         return
@@ -151,21 +158,29 @@ def test_openai_chat_stream(base_url):
         if fr:
             finish_reason = fr
     report("openai stream: got chunks", len(chunks) > 0, "got " + str(len(chunks)))
-    report("openai stream: has content", len(full_content) > 0, "content=" + repr(full_content[:60]))
+    report(
+        "openai stream: has content", len(full_content) > 0, "content=" + repr(full_content[:60])
+    )
     check_no_thinking_leak(full_content, "openai stream")
     check_no_tool_xml_leak(full_content, "openai stream")
-    report("openai stream: finish_reason=stop", finish_reason == "stop", "got " + str(finish_reason))
+    report(
+        "openai stream: finish_reason=stop", finish_reason == "stop", "got " + str(finish_reason)
+    )
 
 
 def test_openai_tool_call(base_url):
     print("")
     print("=== OpenAI: Tool Call (non-streaming) ===")
-    resp = requests.post(base_url + "/v1/chat/completions", json={
-        "model": "qwen3.6-rt",
-        "messages": [{"role": "user", "content": "What is the weather in Tokyo?"}],
-        "tools": [WEATHER_TOOL_OPENAI],
-        "max_tokens": 256,
-    }, timeout=120)
+    resp = requests.post(
+        base_url + "/v1/chat/completions",
+        json={
+            "model": "qwen3.6-rt",
+            "messages": [{"role": "user", "content": "What is the weather in Tokyo?"}],
+            "tools": [WEATHER_TOOL_OPENAI],
+            "max_tokens": 256,
+        },
+        timeout=120,
+    )
     report("openai tool: status 200", resp.status_code == 200, "got " + str(resp.status_code))
     if resp.status_code != 200:
         return
@@ -178,18 +193,24 @@ def test_openai_tool_call(base_url):
     if tool_calls:
         report("openai tool: has tool_calls", True)
         tc = tool_calls[0]
-        report("openai tool: has function name", "name" in tc.get("function", {}),
-               "tc=" + json.dumps(tc)[:100])
+        report(
+            "openai tool: has function name",
+            "name" in tc.get("function", {}),
+            "tc=" + json.dumps(tc)[:100],
+        )
         fr = data["choices"][0]["finish_reason"]
         report("openai tool: finish_reason=tool_calls", fr == "tool_calls", "got " + str(fr))
         args = tc["function"].get("arguments", "{}")
         try:
-            parsed = json.loads(args) if isinstance(args, str) else args
+            if isinstance(args, str):
+                json.loads(args)
             report("openai tool: arguments valid JSON", True)
         except (json.JSONDecodeError, TypeError):
             report("openai tool: arguments valid JSON", False, "args=" + str(args)[:80])
     else:
-        report("openai tool: has tool_calls", False, "no tool_calls (model may not have called tool)")
+        report(
+            "openai tool: has tool_calls", False, "no tool_calls (model may not have called tool)"
+        )
         fr = data["choices"][0]["finish_reason"]
         report("openai tool: finish_reason", fr in ("stop", "tool_calls"), "got " + str(fr))
 
@@ -197,14 +218,21 @@ def test_openai_tool_call(base_url):
 def test_openai_tool_call_stream(base_url):
     print("")
     print("=== OpenAI: Tool Call (streaming) ===")
-    resp = requests.post(base_url + "/v1/chat/completions", json={
-        "model": "qwen3.6-rt",
-        "messages": [{"role": "user", "content": "What is the weather in Beijing?"}],
-        "tools": [WEATHER_TOOL_OPENAI],
-        "max_tokens": 256,
-        "stream": True,
-    }, timeout=120, stream=True)
-    report("openai tool stream: status 200", resp.status_code == 200, "got " + str(resp.status_code))
+    resp = requests.post(
+        base_url + "/v1/chat/completions",
+        json={
+            "model": "qwen3.6-rt",
+            "messages": [{"role": "user", "content": "What is the weather in Beijing?"}],
+            "tools": [WEATHER_TOOL_OPENAI],
+            "max_tokens": 256,
+            "stream": True,
+        },
+        timeout=120,
+        stream=True,
+    )
+    report(
+        "openai tool stream: status 200", resp.status_code == 200, "got " + str(resp.status_code)
+    )
     if resp.status_code != 200:
         return
     full_content = ""
@@ -233,12 +261,18 @@ def test_openai_tool_call_stream(base_url):
     check_no_tool_xml_leak(full_content, "openai tool stream")
     if tool_call_chunks:
         report("openai tool stream: has tool_call chunks", True)
-        report("openai tool stream: finish_reason=tool_calls", finish_reason == "tool_calls",
-               "got " + str(finish_reason))
+        report(
+            "openai tool stream: finish_reason=tool_calls",
+            finish_reason == "tool_calls",
+            "got " + str(finish_reason),
+        )
     else:
         report("openai tool stream: has tool_call chunks", False, "no tool_calls in stream")
-        report("openai tool stream: finish_reason", finish_reason in ("stop", "tool_calls"),
-               "got " + str(finish_reason))
+        report(
+            "openai tool stream: finish_reason",
+            finish_reason in ("stop", "tool_calls"),
+            "got " + str(finish_reason),
+        )
 
 
 def test_openai_multi_turn(base_url):
@@ -246,18 +280,32 @@ def test_openai_multi_turn(base_url):
     print("=== OpenAI: Multi-turn with Tool Result ===")
     messages = [
         {"role": "user", "content": "What is the weather in Paris?"},
-        {"role": "assistant", "content": None, "tool_calls": [{
-            "id": "call_0000", "type": "function",
-            "function": {"name": "get_weather", "arguments": json.dumps({"location": "Paris"})}
-        }]},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_0000",
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "arguments": json.dumps({"location": "Paris"}),
+                    },
+                }
+            ],
+        },
         {"role": "tool", "tool_call_id": "call_0000", "content": "Paris: 22C, sunny"},
         {"role": "user", "content": "Should I bring an umbrella?"},
     ]
-    resp = requests.post(base_url + "/v1/chat/completions", json={
-        "model": "qwen3.6-rt",
-        "messages": messages,
-        "max_tokens": 512,
-    }, timeout=120)
+    resp = requests.post(
+        base_url + "/v1/chat/completions",
+        json={
+            "model": "qwen3.6-rt",
+            "messages": messages,
+            "max_tokens": 512,
+        },
+        timeout=120,
+    )
     report("openai multi-turn: status 200", resp.status_code == 200, "got " + str(resp.status_code))
     if resp.status_code != 200:
         return
@@ -270,14 +318,19 @@ def test_openai_multi_turn(base_url):
 
 # ===== Anthropic Tests =====
 
+
 def test_anthropic_chat(base_url):
     print("")
     print("=== Anthropic: Normal Chat (non-streaming) ===")
-    resp = requests.post(base_url + "/v1/messages", json={
-        "model": "qwen3.6-rt",
-        "max_tokens": 512,
-        "messages": [{"role": "user", "content": "Say hello in one word."}],
-    }, timeout=120)
+    resp = requests.post(
+        base_url + "/v1/messages",
+        json={
+            "model": "qwen3.6-rt",
+            "max_tokens": 512,
+            "messages": [{"role": "user", "content": "Say hello in one word."}],
+        },
+        timeout=120,
+    )
     report("anthropic chat: status 200", resp.status_code == 200, "got " + str(resp.status_code))
     if resp.status_code != 200:
         return
@@ -294,12 +347,17 @@ def test_anthropic_chat(base_url):
 def test_anthropic_chat_stream(base_url):
     print("")
     print("=== Anthropic: Normal Chat (streaming) ===")
-    resp = requests.post(base_url + "/v1/messages", json={
-        "model": "qwen3.6-rt",
-        "max_tokens": 512,
-        "stream": True,
-        "messages": [{"role": "user", "content": "Count from 1 to 5."}],
-    }, timeout=120, stream=True)
+    resp = requests.post(
+        base_url + "/v1/messages",
+        json={
+            "model": "qwen3.6-rt",
+            "max_tokens": 512,
+            "stream": True,
+            "messages": [{"role": "user", "content": "Count from 1 to 5."}],
+        },
+        timeout=120,
+        stream=True,
+    )
     report("anthropic stream: status 200", resp.status_code == 200, "got " + str(resp.status_code))
     if resp.status_code != 200:
         return
@@ -326,18 +384,26 @@ def test_anthropic_chat_stream(base_url):
     report("anthropic stream: has content", len(full_text) > 0, "text=" + repr(full_text[:60]))
     check_no_thinking_leak(full_text, "anthropic stream")
     check_no_tool_xml_leak(full_text, "anthropic stream")
-    report("anthropic stream: stop_reason=end_turn", stop_reason == "end_turn", "got " + str(stop_reason))
+    report(
+        "anthropic stream: stop_reason=end_turn",
+        stop_reason == "end_turn",
+        "got " + str(stop_reason),
+    )
 
 
 def test_anthropic_tool_call(base_url):
     print("")
     print("=== Anthropic: Tool Call (non-streaming) ===")
-    resp = requests.post(base_url + "/v1/messages", json={
-        "model": "qwen3.6-rt",
-        "max_tokens": 256,
-        "tools": [WEATHER_TOOL_ANTHROPIC],
-        "messages": [{"role": "user", "content": "What is the weather in Tokyo?"}],
-    }, timeout=120)
+    resp = requests.post(
+        base_url + "/v1/messages",
+        json={
+            "model": "qwen3.6-rt",
+            "max_tokens": 256,
+            "tools": [WEATHER_TOOL_ANTHROPIC],
+            "messages": [{"role": "user", "content": "What is the weather in Tokyo?"}],
+        },
+        timeout=120,
+    )
     report("anthropic tool: status 200", resp.status_code == 200, "got " + str(resp.status_code))
     if resp.status_code != 200:
         return
@@ -361,14 +427,21 @@ def test_anthropic_tool_call(base_url):
 def test_anthropic_tool_call_stream(base_url):
     print("")
     print("=== Anthropic: Tool Call (streaming) ===")
-    resp = requests.post(base_url + "/v1/messages", json={
-        "model": "qwen3.6-rt",
-        "max_tokens": 256,
-        "stream": True,
-        "tools": [WEATHER_TOOL_ANTHROPIC],
-        "messages": [{"role": "user", "content": "What is the weather in Beijing?"}],
-    }, timeout=120, stream=True)
-    report("anthropic tool stream: status 200", resp.status_code == 200, "got " + str(resp.status_code))
+    resp = requests.post(
+        base_url + "/v1/messages",
+        json={
+            "model": "qwen3.6-rt",
+            "max_tokens": 256,
+            "stream": True,
+            "tools": [WEATHER_TOOL_ANTHROPIC],
+            "messages": [{"role": "user", "content": "What is the weather in Beijing?"}],
+        },
+        timeout=120,
+        stream=True,
+    )
+    report(
+        "anthropic tool stream: status 200", resp.status_code == 200, "got " + str(resp.status_code)
+    )
     if resp.status_code != 200:
         return
     full_text = ""
@@ -405,14 +478,22 @@ def test_anthropic_tool_call_stream(base_url):
     check_no_tool_xml_leak(full_text, "anthropic tool stream")
     if tool_use_blocks:
         report("anthropic tool stream: has tool_use blocks", True)
-        report("anthropic tool stream: stop_reason=tool_use", stop_reason == "tool_use",
-               "got " + str(stop_reason))
+        report(
+            "anthropic tool stream: stop_reason=tool_use",
+            stop_reason == "tool_use",
+            "got " + str(stop_reason),
+        )
         tb = tool_use_blocks[0]
         try:
-            parsed = json.loads(tb["input_json"]) if tb["input_json"] else {}
+            if tb["input_json"]:
+                json.loads(tb["input_json"])
             report("anthropic tool stream: input valid JSON", True)
         except (json.JSONDecodeError, TypeError):
-            report("anthropic tool stream: input valid JSON", False, "raw=" + str(tb["input_json"])[:80])
+            report(
+                "anthropic tool stream: input valid JSON",
+                False,
+                "raw=" + str(tb["input_json"])[:80],
+            )
     else:
         report("anthropic tool stream: has tool_use blocks", False, "no tool_use in stream")
 
@@ -420,21 +501,42 @@ def test_anthropic_tool_call_stream(base_url):
 def test_anthropic_multi_turn(base_url):
     print("")
     print("=== Anthropic: Multi-turn with Tool Result ===")
-    resp = requests.post(base_url + "/v1/messages", json={
-        "model": "qwen3.6-rt",
-        "max_tokens": 512,
-        "messages": [
-            {"role": "user", "content": "What is the weather in Paris?"},
-            {"role": "assistant", "content": [
-                {"type": "tool_use", "id": "toolu_0000", "name": "get_weather", "input": {"location": "Paris"}}
-            ]},
-            {"role": "user", "content": [
-                {"type": "tool_result", "tool_use_id": "toolu_0000", "content": "Paris: 22C, sunny"}
-            ]},
-            {"role": "user", "content": "Should I bring an umbrella?"},
-        ],
-    }, timeout=120)
-    report("anthropic multi-turn: status 200", resp.status_code == 200, "got " + str(resp.status_code))
+    resp = requests.post(
+        base_url + "/v1/messages",
+        json={
+            "model": "qwen3.6-rt",
+            "max_tokens": 512,
+            "messages": [
+                {"role": "user", "content": "What is the weather in Paris?"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_0000",
+                            "name": "get_weather",
+                            "input": {"location": "Paris"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_0000",
+                            "content": "Paris: 22C, sunny",
+                        }
+                    ],
+                },
+                {"role": "user", "content": "Should I bring an umbrella?"},
+            ],
+        },
+        timeout=120,
+    )
+    report(
+        "anthropic multi-turn: status 200", resp.status_code == 200, "got " + str(resp.status_code)
+    )
     if resp.status_code != 200:
         return
     data = resp.json()
@@ -448,17 +550,29 @@ def test_anthropic_multi_turn(base_url):
 def test_anthropic_array_content(base_url):
     print("")
     print("=== Anthropic: Array Content (Claude Desktop compat) ===")
-    resp = requests.post(base_url + "/v1/messages", json={
-        "model": "qwen3.6-rt",
-        "max_tokens": 512,
-        "system": [
-            {"type": "text", "text": "You are a helpful assistant.", "cache_control": {"type": "ephemeral"}}
-        ],
-        "messages": [{"role": "user", "content": [
-            {"type": "text", "text": "Say hi in one word."}
-        ]}],
-    }, timeout=120)
-    report("anthropic array content: status 200", resp.status_code == 200, "got " + str(resp.status_code))
+    resp = requests.post(
+        base_url + "/v1/messages",
+        json={
+            "model": "qwen3.6-rt",
+            "max_tokens": 512,
+            "system": [
+                {
+                    "type": "text",
+                    "text": "You are a helpful assistant.",
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "Say hi in one word."}]}
+            ],
+        },
+        timeout=120,
+    )
+    report(
+        "anthropic array content: status 200",
+        resp.status_code == 200,
+        "got " + str(resp.status_code),
+    )
     if resp.status_code != 200:
         report("anthropic array content: response", False, resp.text[:200])
         return
@@ -498,7 +612,7 @@ def main():
     print("")
     print("=" * 60)
     total = PASS_COUNT + FAIL_COUNT
-    print("RESULTS: {} passed, {} failed, {} total".format(PASS_COUNT, FAIL_COUNT, total))
+    print(f"RESULTS: {PASS_COUNT} passed, {FAIL_COUNT} failed, {total} total")
     if FAIL_COUNT > 0:
         print("")
         print("Failed tests:")

@@ -6,7 +6,6 @@ saves results in evalplus jsonl format for evaluation.
 import asyncio
 import json
 import os
-import sys
 import time
 
 import aiohttp
@@ -99,7 +98,7 @@ def main():
     parser.add_argument("--concurrency", type=int, default=CONCURRENCY)
     args = parser.parse_args()
 
-    print(f"Loading HumanEval+ dataset...")
+    print("Loading HumanEval+ dataset...")
     dataset = get_human_eval_plus()
     print(f"  {len(dataset)} problems loaded")
     print(f"Target: {args.base_url} model={args.model}")

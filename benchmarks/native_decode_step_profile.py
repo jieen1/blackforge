@@ -159,7 +159,7 @@ def main() -> int:
     print(f"\n--- Profiled warm decode ({NUM_PROFILER_STEPS} steps under torch.profiler) ---")
     warm_prompts2 = [p + suffix for p in prefixes]
 
-    from torch.profiler import profile, ProfilerActivity
+    from torch.profiler import ProfilerActivity, profile
     torch.cuda.synchronize()
 
     with profile(
@@ -180,11 +180,11 @@ def main() -> int:
     print(f"{'='*78}")
     print(f"Warm throughput: {total_tokens/warm_time:.1f} tok/s")
     print(f"Total CUDA time (profiled): {profiler_analysis['total_cuda_ms']:.1f} ms")
-    print(f"\nKernel breakdown:")
+    print("\nKernel breakdown:")
     for cat, ms in profiler_analysis["categories"].items():
         pct = profiler_analysis["pct"][cat]
         print(f"  {cat:>15s}: {ms:>10.1f} ms  ({pct:>5.1f}%)")
-    print(f"\nTop 15 kernels:")
+    print("\nTop 15 kernels:")
     for i, k in enumerate(profiler_analysis["top_15_kernels"]):
         print(f"  {i+1:>2}. [{k['total_ms']:>8.1f}ms, {k['count']:>5}x] [{k['category']:>12s}] {k['name'][:80]}")
 

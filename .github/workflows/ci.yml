@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dev dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+
+      - name: Ruff lint (whole repo)
+        run: python -m ruff check .
+
+      - name: Ruff format check (production packages)
+        run: python -m ruff format --check runtime server loader model oracle tests tools
+
+      # Unit tests are CPU-only; torch-dependent tests (test_tensor_reader,
+      # test_capture_hooks) self-skip via pytest.importorskip when torch is
+      # absent, so no GPU or CUDA wheel is needed here.
+      - name: Unit tests (CPU-only)
+        run: python -m pytest -q

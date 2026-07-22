@@ -25,7 +25,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
-import numpy as np
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.engine.arg_utils import EngineArgs
 from vllm.forward_context import set_forward_context
@@ -422,7 +421,9 @@ class BlockPool:
             if block_id < self.reserved:
                 raise RuntimeError(f"INV7 violation: attempted to free reserved block {block_id}")
             if block_id >= self.num_blocks:
-                raise RuntimeError(f"block {block_id} is out of range (num_blocks={self.num_blocks})")
+                raise RuntimeError(
+                    f"block {block_id} is out of range (num_blocks={self.num_blocks})"
+                )
             block = self.blocks[block_id]
             if block.ref_cnt <= 0:
                 raise RuntimeError(f"double-free of block {block_id} (ref_cnt={block.ref_cnt})")
@@ -510,7 +511,9 @@ class BlockPool:
             if block_id < self.reserved:
                 raise RuntimeError(f"INV7 violation: attempted to touch reserved block {block_id}")
             if block_id >= self.num_blocks:
-                raise RuntimeError(f"block {block_id} is out of range (num_blocks={self.num_blocks})")
+                raise RuntimeError(
+                    f"block {block_id} is out of range (num_blocks={self.num_blocks})"
+                )
             block = self.blocks[block_id]
             if block.ref_cnt == 0:
                 # Parked in the free queue (a freed-but-published block):
@@ -605,9 +608,7 @@ def profile_kv_cache_blocks(
     num_kv_heads = any_attn.num_kv_heads
     head_size = any_attn.head_size
     cache_dtype_str = vllm_config.cache_config.cache_dtype
-    shape = backend_cls.get_kv_cache_shape(
-        1, block_size, num_kv_heads, head_size, cache_dtype_str
-    )
+    shape = backend_cls.get_kv_cache_shape(1, block_size, num_kv_heads, head_size, cache_dtype_str)
     torch_dtype = any_attn.kv_cache_torch_dtype
     elem_size = torch.tensor([], dtype=torch_dtype).element_size()
     per_block_elems = 1
@@ -671,7 +672,9 @@ def allocate_fixed_slot_kv_caches(
         conv_shape, ssm_shape = layer.get_state_shape()
         conv_dtype, ssm_dtype = layer.get_state_dtype()
         total_physical_slots = num_slots + RESERVED_PHYSICAL_SLOTS
-        conv_state = torch.zeros((total_physical_slots, *conv_shape), dtype=conv_dtype, device=device)
+        conv_state = torch.zeros(
+            (total_physical_slots, *conv_shape), dtype=conv_dtype, device=device
+        )
         # Phase 2 (2026-07-18): SSM/recurrent state gets num_speculative_tokens
         # EXTRA dedicated rows per physical slot -- one per non-anchor MTP
         # candidate position -- on top of the ordinary one row per physical
@@ -732,9 +735,7 @@ def build_attention_metadata(
     qo_indptr = torch.tensor([0, num_new_tokens], dtype=torch.int32, device=device)
     kv_page_indptr = torch.tensor([0, num_pages], dtype=torch.int32, device=device)
     if block_table is not None:
-        kv_page_indices = torch.tensor(
-            block_table[:num_pages], dtype=torch.int32, device=device
-        )
+        kv_page_indices = torch.tensor(block_table[:num_pages], dtype=torch.int32, device=device)
     else:
         kv_page_indices = torch.arange(
             first_block, first_block + num_pages, dtype=torch.int32, device=device
@@ -1018,10 +1019,15 @@ def build_attention_metadata_batch(
             for slot, num_pages in zip(slots, num_pages_per_req)
         ]
     kv_page_indices = (
-        torch.cat(page_index_chunks) if page_index_chunks else torch.empty(0, dtype=torch.int32, device=device)
+        torch.cat(page_index_chunks)
+        if page_index_chunks
+        else torch.empty(0, dtype=torch.int32, device=device)
     )
     kv_last_page_len = torch.tensor(
-        [kv_len - (num_pages - 1) * page_size for kv_len, num_pages in zip(new_kv_lens, num_pages_per_req)],
+        [
+            kv_len - (num_pages - 1) * page_size
+            for kv_len, num_pages in zip(new_kv_lens, num_pages_per_req)
+        ],
         dtype=torch.int32,
         device=device,
     )
@@ -1042,7 +1048,9 @@ def build_attention_metadata_batch(
         max_num_splits = 1
 
     max_qo_len = max(qo_lens) if qo_lens else 0
-    decode_qo_len = max_qo_len if (is_decode and is_uniform and max_qo_len <= _MAX_DECODE_QO_LEN) else 0
+    decode_qo_len = (
+        max_qo_len if (is_decode and is_uniform and max_qo_len <= _MAX_DECODE_QO_LEN) else 0
+    )
     return SM120GQAMetadata(
         num_actual_tokens=sum(qo_lens),
         num_reqs=num_reqs,
@@ -1276,11 +1284,13 @@ def _install_triton_norm_ops_once() -> None:
     IR op priorities via KernelConfig.ir_op_priority.set_priority()."""
     try:
         from runtime.triton_norm_ops import install_triton_norm_ops
+
         install_triton_norm_ops()
     except Exception:
         pass
     try:
         from runtime.gemma_norm_patch import patch_gemma_rms_norm
+
         patch_gemma_rms_norm()
     except Exception:
         pass
@@ -1383,7 +1393,11 @@ def determine_accept_reject_batch(
     # True at position p iff every position <= p matched (the greedy
     # "still on the accepted prefix" condition) -- a cumulative product
     # over bools is exactly a running AND.
-    still_matching = matches.cumprod(dim=1).bool() if k > 0 else matches.new_zeros((num_reqs, 0), dtype=torch.bool)
+    still_matching = (
+        matches.cumprod(dim=1).bool()
+        if k > 0
+        else matches.new_zeros((num_reqs, 0), dtype=torch.bool)
+    )
     num_accepted = still_matching.sum(dim=1)  # [num_reqs], int64, values 0..k
 
     # ONE combined host round-trip for the whole batch: num_accepted plus
@@ -1546,7 +1560,8 @@ class DirectModelRunner:
         self.block_table: list[list[int]] = [[] for _ in range(num_slots)]
         self._num_blocks_override = num_blocks
         _effective_num_blocks = (
-            num_blocks if num_blocks is not None
+            num_blocks
+            if num_blocks is not None
             else (num_slots + RESERVED_PHYSICAL_SLOTS) * blocks_per_slot
         )
         self.block_pool = BlockPool(
@@ -1572,8 +1587,8 @@ class DirectModelRunner:
         # half is reserved warmup capacity, never touched by real request
         # traffic) -- see ``_get_verify_graph``.
         self.enable_cudagraph = enable_cudagraph
-        self._verify_graphs: dict[tuple[int, int], "CapturedBatchDecodeGraph"] = {}
-        self._draft_step_graphs: dict[tuple[int, int], "CapturedMTPDraftStepGraph"] = {}
+        self._verify_graphs: dict[tuple[int, int], CapturedBatchDecodeGraph] = {}
+        self._draft_step_graphs: dict[tuple[int, int], CapturedMTPDraftStepGraph] = {}
 
         with set_current_vllm_config(vllm_config):
             init_method = get_distributed_init_method("127.0.0.1", get_open_port())
@@ -1779,7 +1794,9 @@ class DirectModelRunner:
             for qo_len in range(1, self.num_speculative_tokens + 2):
                 self._get_draft_step_graph(batch_size, qo_len)
 
-    def _get_draft_step_graph(self, batch_size: int, qo_len: int = 1) -> "CapturedMTPDraftStepGraph | None":
+    def _get_draft_step_graph(
+        self, batch_size: int, qo_len: int = 1
+    ) -> CapturedMTPDraftStepGraph | None:
         """Lazily construct + capture (and cache, keyed by
         ``(batch_size, qo_len)``) a ``CapturedMTPDraftStepGraph`` for the
         MTP draft model's qo_len=1 continuation step OR (2026-07-17,
@@ -1798,14 +1815,16 @@ class DirectModelRunner:
             graph.capture()
         else:
             warmup_slots = list(range(batch_size))
-            graph = CapturedMTPDraftStepGraph(self, batch_size=batch_size, qo_len=qo_len,
-                                              warmup_slots=warmup_slots)
+            graph = CapturedMTPDraftStepGraph(
+                self, batch_size=batch_size, qo_len=qo_len, warmup_slots=warmup_slots
+            )
             graph.capture()
         self._draft_step_graphs[key] = graph
         return graph
 
-    def precapture_cuda_graphs(self, batch_sizes: list[int] | None = None,
-                               qo_lens: list[int] | None = None) -> None:
+    def precapture_cuda_graphs(
+        self, batch_sizes: list[int] | None = None, qo_lens: list[int] | None = None
+    ) -> None:
         """Pre-capture CUDA graphs during initialization, before any real
         traffic. Uses real slots 0..batch_size-1 for warmup, then resets
         them so they are fresh for real traffic. This eliminates the need
@@ -1830,7 +1849,10 @@ class DirectModelRunner:
                 key = (bs, qo)
                 if key not in self._verify_graphs:
                     graph = CapturedBatchDecodeGraph(
-                        self, bs, qo_len=qo, warmup_slots=warmup_slots,
+                        self,
+                        bs,
+                        qo_len=qo,
+                        warmup_slots=warmup_slots,
                     )
                     graph.capture()
                     self._verify_graphs[key] = graph
@@ -1841,7 +1863,10 @@ class DirectModelRunner:
                     key = (bs, qo)
                     if key not in self._draft_step_graphs:
                         graph = CapturedMTPDraftStepGraph(
-                            self, bs, qo_len=qo, warmup_slots=warmup_slots,
+                            self,
+                            bs,
+                            qo_len=qo,
+                            warmup_slots=warmup_slots,
                         )
                         graph.capture()
                         self._draft_step_graphs[key] = graph
@@ -1850,7 +1875,7 @@ class DirectModelRunner:
                 if self.slot_kv_len[slot] != 0:
                     self.reset_slot(slot)
 
-    def _get_verify_graph(self, batch_size: int, qo_len: int) -> "CapturedBatchDecodeGraph | None":
+    def _get_verify_graph(self, batch_size: int, qo_len: int) -> CapturedBatchDecodeGraph | None:
         """Lazily construct + capture (and cache, keyed by
         ``(batch_size, qo_len)``) a ``CapturedBatchDecodeGraph`` for the
         target model's verify forward. Returns ``None`` -- a deliberate,
@@ -1892,8 +1917,9 @@ class DirectModelRunner:
                 self.reset_slot(s)
         else:
             warmup_slots = list(range(batch_size))
-            graph = CapturedBatchDecodeGraph(self, batch_size=batch_size, qo_len=qo_len,
-                                             warmup_slots=warmup_slots)
+            graph = CapturedBatchDecodeGraph(
+                self, batch_size=batch_size, qo_len=qo_len, warmup_slots=warmup_slots
+            )
             graph.capture()
         self._verify_graphs[key] = graph
         return graph
@@ -2206,14 +2232,10 @@ class DirectModelRunner:
         # Never evicts the entry about to be (re-)materialized: callers handle
         # the idempotent/stale-key cases before invoking this.
         total_bytes = sum(meta["bytes"] for meta in self.gdn_ckpt_meta.values())
-        while (
-            self.gdn_ckpt_meta
-            and total_bytes + incoming_bytes > self.gdn_checkpoint_byte_budget
-        ):
+        while self.gdn_ckpt_meta and total_bytes + incoming_bytes > self.gdn_checkpoint_byte_budget:
             lru_key = next(iter(self._gdn_ckpt_lru))
             total_bytes -= self.gdn_ckpt_meta[lru_key]["bytes"]
             self.evict_gdn_checkpoint(lru_key)
-
 
     def _ensure_blocks(self, slot: int, kv_len_needed: int) -> None:
         """P1 (notes/prefix-cache-design.md sec 5): grow
@@ -2314,9 +2336,7 @@ class DirectModelRunner:
         attn_meta = self._attention_metadata(
             slot, num_new_tokens=num_new_tokens, is_decode=is_decode
         )
-        gdn_meta = self._gdn_metadata(
-            slot, num_new_tokens=num_new_tokens, is_decode=is_decode
-        )
+        gdn_meta = self._gdn_metadata(slot, num_new_tokens=num_new_tokens, is_decode=is_decode)
         attn_metadata_dict = {name: attn_meta for name in self.attn_layer_names}
         attn_metadata_dict.update({name: gdn_meta for name in self.gdn_layer_names})
         slot_mapping = self._slot_mapping(slot, start_pos, num_new_tokens)
@@ -3173,7 +3193,12 @@ class DirectModelRunner:
         running_prior_kv_len = self.slot_draft_sync_len[slot]
         for _ in range(1, k):
             step_logits, step_hidden = self._mtp_forward(
-                slot, [prev_token], prev_hidden, next_pos, prior_kv_len=running_prior_kv_len, is_decode=True
+                slot,
+                [prev_token],
+                prev_hidden,
+                next_pos,
+                prior_kv_len=running_prior_kv_len,
+                is_decode=True,
             )
             prev_token = int(step_logits[-1].argmax(dim=-1).item())
             draft_tokens.append(prev_token)
@@ -3444,7 +3469,10 @@ class DirectModelRunner:
                 raise ValueError("token_ids must have one entry per slot when qo_len == 1")
             flat_token_ids = token_ids
         else:
-            if not (len(token_ids) == num_reqs and all(len(t) == qo for t, qo in zip(token_ids, qo_lens))):
+            if not (
+                len(token_ids) == num_reqs
+                and all(len(t) == qo for t, qo in zip(token_ids, qo_lens))
+            ):
                 raise ValueError("every slot's token_ids must have exactly qo_len[i] entries")
             flat_token_ids = [tok for slot_tokens in token_ids for tok in slot_tokens]
 
@@ -3557,7 +3585,9 @@ class DirectModelRunner:
         draft_step_graph = self._get_draft_step_graph(num_reqs) if self.enable_cudagraph else None
         for _ in range(1, k):
             if draft_step_graph is not None:
-                step_logits, step_hidden = draft_step_graph.replay_incremental(slots, prev_tokens, prev_hidden, running_prior_kv_len)
+                step_logits, step_hidden = draft_step_graph.replay_incremental(
+                    slots, prev_tokens, prev_hidden, running_prior_kv_len
+                )
             else:
                 step_logits, step_hidden = self._mtp_forward_batch(
                     slots,
@@ -3641,12 +3671,18 @@ class DirectModelRunner:
         """
         num_reqs = len(slots)
         if not (len(shifted_input_ids_per_slot) == num_reqs and len(start_pos_list) == num_reqs):
-            raise ValueError("slots/shifted_input_ids_per_slot/start_pos_list must have equal length")
-        num_new_tokens_list = [num_new_tokens] * num_reqs if isinstance(num_new_tokens, int) else list(num_new_tokens)
+            raise ValueError(
+                "slots/shifted_input_ids_per_slot/start_pos_list must have equal length"
+            )
+        num_new_tokens_list = (
+            [num_new_tokens] * num_reqs if isinstance(num_new_tokens, int) else list(num_new_tokens)
+        )
         if len(num_new_tokens_list) != num_reqs:
             raise ValueError("num_new_tokens list must have exactly one entry per slot")
         if not all(len(t) == n for t, n in zip(shifted_input_ids_per_slot, num_new_tokens_list)):
-            raise ValueError("every slot's shifted_input_ids must have exactly num_new_tokens[i] entries")
+            raise ValueError(
+                "every slot's shifted_input_ids must have exactly num_new_tokens[i] entries"
+            )
 
         prior_kv_lens_step0 = [self.slot_draft_sync_len[s] for s in slots]
         # 2026-07-17, Phase 3 round 2: step 0 (resync) is graph-capturable
@@ -3673,10 +3709,7 @@ class DirectModelRunner:
         # long prefill, which needs the general/chunked kernel instead.
         step0_graph = None
         step0_qo_len_padded = 0
-        if (
-            self.enable_cudagraph
-            and max(num_new_tokens_list) <= _MAX_DECODE_QO_LEN
-        ):
+        if self.enable_cudagraph and max(num_new_tokens_list) <= _MAX_DECODE_QO_LEN:
             step0_qo_len_padded = max(num_new_tokens_list)
             step0_graph = self._get_draft_step_graph(num_reqs, step0_qo_len_padded)
         # 2026-07-18, D1-followup fix: whether step0's OWN return is already
@@ -3704,7 +3737,9 @@ class DirectModelRunner:
             is_uniform = len(set(num_new_tokens_list)) == 1
             if is_uniform:
                 tokens_for_graph = (
-                    [t[0] for t in shifted_input_ids_per_slot] if step0_qo_len == 1 else shifted_input_ids_per_slot
+                    [t[0] for t in shifted_input_ids_per_slot]
+                    if step0_qo_len == 1
+                    else shifted_input_ids_per_slot
                 )
                 hidden_for_graph = target_hidden_states
             else:
@@ -3716,7 +3751,7 @@ class DirectModelRunner:
                     if n < step0_qo_len:
                         slot_tokens = slot_tokens + [slot_tokens[-1]] * (step0_qo_len - n)
                     tokens_for_graph.append(slot_tokens)
-                    slot_hidden = target_hidden_states[row_start:row_start + n]
+                    slot_hidden = target_hidden_states[row_start : row_start + n]
                     if n < step0_qo_len:
                         pad_rows = slot_hidden[-1:].expand(step0_qo_len - n, -1)
                         slot_hidden = torch.cat([slot_hidden, pad_rows], dim=0)
@@ -3729,7 +3764,8 @@ class DirectModelRunner:
             if not is_uniform:
                 real_last_indices = torch.tensor(
                     [i * step0_qo_len + num_new_tokens_list[i] - 1 for i in range(num_reqs)],
-                    dtype=torch.long, device=step0_logits.device,
+                    dtype=torch.long,
+                    device=step0_logits.device,
                 )
                 step0_logits = step0_logits.index_select(0, real_last_indices)
                 step0_hidden = step0_hidden.index_select(0, real_last_indices)
@@ -3779,7 +3815,9 @@ class DirectModelRunner:
             prev_hidden = step0_hidden
         else:
             last_idx_tensor = torch.tensor(
-                [row_offsets[i + 1] - 1 for i in range(num_reqs)], dtype=torch.long, device=step0_logits.device
+                [row_offsets[i + 1] - 1 for i in range(num_reqs)],
+                dtype=torch.long,
+                device=step0_logits.device,
             )
             last_logits = step0_logits.index_select(0, last_idx_tensor)
             prev_hidden = step0_hidden.index_select(0, last_idx_tensor)
@@ -3788,7 +3826,9 @@ class DirectModelRunner:
             draft_tokens[slots[i]].append(prev_tokens[i])
 
         next_pos_list = [sp + n for sp, n in zip(start_pos_list, num_new_tokens_list)]
-        running_prior_kv_len = [prior_kv_lens_step0[i] + num_new_tokens_list[i] for i in range(num_reqs)]
+        running_prior_kv_len = [
+            prior_kv_lens_step0[i] + num_new_tokens_list[i] for i in range(num_reqs)
+        ]
         # 2026-07-17, Phase 3 round 2: this loop's ``prior_kv_lens`` and
         # ``start_pos_list`` are always numerically identical here (both
         # start equal right after step 0 and both advance by exactly 1
@@ -4010,7 +4050,9 @@ class DirectModelRunner:
             if self.enable_persistent_prefix_cache:
                 for i, s in enumerate(slots):
                     self._publish_committed_blocks(s, prompts_per_slot[i], prompt_lens[i])
-            return {s: {"anchor": anchors[s], "draft_tokens": draft_tokens_by_slot[s]} for s in slots}
+            return {
+                s: {"anchor": anchors[s], "draft_tokens": draft_tokens_by_slot[s]} for s in slots
+            }
 
         if not needs_chunking:
             # NEW (2026-07-19, continuous-batching round): genuinely ragged
@@ -4065,7 +4107,9 @@ class DirectModelRunner:
             if self.enable_persistent_prefix_cache:
                 for i, s in enumerate(slots):
                     self._publish_committed_blocks(s, prompts_per_slot[i], prompt_lens[i])
-            return {s: {"anchor": anchors[s], "draft_tokens": draft_tokens_by_slot[s]} for s in slots}
+            return {
+                s: {"anchor": anchors[s], "draft_tokens": draft_tokens_by_slot[s]} for s in slots
+            }
 
         # Chunked path (2026-07-19). Processes the prompt in
         # ``ceil(prompt_len / chunk_size)`` sequential pieces. Each chunk's
@@ -4094,7 +4138,9 @@ class DirectModelRunner:
             running_kv_len = self.slot_kv_len[slots[0]]
             target_logits_chunk, target_hidden_chunk = self._forward_batch(
                 slots,
-                chunk_tokens_per_slot if this_chunk_len > 1 else [p[0] for p in chunk_tokens_per_slot],
+                chunk_tokens_per_slot
+                if this_chunk_len > 1
+                else [p[0] for p in chunk_tokens_per_slot],
                 [running_kv_len] * num_reqs,
                 qo_len=this_chunk_len,
                 commit=True,
@@ -4130,7 +4176,9 @@ class DirectModelRunner:
                 # real fixture/chunk-size combination this round uses
                 # divides evenly, so this is a defensive correctness
                 # guard, not something exercised by today's measurements.
-                shifted_chunk_per_slot if this_chunk_len > 1 else [t[0] for t in shifted_chunk_per_slot],
+                shifted_chunk_per_slot
+                if this_chunk_len > 1
+                else [t[0] for t in shifted_chunk_per_slot],
                 target_hidden_chunk,
                 [running_draft_len] * num_reqs,
                 [running_draft_len] * num_reqs,
@@ -4188,7 +4236,12 @@ class DirectModelRunner:
         next_pos_list = [self.slot_draft_sync_len[s] for s in slots]
         running_prior_kv_len = [self.slot_draft_sync_len[s] for s in slots]
         self._mtp_run_continuation_steps(
-            slots, draft_tokens, prev_tokens, step0_hidden, next_pos_list, running_prior_kv_len,
+            slots,
+            draft_tokens,
+            prev_tokens,
+            step0_hidden,
+            next_pos_list,
+            running_prior_kv_len,
             self.num_speculative_tokens,
         )
         for s in slots:
@@ -4669,8 +4722,14 @@ class DirectModelRunner:
         g = ((prompt_len - 1) // self.block_size) * self.block_size
         if g >= self.block_size:
             phase1_logits, phase1_hidden = self._forward_batch(
-                [slot], [prompt[:g]], [0], qo_len=g, commit=True,
-                return_hidden=True, is_decode=False, logits_last_position_only=True,
+                [slot],
+                [prompt[:g]],
+                [0],
+                qo_len=g,
+                commit=True,
+                return_hidden=True,
+                is_decode=False,
+                logits_last_position_only=True,
             )
             self._publish_committed_blocks(slot, prompt, g)
             num_g_blocks = g // self.block_size
@@ -4685,14 +4744,23 @@ class DirectModelRunner:
             suffix_logits, suffix_hidden = self._forward_batch(
                 [slot],
                 [suffix_tokens] if suffix_len > 1 else [suffix_tokens[0]],
-                [g], qo_len=suffix_len, commit=True,
-                return_hidden=True, is_decode=False, logits_last_position_only=True,
+                [g],
+                qo_len=suffix_len,
+                commit=True,
+                return_hidden=True,
+                is_decode=False,
+                logits_last_position_only=True,
             )
             anchor = int(suffix_logits[0].argmax(dim=-1).item())
             hidden = torch.cat([phase1_hidden, suffix_hidden], dim=0)
             draft_tokens_by_slot = self._mtp_sync_and_propose_batch(
-                [slot], [prompt[1:] + [anchor]], hidden, [0],
-                num_new_tokens=prompt_len, k=k, step0_logits_last_position_only=True,
+                [slot],
+                [prompt[1:] + [anchor]],
+                hidden,
+                [0],
+                num_new_tokens=prompt_len,
+                k=k,
+                step0_logits_last_position_only=True,
             )
             self._publish_committed_blocks(slot, prompt, prompt_len)
             self.slot_pending_draft_tokens[slot] = draft_tokens_by_slot[slot]
@@ -4704,13 +4772,22 @@ class DirectModelRunner:
         target_logits, target_hidden = self._forward_batch(
             [slot],
             [prompt] if prompt_len > 1 else [prompt[0]],
-            [0], qo_len=prompt_len, commit=True,
-            return_hidden=True, is_decode=False, logits_last_position_only=True,
+            [0],
+            qo_len=prompt_len,
+            commit=True,
+            return_hidden=True,
+            is_decode=False,
+            logits_last_position_only=True,
         )
         anchor = int(target_logits[0].argmax(dim=-1).item())
         draft_tokens_by_slot = self._mtp_sync_and_propose_batch(
-            [slot], [prompt[1:] + [anchor]], target_hidden, [0],
-            num_new_tokens=prompt_len, k=k, step0_logits_last_position_only=True,
+            [slot],
+            [prompt[1:] + [anchor]],
+            target_hidden,
+            [0],
+            num_new_tokens=prompt_len,
+            k=k,
+            step0_logits_last_position_only=True,
         )
         self._publish_committed_blocks(slot, prompt, prompt_len)
         self.slot_pending_draft_tokens[slot] = draft_tokens_by_slot[slot]
@@ -4734,13 +4811,22 @@ class DirectModelRunner:
         suffix_logits, suffix_hidden = self._forward_batch(
             [slot],
             [suffix_tokens] if suffix_len > 1 else [suffix_tokens[0]],
-            [L], qo_len=suffix_len, commit=True,
-            return_hidden=True, is_decode=False, logits_last_position_only=True,
+            [L],
+            qo_len=suffix_len,
+            commit=True,
+            return_hidden=True,
+            is_decode=False,
+            logits_last_position_only=True,
         )
         anchor = int(suffix_logits[0].argmax(dim=-1).item())
         draft_tokens_by_slot = self._mtp_sync_and_propose_batch(
-            [slot], [prompt[L + 1 :] + [anchor]], suffix_hidden, [L],
-            num_new_tokens=suffix_len, k=k, step0_logits_last_position_only=True,
+            [slot],
+            [prompt[L + 1 :] + [anchor]],
+            suffix_hidden,
+            [L],
+            num_new_tokens=suffix_len,
+            k=k,
+            step0_logits_last_position_only=True,
         )
         # Publish the suffix's full committed blocks (attention) so future
         # longer requests can hit deeper. The GDN checkpoint at the new
@@ -4798,13 +4884,22 @@ class DirectModelRunner:
         suffix_logits, suffix_hidden = self._forward_batch(
             [slot],
             [suffix_tokens] if suffix_len > 1 else [suffix_tokens[0]],
-            [prior_len], qo_len=suffix_len, commit=True,
-            return_hidden=True, is_decode=False, logits_last_position_only=True,
+            [prior_len],
+            qo_len=suffix_len,
+            commit=True,
+            return_hidden=True,
+            is_decode=False,
+            logits_last_position_only=True,
         )
         anchor = int(suffix_logits[0].argmax(dim=-1).item())
         draft_tokens_by_slot = self._mtp_sync_and_propose_batch(
-            [slot], [prompt[prior_len + 1 :] + [anchor]], suffix_hidden, [prior_len],
-            num_new_tokens=suffix_len, k=k, step0_logits_last_position_only=True,
+            [slot],
+            [prompt[prior_len + 1 :] + [anchor]],
+            suffix_hidden,
+            [prior_len],
+            num_new_tokens=suffix_len,
+            k=k,
+            step0_logits_last_position_only=True,
         )
         # Publish the suffix's full committed blocks (attention) so future longer
         # requests can hit deeper. The completion GDN checkpoint at the new boundary
@@ -4968,7 +5063,9 @@ class DirectModelRunner:
 
                     target_logits_chunk, target_hidden_chunk = self._forward_batch(
                         hit_slots,
-                        chunk_tokens_per_slot if this_chunk_len > 1 else [t[0] for t in chunk_tokens_per_slot],
+                        chunk_tokens_per_slot
+                        if this_chunk_len > 1
+                        else [t[0] for t in chunk_tokens_per_slot],
                         list(running_kv_lens),
                         qo_len=this_chunk_len,
                         commit=True,
@@ -4983,7 +5080,8 @@ class DirectModelRunner:
                         for i, s in enumerate(hit_slots):
                             anchors[s] = int(target_logits_chunk[i].argmax(dim=-1).item())
                         shifted_chunk_per_slot = [
-                            hit_prompts[i][hit_L[i] + chunk_start + 1 : hit_L[i] + suffix_len] + [anchors[hit_slots[i]]]
+                            hit_prompts[i][hit_L[i] + chunk_start + 1 : hit_L[i] + suffix_len]
+                            + [anchors[hit_slots[i]]]
                             for i in range(num_hit)
                         ]
                     else:
@@ -4994,7 +5092,9 @@ class DirectModelRunner:
 
                     draft_logits_chunk, draft_hidden_chunk = self._mtp_forward_batch(
                         hit_slots,
-                        shifted_chunk_per_slot if this_chunk_len > 1 else [t[0] for t in shifted_chunk_per_slot],
+                        shifted_chunk_per_slot
+                        if this_chunk_len > 1
+                        else [t[0] for t in shifted_chunk_per_slot],
                         target_hidden_chunk,
                         list(running_draft_lens),
                         list(running_draft_lens),
@@ -5009,10 +5109,7 @@ class DirectModelRunner:
                     if is_last_chunk:
                         step0_logits, step0_hidden = draft_logits_chunk, draft_hidden_chunk
 
-                    if (
-                        self.enable_persistent_prefix_cache
-                        and not is_last_chunk
-                    ):
+                    if self.enable_persistent_prefix_cache and not is_last_chunk:
                         for i, s in enumerate(hit_slots):
                             abs_chunk_end = hit_L[i] + chunk_end
                             if abs_chunk_end % self.block_size == 0:
@@ -5021,7 +5118,9 @@ class DirectModelRunner:
                                 self.materialize_gdn_checkpoint(
                                     s,
                                     key=self.block_table[s][num_chunk_blocks - 1],
-                                    hash_value=self.slot_block_hashes[s][num_chunk_blocks - 1].value,
+                                    hash_value=self.slot_block_hashes[s][
+                                        num_chunk_blocks - 1
+                                    ].value,
                                     num_tokens=abs_chunk_end,
                                 )
 
@@ -5029,11 +5128,19 @@ class DirectModelRunner:
 
                 assert step0_logits is not None and step0_hidden is not None
                 prev_tokens = step0_logits.argmax(dim=-1).tolist()
-                hit_drafts: dict[int, list[int]] = {s: [prev_tokens[i]] for i, s in enumerate(hit_slots)}
+                hit_drafts: dict[int, list[int]] = {
+                    s: [prev_tokens[i]] for i, s in enumerate(hit_slots)
+                }
                 next_pos_list = [self.slot_draft_sync_len[s] for s in hit_slots]
                 running_prior_kv_len = [self.slot_draft_sync_len[s] for s in hit_slots]
                 self._mtp_run_continuation_steps(
-                    hit_slots, hit_drafts, prev_tokens, step0_hidden, next_pos_list, running_prior_kv_len, k,
+                    hit_slots,
+                    hit_drafts,
+                    prev_tokens,
+                    step0_hidden,
+                    next_pos_list,
+                    running_prior_kv_len,
+                    k,
                 )
                 for i, s in enumerate(hit_slots):
                     self._publish_committed_blocks(s, hit_prompts[i], len(hit_prompts[i]))
@@ -5075,7 +5182,9 @@ class DirectModelRunner:
 
                         if is_last_chunk:
                             anchor_s = int(target_logits_chunk[0].argmax(dim=-1).item())
-                            shifted_chunk = prompt[L + chunk_start + 1 : L + suffix_len] + [anchor_s]
+                            shifted_chunk = prompt[L + chunk_start + 1 : L + suffix_len] + [
+                                anchor_s
+                            ]
                         else:
                             shifted_chunk = prompt[L + chunk_start + 1 : L + chunk_end + 1]
 
@@ -5118,7 +5227,13 @@ class DirectModelRunner:
                     next_pos_s = [self.slot_draft_sync_len[s]]
                     prior_kv_s = [self.slot_draft_sync_len[s]]
                     self._mtp_run_continuation_steps(
-                        [s], draft_tokens_s, prev_tokens_s, step0_hidden_s, next_pos_s, prior_kv_s, k,
+                        [s],
+                        draft_tokens_s,
+                        prev_tokens_s,
+                        step0_hidden_s,
+                        next_pos_s,
+                        prior_kv_s,
+                        k,
                     )
                     self._publish_committed_blocks(s, prompt, len(prompt))
                     self.slot_pending_draft_tokens[s] = draft_tokens_s[s]
@@ -5403,8 +5518,13 @@ class CapturedBatchDecodeGraph:
     further optimization, not attempted this round.
     """
 
-    def __init__(self, runner: "DirectModelRunner", batch_size: int, qo_len: int = 1,
-                 warmup_slots: list[int] | None = None) -> None:
+    def __init__(
+        self,
+        runner: DirectModelRunner,
+        batch_size: int,
+        qo_len: int = 1,
+        warmup_slots: list[int] | None = None,
+    ) -> None:
         if warmup_slots is not None:
             if len(warmup_slots) != batch_size:
                 raise ValueError(
@@ -5424,7 +5544,6 @@ class CapturedBatchDecodeGraph:
         self.batch_size = batch_size
         self.qo_len = qo_len
         device = runner.device
-        block_size = runner.block_size
         blocks_per_slot = runner.blocks_per_slot
         # 2026-07-18, Phase 2 CUDA-graph reconciliation: this class used to
         # derive its own split-KV config from a stale local
@@ -5459,16 +5578,22 @@ class CapturedBatchDecodeGraph:
         # qo_indptr is CONSTANT for a fixed (batch_size, qo_len) pair
         # ([0, qo_len, 2*qo_len, ..., num_reqs*qo_len]) -- computed once,
         # never refilled.
-        self.static_qo_indptr = torch.arange(0, num_reqs + 1, dtype=torch.int32, device=device) * qo_len
+        self.static_qo_indptr = (
+            torch.arange(0, num_reqs + 1, dtype=torch.int32, device=device) * qo_len
+        )
         self.static_kv_page_indptr = torch.zeros(num_reqs + 1, dtype=torch.int32, device=device)
-        self.static_kv_page_indices = torch.zeros(num_reqs * blocks_per_slot, dtype=torch.int32, device=device)
+        self.static_kv_page_indices = torch.zeros(
+            num_reqs * blocks_per_slot, dtype=torch.int32, device=device
+        )
         self.static_kv_last_page_len = torch.zeros(num_reqs, dtype=torch.int32, device=device)
 
         # GDN metadata static buffers. non_spec_query_start_loc is
         # likewise constant; state_indices is per-replay-filled (depends
         # on slot_ids, not just batch_size/qo_len).
         self.static_state_indices = torch.zeros(num_reqs, dtype=torch.int32, device=device)
-        self.static_non_spec_qsl = torch.arange(0, num_reqs + 1, dtype=torch.int32, device=device) * qo_len
+        self.static_non_spec_qsl = (
+            torch.arange(0, num_reqs + 1, dtype=torch.int32, device=device) * qo_len
+        )
 
         # Model I/O static buffers.
         self.static_input_ids = torch.zeros(n_tokens, dtype=torch.long, device=device)
@@ -5507,8 +5632,12 @@ class CapturedBatchDecodeGraph:
                 torch.arange(0, num_reqs + 1, dtype=torch.int32, device=device) * qo_len
             )
             self.static_spec_sequence_masks = torch.ones(num_reqs, dtype=torch.bool, device=device)
-            self.static_spec_state_indices = torch.zeros((num_reqs, qo_len), dtype=torch.int32, device=device)
-            self.static_num_accepted_tokens = torch.zeros(num_reqs, dtype=torch.int32, device=device)
+            self.static_spec_state_indices = torch.zeros(
+                (num_reqs, qo_len), dtype=torch.int32, device=device
+            )
+            self.static_num_accepted_tokens = torch.zeros(
+                num_reqs, dtype=torch.int32, device=device
+            )
 
         self._graph: torch.cuda.CUDAGraph | None = None
         self._static_logits: torch.Tensor | None = None
@@ -5528,13 +5657,23 @@ class CapturedBatchDecodeGraph:
         self.replay_count = 0
 
         cpu = torch.device("cpu")
-        self._cpu_kv_page_indptr = torch.zeros(num_reqs + 1, dtype=torch.int32, device=cpu, pin_memory=True)
-        self._cpu_kv_page_indices = torch.zeros(num_reqs * blocks_per_slot, dtype=torch.int32, device=cpu, pin_memory=True)
-        self._cpu_kv_last_page_len = torch.zeros(num_reqs, dtype=torch.int32, device=cpu, pin_memory=True)
-        self._cpu_state_indices = torch.zeros(num_reqs, dtype=torch.int32, device=cpu, pin_memory=True)
+        self._cpu_kv_page_indptr = torch.zeros(
+            num_reqs + 1, dtype=torch.int32, device=cpu, pin_memory=True
+        )
+        self._cpu_kv_page_indices = torch.zeros(
+            num_reqs * blocks_per_slot, dtype=torch.int32, device=cpu, pin_memory=True
+        )
+        self._cpu_kv_last_page_len = torch.zeros(
+            num_reqs, dtype=torch.int32, device=cpu, pin_memory=True
+        )
+        self._cpu_state_indices = torch.zeros(
+            num_reqs, dtype=torch.int32, device=cpu, pin_memory=True
+        )
         self._cpu_input_ids = torch.zeros(n_tokens, dtype=torch.long, device=cpu, pin_memory=True)
         self._cpu_positions = torch.zeros(n_tokens, dtype=torch.long, device=cpu, pin_memory=True)
-        self._cpu_slot_mapping = torch.zeros(n_tokens, dtype=torch.long, device=cpu, pin_memory=True)
+        self._cpu_slot_mapping = torch.zeros(
+            n_tokens, dtype=torch.long, device=cpu, pin_memory=True
+        )
         self._np_kv_page_indptr = self._cpu_kv_page_indptr.numpy()
         self._np_kv_page_indices = self._cpu_kv_page_indices.numpy()
         self._np_kv_last_page_len = self._cpu_kv_last_page_len.numpy()
@@ -5543,8 +5682,12 @@ class CapturedBatchDecodeGraph:
         self._np_positions = self._cpu_positions.numpy()
         self._np_slot_mapping = self._cpu_slot_mapping.numpy()
         if qo_len > 1:
-            self._cpu_spec_state_indices = torch.zeros((num_reqs, qo_len), dtype=torch.int32, device=cpu, pin_memory=True)
-            self._cpu_num_accepted_tokens = torch.zeros(num_reqs, dtype=torch.int32, device=cpu, pin_memory=True)
+            self._cpu_spec_state_indices = torch.zeros(
+                (num_reqs, qo_len), dtype=torch.int32, device=cpu, pin_memory=True
+            )
+            self._cpu_num_accepted_tokens = torch.zeros(
+                num_reqs, dtype=torch.int32, device=cpu, pin_memory=True
+            )
 
     def _fill_buffers(
         self,
@@ -5576,7 +5719,6 @@ class CapturedBatchDecodeGraph:
         across calls with potentially different active slot sets at the
         same batch_size)."""
         runner = self.runner
-        device = runner.device
         qo_len = self.qo_len
         block_size = runner.block_size
         blocks_per_slot = runner.blocks_per_slot
@@ -5604,9 +5746,11 @@ class CapturedBatchDecodeGraph:
             for slot, kv_len in zip(slot_ids, new_kv_lens):
                 runner._ensure_blocks(slot, kv_len)
 
-        pages_unchanged = (self._last_num_pages_per_req is not None
-                           and num_pages_per_req == self._last_num_pages_per_req
-                           and slot_ids == getattr(self, '_last_slot_ids', None))
+        pages_unchanged = (
+            self._last_num_pages_per_req is not None
+            and num_pages_per_req == self._last_num_pages_per_req
+            and slot_ids == getattr(self, "_last_slot_ids", None)
+        )
         if not pages_unchanged:
             kv_page_indptr_list = [0]
             for num_pages in num_pages_per_req:
@@ -5627,7 +5771,9 @@ class CapturedBatchDecodeGraph:
             n_pages = len(page_indices_list)
             if n_pages:
                 self._np_kv_page_indices[:n_pages] = page_indices_list
-                self.static_kv_page_indices[:n_pages].copy_(self._cpu_kv_page_indices[:n_pages], non_blocking=True)
+                self.static_kv_page_indices[:n_pages].copy_(
+                    self._cpu_kv_page_indices[:n_pages], non_blocking=True
+                )
             self._last_num_pages_per_req = list(num_pages_per_req)
             self._last_slot_ids = list(slot_ids)
 
@@ -5643,13 +5789,17 @@ class CapturedBatchDecodeGraph:
             first_block = _physical_slot(slot) * blocks_per_slot
             for j in range(qo_len):
                 pos = kv_len + j
-                block_id = table[pos // block_size] if table is not None else first_block + pos // block_size
+                block_id = (
+                    table[pos // block_size]
+                    if table is not None
+                    else first_block + pos // block_size
+                )
                 offset = pos % block_size
                 slot_mapping_list.append(block_id * block_size + offset)
         n_reqs = len(last_page_len_list)
         self._np_kv_last_page_len[:n_reqs] = last_page_len_list
         self.static_kv_last_page_len.copy_(self._cpu_kv_last_page_len, non_blocking=True)
-        slots_changed = (slot_ids != self._last_state_slot_ids)
+        slots_changed = slot_ids != self._last_state_slot_ids
         if slots_changed:
             state_indices_list = [_physical_slot(slot) for slot in slot_ids]
             self._np_state_indices[:n_reqs] = state_indices_list
@@ -5669,15 +5819,24 @@ class CapturedBatchDecodeGraph:
                     "num_accepted_tokens_prev is required when qo_len > 1 "
                     "(this shape only ever means spec-decode verify)"
                 )
-            if slots_changed or not hasattr(self, '_spec_cached'):
+            if slots_changed or not hasattr(self, "_spec_cached"):
                 spec_indices_list = [
-                    [_ssm_spec_row(slot, col, self.total_physical_slots, self.num_spec) for col in range(qo_len)]
+                    [
+                        _ssm_spec_row(slot, col, self.total_physical_slots, self.num_spec)
+                        for col in range(qo_len)
+                    ]
                     for slot in slot_ids
                 ]
-                self._cpu_spec_state_indices[:n_reqs] = torch.tensor(spec_indices_list, dtype=torch.int32)
-                self.static_spec_state_indices.copy_(self._cpu_spec_state_indices, non_blocking=True)
+                self._cpu_spec_state_indices[:n_reqs] = torch.tensor(
+                    spec_indices_list, dtype=torch.int32
+                )
+                self.static_spec_state_indices.copy_(
+                    self._cpu_spec_state_indices, non_blocking=True
+                )
                 self._spec_cached = True
-            self._cpu_num_accepted_tokens[:n_reqs] = torch.tensor(num_accepted_tokens_prev, dtype=torch.int32)
+            self._cpu_num_accepted_tokens[:n_reqs] = torch.tensor(
+                num_accepted_tokens_prev, dtype=torch.int32
+            )
             self.static_num_accepted_tokens.copy_(self._cpu_num_accepted_tokens, non_blocking=True)
 
     def _static_metadata_dicts(self) -> tuple[dict, dict]:
@@ -5750,7 +5909,9 @@ class CapturedBatchDecodeGraph:
         ``capture()``'s warmup loop discards both return values either way."""
         runner = self.runner
         attn_metadata_dict, slot_mapping_dict = self._static_metadata_dicts()
-        with set_forward_context(attn_metadata_dict, runner.vllm_config, slot_mapping=slot_mapping_dict):
+        with set_forward_context(
+            attn_metadata_dict, runner.vllm_config, slot_mapping=slot_mapping_dict
+        ):
             hidden_states = runner.model.forward(self.static_input_ids, self.static_positions)
         logits = runner.model.compute_logits(hidden_states)
         return logits, hidden_states
@@ -5795,7 +5956,9 @@ class CapturedBatchDecodeGraph:
             # convention (see build_gdn_metadata_spec_batch's docstring).
             warmup_num_accepted_tokens_prev = [1] * self.batch_size
         self._fill_buffers(
-            warmup_slots, warmup_token_ids, warmup_kv_lengths,
+            warmup_slots,
+            warmup_token_ids,
+            warmup_kv_lengths,
             num_accepted_tokens_prev=warmup_num_accepted_tokens_prev,
         )
 
@@ -5880,7 +6043,9 @@ class CapturedBatchDecodeGraph:
         OTHER unrelated work queued on the device -- directly working
         against the whole point of using a captured graph to cut CPU-side
         launch/dispatch overhead."""
-        if not self._external_warmup and (slot_ids == self._warmup_slots or set(slot_ids) & set(self._warmup_slots)):
+        if not self._external_warmup and (
+            slot_ids == self._warmup_slots or set(slot_ids) & set(self._warmup_slots)
+        ):
             raise RuntimeError(
                 f"slot(s) {set(slot_ids) & set(self._warmup_slots)} are this "
                 "graph's own reserved warmup slots -- never replay() against "
@@ -5898,7 +6063,9 @@ class CapturedBatchDecodeGraph:
                 )
             if not self.runner.slot_gdn_initialized[slot]:
                 raise RuntimeError(f"slot {slot} has no GDN state yet (needs a prior prefill)")
-        self._fill_buffers(slot_ids, token_ids, kv_lengths, num_accepted_tokens_prev=num_accepted_tokens_prev)
+        self._fill_buffers(
+            slot_ids, token_ids, kv_lengths, num_accepted_tokens_prev=num_accepted_tokens_prev
+        )
         self._graph.replay()
         self.replay_count += 1
         for slot in slot_ids:
@@ -5986,18 +6153,26 @@ class CapturedMTPDraftStepGraph:
     physical reserved-slot range across both graph classes (each resets
     its own warmup slots right after its own ``capture()``)."""
 
-    def __init__(self, runner: "DirectModelRunner", batch_size: int, qo_len: int = 1,
-                 warmup_slots: list[int] | None = None) -> None:
+    def __init__(
+        self,
+        runner: DirectModelRunner,
+        batch_size: int,
+        qo_len: int = 1,
+        warmup_slots: list[int] | None = None,
+    ) -> None:
         if runner.mtp_model is None:
             raise RuntimeError("no MTP draft model loaded")
         if warmup_slots is not None:
             if len(warmup_slots) != batch_size:
-                raise ValueError(f"warmup_slots must have exactly batch_size ({batch_size}) entries")
+                raise ValueError(
+                    f"warmup_slots must have exactly batch_size ({batch_size}) entries"
+                )
             self._external_warmup = True
         else:
             if runner.num_slots < 2 * batch_size:
                 raise ValueError(
-                    f"runner.num_slots={runner.num_slots} must be >= 2*batch_size ({2 * batch_size})"
+                    f"runner.num_slots={runner.num_slots} must be >= "
+                    f"2*batch_size ({2 * batch_size})"
                 )
             warmup_slots = list(range(runner.num_slots - batch_size, runner.num_slots))
             self._external_warmup = False
@@ -6012,20 +6187,32 @@ class CapturedMTPDraftStepGraph:
         self._warmup_slots = warmup_slots
 
         n_tokens = batch_size * qo_len
-        self.static_qo_indptr = torch.arange(0, batch_size + 1, dtype=torch.int32, device=device) * qo_len
+        self.static_qo_indptr = (
+            torch.arange(0, batch_size + 1, dtype=torch.int32, device=device) * qo_len
+        )
         self.static_kv_page_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
-        self.static_kv_page_indices = torch.zeros(batch_size * blocks_per_slot, dtype=torch.int32, device=device)
+        self.static_kv_page_indices = torch.zeros(
+            batch_size * blocks_per_slot, dtype=torch.int32, device=device
+        )
         self.static_kv_last_page_len = torch.zeros(batch_size, dtype=torch.int32, device=device)
         self.static_input_ids = torch.zeros(n_tokens, dtype=torch.long, device=device)
         self.static_positions = torch.zeros(n_tokens, dtype=torch.long, device=device)
         self.static_slot_mapping = torch.zeros(n_tokens, dtype=torch.long, device=device)
         cpu = torch.device("cpu")
-        self._cpu_kv_page_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=cpu, pin_memory=True)
-        self._cpu_kv_page_indices = torch.zeros(batch_size * blocks_per_slot, dtype=torch.int32, device=cpu, pin_memory=True)
-        self._cpu_kv_last_page_len = torch.zeros(batch_size, dtype=torch.int32, device=cpu, pin_memory=True)
+        self._cpu_kv_page_indptr = torch.zeros(
+            batch_size + 1, dtype=torch.int32, device=cpu, pin_memory=True
+        )
+        self._cpu_kv_page_indices = torch.zeros(
+            batch_size * blocks_per_slot, dtype=torch.int32, device=cpu, pin_memory=True
+        )
+        self._cpu_kv_last_page_len = torch.zeros(
+            batch_size, dtype=torch.int32, device=cpu, pin_memory=True
+        )
         self._cpu_input_ids = torch.zeros(n_tokens, dtype=torch.long, device=cpu, pin_memory=True)
         self._cpu_positions = torch.zeros(n_tokens, dtype=torch.long, device=cpu, pin_memory=True)
-        self._cpu_slot_mapping = torch.zeros(n_tokens, dtype=torch.long, device=cpu, pin_memory=True)
+        self._cpu_slot_mapping = torch.zeros(
+            n_tokens, dtype=torch.long, device=cpu, pin_memory=True
+        )
         self._np_kv_page_indptr = self._cpu_kv_page_indptr.numpy()
         self._np_kv_page_indices = self._cpu_kv_page_indices.numpy()
         self._np_kv_last_page_len = self._cpu_kv_last_page_len.numpy()
@@ -6047,10 +6234,10 @@ class CapturedMTPDraftStepGraph:
         self._last_slot_ids: list[int] | None = None
         self._last_kv_lengths: list[int] | None = None
 
-
-    def _fill_buffers(self, slot_ids: list[int], token_ids, hidden_states_in: torch.Tensor, kv_lengths: list[int]) -> None:
+    def _fill_buffers(
+        self, slot_ids: list[int], token_ids, hidden_states_in: torch.Tensor, kv_lengths: list[int]
+    ) -> None:
         runner = self.runner
-        device = runner.device
         block_size = runner.block_size
         blocks_per_slot = runner.blocks_per_slot
         qo_len = self.qo_len
@@ -6064,7 +6251,10 @@ class CapturedMTPDraftStepGraph:
         num_pages_per_req = [(kv_len + block_size - 1) // block_size for kv_len in new_kv_lens]
         for slot, kv_len, num_pages in zip(slot_ids, new_kv_lens, num_pages_per_req):
             if num_pages > blocks_per_slot:
-                raise RuntimeError(f"slot {slot} kv_len {kv_len} exceeds this slot's {blocks_per_slot * block_size}-token capacity")
+                raise RuntimeError(
+                    f"slot {slot} kv_len {kv_len} exceeds this slot's "
+                    f"{blocks_per_slot * block_size}-token capacity"
+                )
 
         # P1 (notes/prefix-cache-design.md sec 5): same reasoning as
         # CapturedBatchDecodeGraph._fill_buffers -- grow before reading.
@@ -6083,7 +6273,8 @@ class CapturedMTPDraftStepGraph:
                 first_block = _physical_slot(slot) * blocks_per_slot
                 page_indices_list.extend(range(first_block, first_block + num_pages))
         last_page_len_list = [
-            kv_len - (num_pages - 1) * block_size for kv_len, num_pages in zip(new_kv_lens, num_pages_per_req)
+            kv_len - (num_pages - 1) * block_size
+            for kv_len, num_pages in zip(new_kv_lens, num_pages_per_req)
         ]
         positions_list = [kv_len + j for kv_len in kv_lengths for j in range(qo_len)]
         slot_mapping_list = []
@@ -6092,7 +6283,11 @@ class CapturedMTPDraftStepGraph:
             first_block = _physical_slot(slot) * blocks_per_slot
             for j in range(qo_len):
                 pos = kv_len + j
-                block_id = table[pos // block_size] if table is not None else first_block + pos // block_size
+                block_id = (
+                    table[pos // block_size]
+                    if table is not None
+                    else first_block + pos // block_size
+                )
                 offset = pos % block_size
                 slot_mapping_list.append(block_id * block_size + offset)
 
@@ -6103,14 +6298,16 @@ class CapturedMTPDraftStepGraph:
         n_pages = len(page_indices_list)
         if n_pages:
             self._np_kv_page_indices[:n_pages] = page_indices_list
-            self.static_kv_page_indices[:n_pages].copy_(self._cpu_kv_page_indices[:n_pages], non_blocking=True)
-        self._np_kv_last_page_len[:len(last_page_len_list)] = last_page_len_list
+            self.static_kv_page_indices[:n_pages].copy_(
+                self._cpu_kv_page_indices[:n_pages], non_blocking=True
+            )
+        self._np_kv_last_page_len[: len(last_page_len_list)] = last_page_len_list
         self.static_kv_last_page_len.copy_(self._cpu_kv_last_page_len, non_blocking=True)
-        self._np_input_ids[:len(flat_token_ids)] = flat_token_ids
+        self._np_input_ids[: len(flat_token_ids)] = flat_token_ids
         self.static_input_ids.copy_(self._cpu_input_ids, non_blocking=True)
-        self._np_positions[:len(positions_list)] = positions_list
+        self._np_positions[: len(positions_list)] = positions_list
         self.static_positions.copy_(self._cpu_positions, non_blocking=True)
-        self._np_slot_mapping[:len(slot_mapping_list)] = slot_mapping_list
+        self._np_slot_mapping[: len(slot_mapping_list)] = slot_mapping_list
         self.static_slot_mapping.copy_(self._cpu_slot_mapping, non_blocking=True)
         if self.static_hidden_states_in is None:
             self.static_hidden_states_in = torch.zeros_like(hidden_states_in)
@@ -6137,7 +6334,9 @@ class CapturedMTPDraftStepGraph:
         runner = self.runner
         attn_metadata_dict = self._static_metadata_dict()
         slot_mapping_dict = {name: self.static_slot_mapping for name in runner.mtp_attn_layer_names}
-        with set_forward_context(attn_metadata_dict, runner.vllm_config, slot_mapping=slot_mapping_dict):
+        with set_forward_context(
+            attn_metadata_dict, runner.vllm_config, slot_mapping=slot_mapping_dict
+        ):
             hidden_states_out = runner.mtp_model.forward(
                 self.static_input_ids, self.static_positions, self.static_hidden_states_in
             )
@@ -6176,7 +6375,10 @@ class CapturedMTPDraftStepGraph:
         else:
             warmup_token_ids = [[0] * self.qo_len for _ in range(self.batch_size)]
         warmup_hidden = torch.zeros(
-            self.batch_size * self.qo_len, self.hidden_size, dtype=dummy_hidden.dtype, device=runner.device
+            self.batch_size * self.qo_len,
+            self.hidden_size,
+            dtype=dummy_hidden.dtype,
+            device=runner.device,
         )
         self._fill_buffers(warmup_slots, warmup_token_ids, warmup_hidden, warmup_kv_lengths)
 
@@ -6257,7 +6459,9 @@ class CapturedMTPDraftStepGraph:
         self._last_kv_lengths = kv_lengths
         return self._static_logits, self._static_hidden_states_out
 
-    def _fill_buffers_incremental(self, slot_ids: list[int], token_ids, hidden_states_in: torch.Tensor, kv_lengths: list[int]) -> None:
+    def _fill_buffers_incremental(
+        self, slot_ids: list[int], token_ids, hidden_states_in: torch.Tensor, kv_lengths: list[int]
+    ) -> None:
         """Fast path: only update last_page_len, positions, slot_mapping,
         input_ids, hidden_states. Skip kv_page_indptr and kv_page_indices."""
         runner = self.runner
@@ -6269,7 +6473,8 @@ class CapturedMTPDraftStepGraph:
             for slot, kv_len in zip(slot_ids, new_kv_lens):
                 runner._ensure_blocks(slot, kv_len)
         last_page_len_list = [
-            kv_len - (num_pages - 1) * block_size for kv_len, num_pages in zip(new_kv_lens, num_pages_per_req)
+            kv_len - (num_pages - 1) * block_size
+            for kv_len, num_pages in zip(new_kv_lens, num_pages_per_req)
         ]
         positions_list = [kv_len + j for kv_len in kv_lengths for j in range(qo_len)]
         slot_mapping_list = []
@@ -6278,19 +6483,23 @@ class CapturedMTPDraftStepGraph:
             first_block = _physical_slot(slot) * runner.blocks_per_slot
             for j in range(qo_len):
                 pos = kv_len + j
-                block_id = table[pos // block_size] if table is not None else first_block + pos // block_size
+                block_id = (
+                    table[pos // block_size]
+                    if table is not None
+                    else first_block + pos // block_size
+                )
                 slot_mapping_list.append(block_id * block_size + pos % block_size)
         if qo_len == 1:
             flat_token_ids = token_ids
         else:
             flat_token_ids = [tok for slot_tokens in token_ids for tok in slot_tokens]
-        self._np_kv_last_page_len[:len(last_page_len_list)] = last_page_len_list
+        self._np_kv_last_page_len[: len(last_page_len_list)] = last_page_len_list
         self.static_kv_last_page_len.copy_(self._cpu_kv_last_page_len, non_blocking=True)
-        self._np_input_ids[:len(flat_token_ids)] = flat_token_ids
+        self._np_input_ids[: len(flat_token_ids)] = flat_token_ids
         self.static_input_ids.copy_(self._cpu_input_ids, non_blocking=True)
-        self._np_positions[:len(positions_list)] = positions_list
+        self._np_positions[: len(positions_list)] = positions_list
         self.static_positions.copy_(self._cpu_positions, non_blocking=True)
-        self._np_slot_mapping[:len(slot_mapping_list)] = slot_mapping_list
+        self._np_slot_mapping[: len(slot_mapping_list)] = slot_mapping_list
         self.static_slot_mapping.copy_(self._cpu_slot_mapping, non_blocking=True)
         if self.static_hidden_states_in is None:
             self.static_hidden_states_in = torch.zeros_like(hidden_states_in)

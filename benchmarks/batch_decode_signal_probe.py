@@ -90,7 +90,6 @@ def _assign_filler_repeats(batch: int, varlen: bool) -> list[int]:
 
 
 def _run_once(batch: int, varlen: bool, steps: int, reuse: bool, mtp_qo_len: int = 0) -> dict:
-    import torch
 
     sys.path.insert(0, SM120_VLLM_INTEGRATION)
     import register_sm120_backend  # noqa: F401

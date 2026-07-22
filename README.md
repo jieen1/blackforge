@@ -102,13 +102,28 @@ blackforge/
 ├── loader/                   # Weight loading (safetensors, NVFP4)
 ├── kernels/                  # CUDA kernel documentation
 ├── benchmarks/               # Reproducible perf & correctness checks
-├── tests/                    # Unit tests (27 tests, CPU-only)
+├── tests/                    # Unit tests (170+ tests, CPU-only)
 └── oracle/                   # vLLM reference comparison utilities
 ```
 
 The CUDA attention kernel lives in
 [sm120-flash-attention](https://github.com/jieen1/sm120-flash-attention),
 integrated via vLLM's custom attention backend registration.
+
+This repository holds the **runtime and serving layer**: the fixed-slot
+scheduler, hybrid KV/GDN cache, MTP verify loop, prefix cache, and the
+OpenAI/Anthropic-compatible server. The Qwen3.6 model graph and the SM120
+CUDA kernels are provided by vLLM plus the `sm120-flash-attention`
+integration, which this runtime drives as a library (see
+`runtime/direct_model_runner.py`). That is why `model/` (config only) and
+`kernels/` (documentation only) are intentionally thin here. The
+`runtime/vllm_*_baseline.py` modules are historical reference baselines kept
+for parity checks (e.g. `benchmarks/real_forward_smoke.py`), not the active
+serving path.
+
+> **Naming:** the product and GitHub repo are **BlackForge**; the package
+> directory is historically `qwen-sm120-runtime`; configuration env vars use
+> the `QSR_` (Qwen SM120 Runtime) prefix. All three refer to this same system.
 
 ## Quick Start
 
@@ -186,10 +201,37 @@ python -m pytest tests/ -q
 | 8192               | 128K        | 4        | 8                        |
 | 4200               | 67K         | 4        | 16                       |
 
+## Development
+
+Common tasks are wired into the `Makefile` (run `make help` for the full
+list):
+
+```bash
+make install        # editable install with dev + serving extras
+make lint           # ruff lint gate (whole repo, must stay green)
+make format         # ruff auto-fix + format the production packages
+make test           # CPU-only unit test suite (fast, no GPU required)
+make verify-cuda    # confirm an SM120 CUDA op executes
+make workloads      # print the frozen Phase-0 W1/W2 contracts
+make serve          # start the server (tune via QSR_* env vars)
+```
+
+Lint and formatting are enforced by `ruff` (config in `pyproject.toml`).
+Install the pre-commit hooks to run them automatically on each commit:
+
+```bash
+python -m pip install pre-commit
+pre-commit install
+```
+
+The same gate (ruff lint + format check + unit tests) runs in CI on every
+push and pull request (`.github/workflows/ci.yml`). The unit tests are
+CPU-only; tests that need `torch` self-skip via `pytest.importorskip`.
+
 ## Roadmap
 
 - [ ] More model support (Qwen3 series, other hybrid architectures)
-- [ ] Streaming response support
+- [x] Streaming response support (OpenAI + Anthropic SSE)
 - [ ] Temperature / top-p sampling
 - [ ] Dynamic KV cache allocation (flexible context vs concurrency)
 - [ ] Multi-GPU support
@@ -198,8 +240,7 @@ python -m pytest tests/ -q
 
 - **Single model**: currently Qwen3.6-27B-NVFP4 only
 - **Single GPU**: no tensor/pipeline parallelism
-- **Greedy decoding only**: sampling not yet implemented
-- **Non-streaming**: `stream=true` rejected
+- **Greedy decoding only**: sampling fields are accepted for client compatibility, but decoding is greedy (temperature / top-p not yet applied)
 - **SM120 only**: requires compute capability 12.0
 
 ## License
