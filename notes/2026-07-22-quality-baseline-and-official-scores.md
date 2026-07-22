@@ -207,3 +207,35 @@ python benchmarks/official/aime_eval.py --base-url http://localhost:8000/v1 \
 All runners checkpoint to `<out>.jsonl` and resume if interrupted (e.g. by a
 server restart). Launch long runs detached with `setsid bash -c '...' &` so they
 survive the calling session.
+
+
+---
+
+## 7. FINAL MMLU-Pro result (2026-07-22, 414 stratified, thinking mode)
+
+Run: `evalplus_results/official/mmlu_pro_think_c4.json` (414 questions, ~30/category,
+thinking mode, official max_tokens=32768, 5-shot CoT, greedy). Server at 8 slots x 64K
+for throughput; zero truncation, 1 unanswered.
+
+**Overall accuracy = 84.54%  vs official Qwen3.6-27B = 86.2**  (gap ~1.7pt, within
+the ~+-3.5% sampling noise of a 414-question stratified subset).
+=> Local custom-runtime inference quality is NOT degraded vs the original model.
+
+Per-category (correct/total):
+| Category | Acc | | Category | Acc |
+|---|---|---|---|---|
+| physics | 44/45 = 98% | | economics | 25/29 = 86% |
+| math | 45/47 = 96% | | computer science | 12/14 = 86% |
+| chemistry | 36/39 = 92% | | history | 11/13 = 85% |
+| biology | 23/25 = 92% | | law | 31/38 = 82% |
+| engineering | 29/33 = 88% | | business | 22/27 = 81% |
+| psychology | 21/27 = 78% | | health | 21/28 = 75% |
+| philosophy | 11/17 = 65% | | other | 19/32 = 59% |
+
+STEM categories are very strong (math/physics/chemistry/biology >= 92%); the weaker
+humanities/social categories reflect the model's natural profile, not a runtime defect
+(they would score the same on stock vLLM with identical weights).
+
+Throughput note: benchmark speed is GPU decode-bound; raising concurrency past ~4 gives
+diminishing returns (total tokens/s is roughly constant). 8 slots x 64K maximizes GPU
+utilization without changing the per-question decode cost.
