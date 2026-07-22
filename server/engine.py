@@ -209,6 +209,9 @@ class ServerEngine:
         self.free_slots: list[int] = list(range(capacity))
         self.active: dict[int, dict[str, Any]] = {}
         self.waiting: list[GenerationRequest] = []
+        # A5/B4: incremental chunked prefill state (None = no prefill in progress)
+        self._pending_prefill = None  # ChunkedPrefillState | None
+        self._pending_prefill_reqs: list[tuple[int, GenerationRequest]] = []
         self.retained: dict[str, dict[str, Any]] = {}
         self.ref_slot_for = {p: capacity + p for p in range(capacity)}
         self.diag_slot_for = {p: 2 * capacity + p for p in range(capacity)}
@@ -718,8 +721,38 @@ class ServerEngine:
                     self.stats["session_warm_continuation_samples"].pop(0)
                 self._activate_slot(slot, req, res["anchor"], res["draft_tokens"])
 
-        # -- normal admission --
-        if self.free_slots and self.waiting:
+        # -- A5/B4: advance pending incremental prefill (one chunk per round) --
+        if self._pending_prefill is not None:
+            try:
+                done = self.runner.prefill_chunked_step(self._pending_prefill)
+            except Exception as exc:
+                logger.exception("incremental prefill step failed")
+                for slot, req in self._pending_prefill_reqs:
+                    self._fail_future(req.future, exc)
+                    if req.stream_channel is not None:
+                        self._stream_close(req.stream_channel)
+                    try:
+                        self.runner.reset_slot(slot)
+                    except Exception:
+                        logger.exception("reset_slot(%d) failed in prefill recovery", slot)
+                    self.free_slots.append(slot)
+                self._pending_prefill = None
+                self._pending_prefill_reqs = []
+            else:
+                if done:
+                    prefill_result = self._pending_prefill.result
+                    admit_now = self._pending_prefill_reqs
+                    self.stats["admissions"] += 1
+                    self.stats["admission_batch_sizes"].append(len(admit_now))
+                    for slot, req in admit_now:
+                        anchor = prefill_result[slot]["anchor"]
+                        drafts = prefill_result[slot]["draft_tokens"]
+                        self._activate_slot(slot, req, anchor, drafts)
+                    self._pending_prefill = None
+                    self._pending_prefill_reqs = []
+
+        # -- normal admission (starts incremental prefill, non-blocking) --
+        if self._pending_prefill is None and self.free_slots and self.waiting:
             n = min(len(self.free_slots), len(self.waiting))
             admit_now = [(self.free_slots.pop(0), self.waiting.pop(0)) for _ in range(n)]
             new_slots = [s for s, _ in admit_now]
@@ -729,7 +762,7 @@ class ServerEngine:
                     if self.runner.slot_kv_len[slot] != 0 or self.runner.block_table[slot]:
                         self.runner.reset_slot(slot)
                 hit_depths = [self.runner.reconcile_prefix_hit(p) for p in new_prompts]
-                prefill_result = self.runner.mtp_prefill_with_cache(
+                prefill_state = self.runner.prefill_chunked_begin(
                     new_slots, new_prompts, chunk_size=self._prefill_chunk_size
                 )
             except Exception as exc:
@@ -744,20 +777,27 @@ class ServerEngine:
                         logger.exception("reset_slot(%d) failed in admission recovery", slot)
                     self.free_slots.append(slot)
             else:
-                self.stats["admissions"] += 1
-                self.stats["admission_batch_sizes"].append(len(admit_now))
                 self._log_prefix_overlap(admit_now)
                 self._record_prefix_cache_hits(admit_now, hit_depths)
-                for slot, req in admit_now:
-                    anchor = prefill_result[slot]["anchor"]
-                    drafts = prefill_result[slot]["draft_tokens"]
-                    self._activate_slot(slot, req, anchor, drafts)
+                if prefill_state.done:
+                    # Short prompt: prefill completed immediately
+                    self.stats["admissions"] += 1
+                    self.stats["admission_batch_sizes"].append(len(admit_now))
+                    prefill_result = prefill_state.result
+                    for slot, req in admit_now:
+                        anchor = prefill_result[slot]["anchor"]
+                        drafts = prefill_result[slot]["draft_tokens"]
+                        self._activate_slot(slot, req, anchor, drafts)
+                else:
+                    # Long prompt: prefill will be advanced incrementally
+                    self._pending_prefill = prefill_state
+                    self._pending_prefill_reqs = admit_now
 
         # -- idle: block on pipe (zero CPU, instant wakeup) --
         # Only block when BOTH active and waiting are empty.
         # If waiting has requests (e.g. admission failed and re-queued),
         # we must loop back to retry admission, NOT block on the pipe.
-        if not self.active and not self.waiting:
+        if not self.active and not self.waiting and self._pending_prefill is None:
             # Set pipe to blocking mode for efficient idle wait
             os.set_blocking(self._req_pipe_r, True)
             try:
@@ -770,7 +810,7 @@ class ServerEngine:
             self._drain_requests()
             _drain_pipe(self._req_pipe_r)
             return
-        elif not self.active and self.waiting:
+        elif not self.active and self.waiting and self._pending_prefill is None:
             # Have waiting requests but no active slots — retry admission
             # next round without blocking. Brief sleep to avoid hot-spin
             # if admission keeps failing (e.g. OOM).

@@ -193,6 +193,39 @@ class Block:
     next_free: Block | None = None
 
 
+@dataclass
+class ChunkedPrefillState:
+    """A5/B4: Tracks an in-progress incremental chunked prefill.
+
+    The engine advances this one chunk at a time via
+    ``DirectModelRunner.prefill_chunked_step()``, interleaving decode
+    rounds for active slots between chunks. This prevents long prefills
+    (32K+ tokens) from starving active decode slots.
+    """
+
+    done: bool = False
+    result: dict | None = None
+    slots: list = None
+    prompts_per_slot: list = None
+    suffix_per_slot: list = None
+    suffix_lens: list = None
+    kv_offsets: list = None
+    L_per_slot: list = None
+    chunk_size: int = 512
+    chunk_start: int = 0
+    total_len: int = 0
+    step0_logits: object = None
+    step0_hidden: object = None
+    anchors: dict = None
+
+    def __post_init__(self):
+        if self.slots is None:
+            self.slots = []
+        if self.anchors is None:
+            self.anchors = {}
+
+
+
 class FreeBlockQueue:
     """Intrusive doubly-linked LRU free-block queue (P3.2; design doc sec 3.2,
     vLLM ``FreeKVCacheBlockQueue`` shape, adapted). Replaces P1's plain
@@ -4308,6 +4341,219 @@ class DirectModelRunner:
             for i, s in enumerate(slots):
                 self._publish_committed_blocks(s, prompts_per_slot[i], prompt_lens[i])
         return {s: {"anchor": anchors[s], "draft_tokens": draft_tokens[s]} for s in slots}
+
+
+    # =====================================================================
+    # A5/B4: Incremental chunked prefill API (2026-07-22)
+    # Allows the engine to interleave prefill chunks with decode rounds,
+    # preventing long prefills from starving active decode slots.
+    # =====================================================================
+
+    def prefill_chunked_begin(
+        self,
+        slots: list[int],
+        prompts_per_slot: list[list[int]],
+        chunk_size: int = 512,
+    ) -> ChunkedPrefillState:
+        """Start an incremental chunked prefill. Returns a state object that
+        the engine advances one chunk at a time via ``prefill_chunked_step()``.
+
+        Handles prefix cache reconciliation internally: hit slots get their
+        cached prefix restored immediately; the remaining suffix (or full
+        cold prompt) is processed incrementally.
+
+        For short prompts (<= chunk_size) or ragged batches, falls back to
+        the monolithic ``mtp_prefill_with_cache`` and returns a state with
+        ``done=True`` immediately.
+        """
+        if self.mtp_model is None or self.num_speculative_tokens is None:
+            raise RuntimeError("no MTP draft model loaded")
+        if len(slots) != len(prompts_per_slot):
+            raise ValueError("slots and prompts_per_slot must have equal length")
+        if not slots:
+            return ChunkedPrefillState(done=True, result={})
+
+        prompt_lens = [len(p) for p in prompts_per_slot]
+        is_uniform = len(set(prompt_lens)) == 1
+
+        # Ragged batch or short prompts: monolithic fallback
+        if not is_uniform or max(prompt_lens) <= chunk_size:
+            result = self.mtp_prefill_with_cache(slots, prompts_per_slot, chunk_size)
+            return ChunkedPrefillState(done=True, result=result)
+
+        # Prefix cache reconciliation
+        if self.enable_persistent_prefix_cache:
+            L_per_slot = [self.reconcile_prefix_hit(p) for p in prompts_per_slot]
+        else:
+            L_per_slot = [0] * len(slots)
+
+        # For hit slots, restore cached prefix immediately
+        for s, p, L in zip(slots, prompts_per_slot, L_per_slot):
+            if L > 0:
+                if self.slot_kv_len[s] != 0 or self.slot_draft_sync_len[s] != 0:
+                    raise RuntimeError(f"slot {s} is not fresh")
+                self.restore_cached_prefix(s, p, L)
+
+        # Validate cold slots are fresh
+        for s, L in zip(slots, L_per_slot):
+            if L == 0:
+                if self.slot_kv_len[s] != 0 or self.slot_draft_sync_len[s] != 0:
+                    raise RuntimeError(f"slot {s} is not fresh")
+                self.slot_num_accepted_tokens[s] = 1
+
+        # Suffix = portion of prompt not covered by cache hit
+        suffix_per_slot = [p[L:] for p, L in zip(prompts_per_slot, L_per_slot)]
+        suffix_lens = [len(sfx) for sfx in suffix_per_slot]
+        total_suffix = max(suffix_lens)
+
+        # If suffix fits in one chunk after all, monolithic
+        if total_suffix <= chunk_size:
+            result = self.mtp_prefill_with_cache(slots, prompts_per_slot, chunk_size)
+            return ChunkedPrefillState(done=True, result=result)
+
+        return ChunkedPrefillState(
+            done=False,
+            result=None,
+            slots=slots,
+            prompts_per_slot=prompts_per_slot,
+            suffix_per_slot=suffix_per_slot,
+            suffix_lens=suffix_lens,
+            kv_offsets=list(L_per_slot),
+            L_per_slot=L_per_slot,
+            chunk_size=chunk_size,
+            chunk_start=0,
+            total_len=total_suffix,
+            step0_logits=None,
+            step0_hidden=None,
+            anchors={},
+        )
+
+    def prefill_chunked_step(self, state: ChunkedPrefillState) -> bool:
+        """Advance the incremental prefill by ONE chunk. Returns True when
+        the prefill is complete (``state.result`` is populated).
+
+        Each call processes exactly one ``chunk_size`` worth of tokens through
+        the target model + draft model, then returns control to the engine
+        so it can run a decode round for active slots before the next chunk.
+        """
+        if state.done:
+            return True
+
+        slots = state.slots
+        prompts_per_slot = state.prompts_per_slot
+        suffix_per_slot = state.suffix_per_slot
+        chunk_size = state.chunk_size
+        chunk_start = state.chunk_start
+        total_len = state.total_len
+        num_reqs = len(slots)
+        k = self.num_speculative_tokens
+
+        chunk_end = min(chunk_start + chunk_size, total_len)
+        this_chunk_len = chunk_end - chunk_start
+        is_last_chunk = chunk_end >= total_len
+
+        # Build this chunk's tokens per slot
+        chunk_tokens_per_slot = [sfx[chunk_start:chunk_end] for sfx in suffix_per_slot]
+
+        # Current kv_len per slot (grows with each chunk)
+        running_kv_lens = [self.slot_kv_len[s] for s in slots]
+
+        # Target model forward for this chunk
+        target_logits_chunk, target_hidden_chunk = self._forward_batch(
+            slots,
+            chunk_tokens_per_slot if this_chunk_len > 1 else [t[0] for t in chunk_tokens_per_slot],
+            running_kv_lens,
+            qo_len=this_chunk_len,
+            commit=True,
+            return_hidden=True,
+            is_decode=False,
+            logits_last_position_only=True,
+        )
+
+        if is_last_chunk:
+            for i, s in enumerate(slots):
+                state.anchors[s] = int(target_logits_chunk[i].argmax(dim=-1).item())
+            shifted_chunk_per_slot = [
+                suffix_per_slot[i][chunk_start + 1:] + [state.anchors[slots[i]]]
+                for i in range(num_reqs)
+            ]
+        else:
+            shifted_chunk_per_slot = [
+                suffix_per_slot[i][chunk_start + 1:chunk_end + 1]
+                for i in range(num_reqs)
+            ]
+
+        # Draft model forward for this chunk
+        running_draft_lens = [self.slot_draft_sync_len[s] for s in slots]
+        draft_logits_chunk, draft_hidden_chunk = self._mtp_forward_batch(
+            slots,
+            shifted_chunk_per_slot
+            if this_chunk_len > 1
+            else [t[0] for t in shifted_chunk_per_slot],
+            target_hidden_chunk,
+            running_draft_lens,
+            running_draft_lens,
+            qo_len=this_chunk_len,
+            is_decode=False,
+            logits_last_position_only=True,
+        )
+        for s in slots:
+            self.slot_draft_sync_len[s] += this_chunk_len
+
+        if is_last_chunk:
+            state.step0_logits = draft_logits_chunk
+            state.step0_hidden = draft_hidden_chunk
+
+        # P3.2 chunk-boundary GDN checkpoints (block-aligned boundaries)
+        if (
+            self.enable_persistent_prefix_cache
+            and not is_last_chunk
+        ):
+            abs_kv_end = self.slot_kv_len[slots[0]]
+            if abs_kv_end % self.block_size == 0:
+                num_chunk_blocks = abs_kv_end // self.block_size
+                for i, s in enumerate(slots):
+                    self._publish_committed_blocks(s, prompts_per_slot[i], abs_kv_end)
+                    self.materialize_gdn_checkpoint(
+                        s,
+                        key=self.block_table[s][num_chunk_blocks - 1],
+                        hash_value=self.slot_block_hashes[s][num_chunk_blocks - 1].value,
+                        num_tokens=abs_kv_end,
+                    )
+
+        state.chunk_start = chunk_end
+
+        if not is_last_chunk:
+            return False
+
+        # === FINALIZE: run draft continuation steps ===
+        assert state.step0_logits is not None and state.step0_hidden is not None
+        prev_tokens = state.step0_logits.argmax(dim=-1).tolist()
+        draft_tokens: dict[int, list[int]] = {s: [prev_tokens[i]] for i, s in enumerate(slots)}
+        next_pos_list = [self.slot_draft_sync_len[s] for s in slots]
+        running_prior_kv_len = [self.slot_draft_sync_len[s] for s in slots]
+        self._mtp_run_continuation_steps(
+            slots,
+            draft_tokens,
+            prev_tokens,
+            state.step0_hidden,
+            next_pos_list,
+            running_prior_kv_len,
+            k,
+        )
+        for s in slots:
+            self.slot_pending_draft_tokens[s] = draft_tokens[s]
+
+        # Publish committed blocks for prefix cache
+        if self.enable_persistent_prefix_cache:
+            for i, s in enumerate(slots):
+                self._publish_committed_blocks(s, prompts_per_slot[i], len(prompts_per_slot[i]))
+
+        state.result = {
+            s: {"anchor": state.anchors[s], "draft_tokens": draft_tokens[s]} for s in slots
+        }
+        state.done = True
+        return True
 
     @staticmethod
     def _common_prefix_len(prompts: list[list[int]]) -> int:
