@@ -63,13 +63,22 @@ def format_tool_calls_openai(tool_calls: list[dict], start_id: int = 0) -> list[
 
 
 def format_tool_calls_anthropic(tool_calls: list[dict], start_id: int = 0) -> list[dict]:
-    """Format parsed tool calls as Anthropic tool_use content blocks."""
+    """Format parsed tool calls as Anthropic tool_use content blocks.
+
+    Each tool_use block gets a globally unique ID (uuid4-based) so that
+    IDs never collide across turns in a multi-turn conversation.  The
+    previous sequential scheme (toolu_0000, toolu_0001, ...) reused the
+    same IDs in every assistant turn, which confused Claude Desktop's
+    tool_result matching.
+    """
+    import uuid as _uuid
+
     result = []
-    for i, tc in enumerate(tool_calls):
+    for tc in tool_calls:
         result.append(
             {
                 "type": "tool_use",
-                "id": f"toolu_{start_id + i:04d}",
+                "id": f"toolu_{_uuid.uuid4().hex[:24]}",
                 "name": tc["name"],
                 "input": tc["arguments"],
             }

@@ -155,28 +155,6 @@ async def _tokenize_decode(engine_ref, token_ids):
     return await loop.run_in_executor(None, fn)
 
 
-def _anthropic_close_thinking(block_index: int, signature: str) -> list[str]:
-    """SSE events that close an Anthropic ``thinking`` content block.
-
-    Emits the ``signature_delta`` Claude Desktop requires, then
-    ``content_block_stop``. Mirrors vLLM's anthropic streaming layer: without
-    the signature_delta the client rejects the thinking block and DROPS any
-    tool_use that follows (the assistant turn is recorded as thinking-only, so
-    the pending tool call -- e.g. AskUserQuestion -- is lost and the user's
-    selection comes back as an empty "(no content)" message).
-    """
-    sig_ev = {
-        "type": "content_block_delta",
-        "index": block_index,
-        "delta": {"type": "signature_delta", "signature": signature},
-    }
-    stop_ev = {"type": "content_block_stop", "index": block_index}
-    return [
-        "event: content_block_delta\ndata: " + json.dumps(sig_ev) + "\n\n",
-        "event: content_block_stop\ndata: " + json.dumps(stop_ev) + "\n\n",
-    ]
-
-
 def _endpoint_from_path(path: str) -> str:
     """Map a request path to a low-cardinality metrics endpoint label."""
     if path.startswith("/v1/chat/completions"):
@@ -1003,9 +981,6 @@ async def anthropic_messages(request: Request):
             yield "event: ping\ndata: " + _json.dumps({"type": "ping"}) + "\n\n"
 
             block_index = 0
-            thinking_open = False
-            thinking_closed = False
-            thinking_signature = ""
             text_open = False
 
             async for item in engine.submit_stream(prompt_ids, effective_max):
@@ -1016,29 +991,16 @@ async def anthropic_messages(request: Request):
                 if first_token_t is None and item:
                     first_token_t = time.perf_counter()
 
-                for td in proc.drain_thinking():
-                    if not thinking_open:
-                        thinking_open = True
-                        thinking_signature = uuid.uuid4().hex
-                        bs = {
-                            "type": "content_block_start",
-                            "index": block_index,
-                            "content_block": {"type": "thinking", "thinking": ""},
-                        }
-                        yield f"event: content_block_start\ndata: {_json.dumps(bs)}\n\n"
-                    d = {
-                        "type": "content_block_delta",
-                        "index": block_index,
-                        "delta": {"type": "thinking_delta", "thinking": td},
-                    }
-                    yield f"event: content_block_delta\ndata: {_json.dumps(d)}\n\n"
+                # Advance the thinking state machine but do NOT emit thinking
+                # blocks.  We cannot produce the cryptographic signature that
+                # the official Anthropic API attaches via signature_delta;
+                # Claude Desktop validates it and DROPS every content block
+                # that follows an invalid thinking block -- including tool_use
+                # (e.g. AskUserQuestion), which is why the user's selection
+                # was lost as "(no content)".
+                proc.drain_thinking()
 
                 for delta in proc.drain_content():
-                    if thinking_open and not thinking_closed:
-                        thinking_closed = True
-                        for ev in _anthropic_close_thinking(block_index, thinking_signature):
-                            yield ev
-                        block_index += 1
                     if not text_open:
                         text_open = True
                         bs = {
@@ -1054,10 +1016,6 @@ async def anthropic_messages(request: Request):
                     }
                     yield f"event: content_block_delta\ndata: {_json.dumps(d)}\n\n"
 
-            if thinking_open and not thinking_closed:
-                for ev in _anthropic_close_thinking(block_index, thinking_signature):
-                    yield ev
-                block_index += 1
             if text_open:
                 yield (
                     "event: content_block_stop\ndata: "
@@ -1065,19 +1023,6 @@ async def anthropic_messages(request: Request):
                     + "\n\n"
                 )
                 block_index += 1
-            if not thinking_open and not text_open:
-                bs = {
-                    "type": "content_block_start",
-                    "index": 0,
-                    "content_block": {"type": "text", "text": ""},
-                }
-                yield f"event: content_block_start\ndata: {_json.dumps(bs)}\n\n"
-                yield (
-                    "event: content_block_stop\ndata: "
-                    + _json.dumps({"type": "content_block_stop", "index": 0})
-                    + "\n\n"
-                )
-                block_index = 1
 
             finish = final_result["finish_reason"] if final_result else "stop"
             stop_reason = "end_turn" if finish == "stop" else "max_tokens"
@@ -1114,10 +1059,24 @@ async def anthropic_messages(request: Request):
                         + "\n\n"
                     )
                     block_index += 1
+
+            if not text_open and not tool_calls:
+                bs = {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                }
+                yield f"event: content_block_start\ndata: {_json.dumps(bs)}\n\n"
+                yield (
+                    "event: content_block_stop\ndata: "
+                    + _json.dumps({"type": "content_block_stop", "index": 0})
+                    + "\n\n"
+                )
+
             msg_delta = {
                 "type": "message_delta",
                 "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-                "usage": {"input_tokens": len(prompt_ids), "output_tokens": out_tokens},
+                "usage": {"output_tokens": out_tokens},
             }
             yield f"event: message_delta\ndata: {_json.dumps(msg_delta)}\n\n"
             metrics.record_request(

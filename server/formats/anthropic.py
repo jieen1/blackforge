@@ -231,8 +231,3 @@ def build_sse_events(
     }
     yield f"event: message_delta\ndata: {json.dumps(msg_delta)}\n\n"
     yield "event: message_stop\ndata: " + json.dumps({"type": "message_stop"}) + "\n\n"
-    msg_delta = {
-        "type": "message_delta",
-        "delta": {"stop_reason": stop_reason},
-        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
-    }

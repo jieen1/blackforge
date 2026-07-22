@@ -182,32 +182,60 @@ def test_billing_header_stripped_from_user_content():
     assert "the real user question" in user["content"]
 
 
-def test_anthropic_close_thinking_emits_signature_delta():
-    """Claude Desktop requires a ``signature_delta`` before the
-    ``content_block_stop`` of a thinking block; without it the client drops the
-    thinking block AND the tool_use that follows -- the root cause of the user's
-    AskUserQuestion selection coming back as an empty "(no content)" message.
-    This locks the streaming-format fix."""
+def test_anthropic_sse_no_thinking_blocks():
+    """The Anthropic SSE stream must NOT emit thinking blocks.
+
+    We cannot produce the cryptographic signature that the official API
+    attaches via signature_delta.  Claude Desktop validates it and DROPS
+    every content block that follows an invalid thinking block -- including
+    tool_use (e.g. AskUserQuestion), which caused the user's selection to
+    come back as "(no content)".  The fix is to omit thinking blocks entirely
+    (valid when thinking.type is "adaptive").
+    """
     import json as _json
 
     pytest.importorskip("fastapi")
-    from server.app import _anthropic_close_thinking
+    from server.formats.anthropic import build_sse_events
 
-    events = _anthropic_close_thinking(0, "abc123sig")
+    events = list(
+        build_sse_events(
+            model="test",
+            text="hello world",
+            finish_reason="stop",
+            input_tokens=10,
+            output_tokens=5,
+        )
+    )
     joined = "".join(events)
-    assert "signature_delta" in joined
-    assert "abc123sig" in joined
-    assert "content_block_stop" in joined
-    # signature_delta must precede content_block_stop
-    assert joined.index("signature_delta") < joined.index("content_block_stop")
-    # both events are well-formed SSE data lines that parse as JSON
-    payloads = [
-        line[len("data: ") :]
-        for ev in events
-        for line in ev.splitlines()
-        if line.startswith("data: ")
-    ]
-    parsed = [_json.loads(x) for x in payloads]
-    assert parsed[0]["delta"]["type"] == "signature_delta"
-    assert parsed[0]["delta"]["signature"] == "abc123sig"
-    assert parsed[1]["type"] == "content_block_stop"
+    # Must NOT contain any thinking-related events
+    assert "thinking" not in joined
+    assert "signature_delta" not in joined
+    # Must contain the text
+    assert "hello world" in joined
+    # message_delta usage must only have output_tokens
+    for ev in events:
+        if "message_delta" in ev:
+            data_line = [line for line in ev.splitlines() if line.startswith("data: ")][0]
+            payload = _json.loads(data_line[len("data: ") :])
+            assert "input_tokens" not in payload.get("usage", {})
+            assert "output_tokens" in payload["usage"]
+
+
+def test_anthropic_tool_use_ids_are_unique():
+    """Tool-use IDs must be globally unique across turns.
+
+    The previous sequential scheme (toolu_0000, toolu_0001, ...) reused the
+    same IDs in every assistant turn, which confused Claude Desktop's
+    tool_result matching in multi-turn conversations.
+    """
+    from server.formats.tools import format_tool_calls_anthropic
+
+    calls = [{"name": "Bash", "arguments": {"command": "ls"}}]
+    ids_turn1 = {tc["id"] for tc in format_tool_calls_anthropic(calls)}
+    ids_turn2 = {tc["id"] for tc in format_tool_calls_anthropic(calls)}
+    # IDs must differ across invocations (uuid4-based)
+    assert ids_turn1.isdisjoint(ids_turn2)
+    # IDs must have the toolu_ prefix and be 30 chars total
+    for tid in ids_turn1 | ids_turn2:
+        assert tid.startswith("toolu_")
+        assert len(tid) == 30  # "toolu_" (6) + 24 hex chars
