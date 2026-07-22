@@ -119,7 +119,8 @@ def main() -> None:
 
     # --- Monkey-patch verify_batch_spec to capture logits ---
     captured_logits: list[torch.Tensor] = []
-    _orig_verify_batch_spec = runner.verify_batch_spec
+    _patch_target = runner.backend if hasattr(runner, "backend") else runner
+    _orig_verify_batch_spec = _patch_target.verify_batch_spec
 
     def _hooked_verify_batch_spec(*a, **kw):
         result = _orig_verify_batch_spec(*a, **kw)
@@ -127,7 +128,7 @@ def main() -> None:
         captured_logits.append(logits.detach().clone())
         return result
 
-    runner.verify_batch_spec = _hooked_verify_batch_spec
+    _patch_target.verify_batch_spec = _hooked_verify_batch_spec
 
     # --- Run recording ---
     slots = list(range(min(args.concurrency, len(prompts))))
@@ -194,7 +195,7 @@ def main() -> None:
                   f"total committed: {total_committed}, {elapsed:.1f}s")
 
     # Restore original method
-    runner.verify_batch_spec = _orig_verify_batch_spec
+    _patch_target.verify_batch_spec = _orig_verify_batch_spec
 
     # --- Save results ---
     os.makedirs(args.out, exist_ok=True)

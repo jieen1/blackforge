@@ -85,9 +85,10 @@ def run_recording(num_prompts: int, decode_steps: int, concurrency: int):
         enable_cudagraph=False,
     )
 
-    # Monkey-patch to capture logits
+    # Monkey-patch to capture logits (E1 Phase 2: actual method lives on backend)
     captured_logits = []
-    _orig = runner.verify_batch_spec
+    _target = runner.backend if hasattr(runner, "backend") else runner
+    _orig = _target.verify_batch_spec
 
     def _hooked(*a, **kw):
         result = _orig(*a, **kw)
@@ -95,7 +96,7 @@ def run_recording(num_prompts: int, decode_steps: int, concurrency: int):
         captured_logits.append(logits.detach().clone())
         return result
 
-    runner.verify_batch_spec = _hooked
+    _target.verify_batch_spec = _hooked
 
     slots = list(range(min(concurrency, len(prompts))))
     batch_prompts = prompts[:len(slots)]
@@ -145,7 +146,7 @@ def run_recording(num_prompts: int, decode_steps: int, concurrency: int):
         for s in slots:
             gdn_norms_record[s].append(capture_gdn_norms(runner, s))
 
-    runner.verify_batch_spec = _orig
+    _target.verify_batch_spec = _orig
 
     return {
         "tokens": {str(s): committed_tokens[s] for s in slots},
