@@ -25,6 +25,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from server.formats import anthropic as anthropic_format
 from server.formats import convert_tools_to_chat_template
 from server.formats import openai as openai_format
@@ -188,6 +190,7 @@ def test_anthropic_close_thinking_emits_signature_delta():
     This locks the streaming-format fix."""
     import json as _json
 
+    pytest.importorskip("fastapi")
     from server.app import _anthropic_close_thinking
 
     events = _anthropic_close_thinking(0, "abc123sig")

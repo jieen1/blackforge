@@ -7,6 +7,8 @@ import json
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from server.formats import anthropic as anthropic_format
@@ -302,6 +304,7 @@ class TestContextCapacity:
         assert bps * bs == 262144, f"{bps}*{bs}={bps * bs} != 262144"
 
     def test_default_max_tokens_16384(self):
+        pytest.importorskip("fastapi")
         from server.app import DEFAULT_MAX_TOKENS
 
         assert DEFAULT_MAX_TOKENS == 16384
