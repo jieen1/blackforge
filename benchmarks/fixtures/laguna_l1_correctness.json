@@ -1,0 +1,26 @@
+{
+  "tests": [
+    {
+      "name": "greedy_determinism",
+      "passed": true
+    },
+    {
+      "name": "sampling_variation",
+      "passed": true,
+      "unique": 5
+    },
+    {
+      "name": "long_output_stability",
+      "passed": true,
+      "n_tokens": 256
+    },
+    {
+      "name": "concurrent_requests",
+      "passed": true
+    }
+  ],
+  "passed": 4,
+  "failed": 0,
+  "date": "2026-07-22 23:51:33",
+  "model": "poolside/Laguna-S-2.1-NVFP4"
+}
