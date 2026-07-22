@@ -1,38 +1,21 @@
-"""Minimal OpenAI-compatible HTTP server for this repository's
-``DirectModelRunner`` runtime (see ``server/engine.py`` for the
-continuous-batching engine this app wraps).
+"""OpenAI + Anthropic compatible HTTP server for BlackForge runtime.
 
-Scope (a genuinely working first cut, not a feature-complete production
-server -- see ``notes/2026-07-18-session-review-and-next-steps.md``'s
-server section for the honest capability/limitation record):
+Wraps ``server/engine.py`` (continuous-batching engine) with full
+OpenAI ``/v1/chat/completions`` and Anthropic ``/v1/messages`` APIs.
 
-- ``POST /v1/chat/completions`` and ``POST /v1/completions``, NON-STREAMING
-  only. ``stream=true`` is rejected with a clean 400, not silently ignored
-  and not a crash.
-- Greedy decoding only, matching this runtime's own MTP-verify mechanism
-  (verify is a greedy match, see ``runtime/direct_model_runner.py``'s
-  ``determine_accept_reject*``): any request setting ``temperature`` to a
-  non-zero value, or ``top_p`` to anything other than 1.0, or ``n`` to
-  anything other than 1, is rejected with a clean 400 rather than silently
-  ignored -- this project's explicit instruction for this task, since
-  actually adding sampling is separate, larger work, out of scope here.
-- Fixed capacity=4 concurrent slots (``server.engine.ServerEngine``'s
-  default), matching every validated benchmark's shape in this repo.
-  A request whose prompt token length would not leave room for at least
-  ``max_tokens`` more tokens within this runtime's per-slot capacity
-  (``blocks_per_slot * block_size``) is rejected with a clean 400 BEFORE
-  it ever reaches the runtime -- this is what keeps this server from ever
-  triggering the known ``build_attention_metadata_batch:440``
-  whole-batch-crash gap (a real ``runtime/`` bug, out of scope to fix in
-  this task; see the task brief / session notes).
-- A non-standard ``debug_committed_token_ids`` field is included in every
-  response (both endpoints), OUTSIDE the standard OpenAI response shape.
-  This exists solely so this project's own correctness-verification
-  script (``benchmarks/server_e2e_check.py``) can replay the EXACT real
-  committed token ids through an independent reference slot on the same
-  running engine, using this project's established near-tie methodology,
-  without needing a second full model load. Any real OpenAI client simply
-  ignores an unrecognized JSON field.
+Capabilities (B1/C1 采样全链路 + streaming + tool calling):
+
+- ``POST /v1/chat/completions``, ``POST /v1/completions``,
+  ``POST /v1/messages`` (Anthropic format).
+- Streaming (SSE) and non-streaming responses.
+- Full sampling: temperature, top_p, top_k, seed (``runtime/sampling.py``).
+  ``temperature == 0`` selects greedy with MTP speculative verification.
+- Tool calling via chat template (``convert_tools_to_chat_template``).
+- Configurable capacity (default 4 slots, 256K context per slot).
+- Prefix cache with session affinity for warm multi-turn.
+- CUDA Graph accelerated decode.
+- FP8 KV cache (2× capacity vs BF16).
+- Prometheus metrics at ``/metrics``.
 """
 
 from __future__ import annotations
