@@ -80,6 +80,10 @@ def sample_from_logits(
         logits_f32 = _apply_top_p(logits_f32, params.top_p)
 
     probs = _torch.softmax(logits_f32, dim=-1)
+    if generator is not None and probs.device != generator.device:
+        probs = probs.to(generator.device)
+        result = _torch.multinomial(probs, num_samples=1, generator=generator).squeeze(-1)
+        return result.to(logits.device)
     return _torch.multinomial(probs, num_samples=1, generator=generator).squeeze(-1)
 
 
