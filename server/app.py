@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import json
 import logging
 import os
 import time
@@ -49,6 +50,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
+from server import metrics
 from server.engine import ServerEngine
 from server.formats import anthropic as anthropic_format
 from server.formats import convert_tools_to_chat_template, strip_thinking
@@ -56,6 +58,27 @@ from server.formats import openai as openai_format
 from server.formats.stream import StreamProcessor
 
 logger = logging.getLogger("qwen_sm120_server.app")
+
+# uvicorn only configures its own loggers; without an explicit handler this
+# logger's INFO records (e.g. the Anthropic debug capture below) are dropped
+# silently. Attach a stderr handler so they reach the service log file.
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    _stderr_handler = logging.StreamHandler()
+    _stderr_handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    )
+    logger.addHandler(_stderr_handler)
+logger.propagate = False
+
+# Verbose raw request/response capture for ALL endpoints (OpenAI + Anthropic).
+# Default ON so real client traffic (e.g. Claude Desktop) is captured for
+# debugging and regression fixtures; set QSR_DEBUG_REQUESTS=0 (or the legacy
+# QSR_DEBUG_ANTHROPIC=0) to disable. Logs the raw request body, the parsed
+# messages, the decoded prompt (exact model input), and the raw model output.
+DEBUG_REQUESTS = (
+    os.environ.get("QSR_DEBUG_REQUESTS", os.environ.get("QSR_DEBUG_ANTHROPIC", "1")) != "0"
+)
 
 DEFAULT_MAX_TOKENS = 16384
 
@@ -123,6 +146,100 @@ async def _tokenize_decode(engine_ref, token_ids):
     loop = asyncio.get_running_loop()
     fn = functools.partial(engine_ref.tok.decode, token_ids, skip_special_tokens=True)
     return await loop.run_in_executor(None, fn)
+
+
+def _endpoint_from_path(path: str) -> str:
+    """Map a request path to a low-cardinality metrics endpoint label."""
+    if path.startswith("/v1/chat/completions"):
+        return "chat"
+    if path.startswith("/v1/completions"):
+        return "completions"
+    if path.startswith("/v1/messages"):
+        return "messages"
+    return "other"
+
+
+async def _debug_log_input(tag: str, body: dict, parsed_messages, prompt_ids: list[int]) -> None:
+    """Capture the full raw request, the parsed messages, and the decoded
+    prompt (the exact input the model receives). Gated on DEBUG_REQUESTS."""
+    if not DEBUG_REQUESTS:
+        return
+    try:
+        _raw = json.dumps(body, ensure_ascii=False, default=str)
+        logger.info("%s RAW REQUEST (%d bytes): %s", tag, len(_raw), _raw)
+        logger.info(
+            "%s PARSED MESSAGES: %s",
+            tag,
+            json.dumps(parsed_messages, ensure_ascii=False, default=str),
+        )
+        _loop = asyncio.get_running_loop()
+        _prompt_text = await _loop.run_in_executor(
+            None,
+            functools.partial(engine.tok.decode, prompt_ids, skip_special_tokens=False),
+        )
+        logger.info(
+            "%s DECODED PROMPT (%d ids, %d chars): %s",
+            tag,
+            len(prompt_ids),
+            len(_prompt_text),
+            _prompt_text,
+        )
+    except Exception:
+        logger.exception("%s debug input capture failed", tag)
+
+
+def _debug_log_output(
+    tag: str, raw_text: str, visible_text: str, finish_reason: str, gen_tokens: int
+) -> None:
+    """Capture the raw model output and the visible (thinking-stripped) output
+    for a NON-streaming response. Gated on DEBUG_REQUESTS."""
+    if not DEBUG_REQUESTS:
+        return
+    try:
+        logger.info(
+            "%s RAW OUTPUT (%d tokens, finish=%s, %d chars): %s",
+            tag,
+            gen_tokens,
+            finish_reason,
+            len(raw_text),
+            raw_text,
+        )
+        logger.info("%s VISIBLE OUTPUT (%d chars): %s", tag, len(visible_text), visible_text)
+    except Exception:
+        logger.exception("%s debug output capture failed", tag)
+
+
+async def _debug_log_stream_output(
+    tag: str, proc, visible_text: str, tool_calls, finish_reason: str
+) -> None:
+    """Capture the raw + visible model output for a STREAMING response by
+    decoding the full committed token list. Gated on DEBUG_REQUESTS."""
+    if not DEBUG_REQUESTS:
+        return
+    try:
+        gen_tokens = len(proc.all_ids)
+        _loop = asyncio.get_running_loop()
+        _raw = await _loop.run_in_executor(
+            None,
+            functools.partial(engine.tok.decode, proc.all_ids, skip_special_tokens=False),
+        )
+        logger.info(
+            "%s RAW OUTPUT (%d tokens, finish=%s, %d chars): %s",
+            tag,
+            gen_tokens,
+            finish_reason,
+            len(_raw),
+            _raw,
+        )
+        logger.info("%s VISIBLE OUTPUT (%d chars): %s", tag, len(visible_text), visible_text)
+        if tool_calls:
+            logger.info(
+                "%s TOOL CALLS: %s",
+                tag,
+                json.dumps(tool_calls, ensure_ascii=False, default=str),
+            )
+    except Exception:
+        logger.exception("%s debug output capture failed", tag)
 
 
 @asynccontextmanager
@@ -241,9 +358,10 @@ def _validate_and_resolve_max_tokens(max_tokens: int | None) -> int:
     return resolved
 
 
-def _validate_capacity(prompt_ids: list[int], max_tokens: int) -> None:
+def _validate_capacity(prompt_ids: list[int], max_tokens: int, endpoint: str = "request") -> None:
     assert engine is not None
     if not engine.capacity_ok(len(prompt_ids), max_tokens):
+        metrics.record_error(endpoint, 400)
         raise _invalid_request(
             f"prompt_tokens({len(prompt_ids)}) + max_tokens({max_tokens}) = "
             f"{len(prompt_ids) + max_tokens} exceeds this runtime's per-slot capacity of "
@@ -258,6 +376,7 @@ async def _unhandled_exception_handler(request, exc: Exception):
     # error-recovery path in server/engine.py's _loop) surfaces as a clean
     # 500 JSON body instead of an unhandled-exception stack trace / crash.
     logger.exception("unhandled exception serving %s", request.url.path)
+    metrics.record_error(_endpoint_from_path(request.url.path), 500)
     return JSONResponse(
         status_code=500,
         content={"error": {"message": str(exc), "type": "internal_error"}},
@@ -292,6 +411,7 @@ async def chat_completions(req: ChatCompletionRequest):
     assert engine is not None
     _validate_sampling_params(req.temperature, req.top_p, req.n, req.stream)
     max_tokens = _validate_and_resolve_max_tokens(req.max_tokens)
+    t0 = time.perf_counter()
 
     # Parse messages through the format layer (handles string | array content)
     chat_messages = openai_format.parse_chat_messages(req.model_dump())
@@ -300,7 +420,10 @@ async def chat_completions(req: ChatCompletionRequest):
     tools = convert_tools_to_chat_template(req.tools)
 
     prompt_ids = await _tokenize_chat(engine, chat_messages, tools=tools)
-    _validate_capacity(prompt_ids, max_tokens)
+    await _debug_log_input(
+        "OPENAI /v1/chat/completions", req.model_dump(), chat_messages, prompt_ids
+    )
+    _validate_capacity(prompt_ids, max_tokens, "chat")
 
     model_name = req.model or ServerEngine.MODEL
 
@@ -313,6 +436,7 @@ async def chat_completions(req: ChatCompletionRequest):
         async def _sse():
             proc = StreamProcessor(engine.tok)
             final_result = None
+            first_token_t = None
             # First chunk: role announcement (matches vLLM format)
             first_chunk = {
                 "id": cmpl_id,
@@ -335,6 +459,8 @@ async def chat_completions(req: ChatCompletionRequest):
                     final_result = item
                     break
                 proc.add_tokens(item)
+                if first_token_t is None and item:
+                    first_token_t = time.perf_counter()
                 # Stream thinking as reasoning_content (vLLM compatible)
                 for td in proc.drain_thinking():
                     chunk = {
@@ -419,6 +545,17 @@ async def chat_completions(req: ChatCompletionRequest):
                 "choices": [{"index": 0, "delta": {}, "finish_reason": finish, "logprobs": None}],
             }
             yield f"data: {_json.dumps(done)}\n\n"
+            metrics.record_request(
+                "chat",
+                len(prompt_ids),
+                len(proc.all_ids),
+                finish,
+                time.perf_counter() - t0,
+                (first_token_t - t0) if first_token_t is not None else None,
+            )
+            await _debug_log_stream_output(
+                "OPENAI /v1/chat/completions", proc, visible_text, tool_calls, finish
+            )
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(_sse(), media_type="text/event-stream")
@@ -448,6 +585,20 @@ async def chat_completions(req: ChatCompletionRequest):
             start += 1
         end = _raw_with_think.index(_THINK_CLOSE)
         reasoning_content = _raw_with_think[start:end].strip().replace("\ufffd", "")
+    metrics.record_request(
+        "chat",
+        result["prompt_tokens"],
+        result["completion_tokens"],
+        result["finish_reason"],
+        time.perf_counter() - t0,
+    )
+    _debug_log_output(
+        "OPENAI /v1/chat/completions",
+        raw_text,
+        text,
+        result["finish_reason"],
+        result["completion_tokens"],
+    )
     resp = openai_format.build_response(
         model=model_name,
         text=text,
@@ -467,8 +618,10 @@ async def completions(req: CompletionRequest):
     assert engine is not None
     _validate_sampling_params(req.temperature, req.top_p, req.n, req.stream)
     max_tokens = _validate_and_resolve_max_tokens(req.max_tokens)
+    t0 = time.perf_counter()
     prompt_ids = await _tokenize_encode(engine, req.prompt)
-    _validate_capacity(prompt_ids, max_tokens)
+    await _debug_log_input("OPENAI /v1/completions", req.model_dump(), req.prompt, prompt_ids)
+    _validate_capacity(prompt_ids, max_tokens, "completions")
 
     result = await engine.submit(prompt_ids, max_tokens, session_id=req.session_id)
     _raw_comp = await _tokenize_decode(engine, result["committed_token_ids"])
@@ -478,6 +631,20 @@ async def completions(req: CompletionRequest):
         else (chr(60) + "think" + chr(62) + "\n" + _raw_comp)
     )
     text = strip_thinking(_raw_comp_full)
+    metrics.record_request(
+        "completions",
+        result["prompt_tokens"],
+        result["completion_tokens"],
+        result["finish_reason"],
+        time.perf_counter() - t0,
+    )
+    _debug_log_output(
+        "OPENAI /v1/completions",
+        _raw_comp,
+        text,
+        result["finish_reason"],
+        result["completion_tokens"],
+    )
     return {
         "id": f"cmpl-{uuid.uuid4().hex[:24]}",
         "object": "text_completion",
@@ -590,7 +757,7 @@ async def list_models():
 
 
 @app.get("/metrics")
-async def metrics():
+async def metrics_endpoint():
     """Prometheus-compatible metrics (vLLM naming convention)."""
     assert engine is not None
     runner = engine.runner
@@ -644,6 +811,32 @@ async def metrics():
         "# TYPE vllm:kv_cache_used_blocks gauge",
         f'vllm:kv_cache_used_blocks{{model_name="{ServerEngine.MODEL}"}} {used_blocks}',
     ]
+
+    # Accuracy/correctness signal: the admission bootstrap check re-runs each
+    # speculative prefill on an independent reference slot and compares the
+    # first committed token. A non-zero failure count means the MTP path
+    # diverged from the greedy reference output (a real correctness problem).
+    lines.append(
+        "# HELP vllm:bootstrap_checks_ok_total Speculative prefills matching the reference prefill."
+    )
+    lines.append("# TYPE vllm:bootstrap_checks_ok_total counter")
+    lines.append(
+        f'vllm:bootstrap_checks_ok_total{{model_name="{ServerEngine.MODEL}"}} '
+        f"{engine.stats.get('bootstrap_checks_ok', 0)}"
+    )
+    lines.append(
+        "# HELP vllm:bootstrap_checks_failed_total Speculative prefills diverged from reference."
+    )
+    lines.append("# TYPE vllm:bootstrap_checks_failed_total counter")
+    lines.append(
+        f'vllm:bootstrap_checks_failed_total{{model_name="{ServerEngine.MODEL}"}} '
+        f"{engine.stats.get('bootstrap_checks_failed', 0)}"
+    )
+
+    # App-layer request metrics: latency, TTFT, TPOT, token throughput, and
+    # success/error counters (recorded per request in the handlers above).
+    lines.extend(metrics.render(ServerEngine.MODEL))
+
     from fastapi.responses import PlainTextResponse
 
     return PlainTextResponse("\n".join(lines) + "\n", media_type="text/plain; charset=utf-8")
@@ -669,6 +862,14 @@ async def anthropic_count_tokens(request: Request):
     chat_messages = parse_messages(body)
     tools = convert_tools_to_chat_template(body.get("tools"))
     prompt_ids = await _tokenize_chat(engine, chat_messages, tools=tools)
+    if DEBUG_REQUESTS:
+        logger.info(
+            "ANTHROPIC count_tokens: msgs=%d system_chars=%d tools=%d -> input_tokens=%d",
+            len(body.get("messages", [])),
+            len(str(body.get("system") or "")),
+            len(body.get("tools", [])),
+            len(prompt_ids),
+        )
     return {"input_tokens": len(prompt_ids)}
 
 
@@ -681,6 +882,7 @@ async def anthropic_count_tokens(request: Request):
 async def anthropic_messages(request: Request):
     assert engine is not None
     body = await request.json()
+    t0 = time.perf_counter()
 
     # Diagnostic: log request shape for Claude Desktop debugging
     _sys = body.get("system")
@@ -705,6 +907,7 @@ async def anthropic_messages(request: Request):
     # Parse through the Anthropic format layer (handles array content, tool_use, tool_result)
     chat_messages = anthropic_format.parse_messages(body)
     if not chat_messages:
+        metrics.record_error("messages", 400)
         return JSONResponse(
             status_code=400,
             content={
@@ -717,9 +920,11 @@ async def anthropic_messages(request: Request):
     tools = convert_tools_to_chat_template(body.get("tools"))
 
     prompt_ids = await _tokenize_chat(engine, chat_messages, tools=tools)
+    await _debug_log_input("ANTHROPIC /v1/messages", body, chat_messages, prompt_ids)
 
     effective_max = min(max_tokens, engine.capacity_tokens_per_slot - len(prompt_ids) - 1)
     if effective_max < 1:
+        metrics.record_error("messages", 400)
         return JSONResponse(
             status_code=400,
             content={
@@ -737,6 +942,7 @@ async def anthropic_messages(request: Request):
         async def _anthropic_sse():
             proc = StreamProcessor(engine.tok)
             final_result = None
+            first_token_t = None
             msg_id = f"msg_{uuid.uuid4().hex[:24]}"
             msg_start = {
                 "type": "message_start",
@@ -764,6 +970,8 @@ async def anthropic_messages(request: Request):
                     final_result = item
                     break
                 proc.add_tokens(item)
+                if first_token_t is None and item:
+                    first_token_t = time.perf_counter()
 
                 for td in proc.drain_thinking():
                     if not thinking_open:
@@ -874,6 +1082,17 @@ async def anthropic_messages(request: Request):
                 "usage": {"input_tokens": len(prompt_ids), "output_tokens": out_tokens},
             }
             yield f"event: message_delta\ndata: {_json.dumps(msg_delta)}\n\n"
+            metrics.record_request(
+                "messages",
+                len(prompt_ids),
+                len(proc.all_ids),
+                finish,
+                time.perf_counter() - t0,
+                (first_token_t - t0) if first_token_t is not None else None,
+            )
+            await _debug_log_stream_output(
+                "ANTHROPIC /v1/messages", proc, visible_text, tool_calls, finish
+            )
             yield "event: message_stop\ndata: " + _json.dumps({"type": "message_stop"}) + "\n\n"
 
         return StreamingResponse(_anthropic_sse(), media_type="text/event-stream")
@@ -887,6 +1106,20 @@ async def anthropic_messages(request: Request):
         else (chr(60) + "think" + chr(62) + "\n" + _raw_anth)
     )
     text = strip_thinking(_raw_anth_full)
+    metrics.record_request(
+        "messages",
+        result["prompt_tokens"],
+        result["completion_tokens"],
+        result["finish_reason"],
+        time.perf_counter() - t0,
+    )
+    _debug_log_output(
+        "ANTHROPIC /v1/messages",
+        _raw_anth,
+        text,
+        result["finish_reason"],
+        result["completion_tokens"],
+    )
     return anthropic_format.build_response(
         model=model_name,
         text=text,

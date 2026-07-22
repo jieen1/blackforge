@@ -185,9 +185,10 @@ python -m pytest tests/ -q
 | Env Variable | Default | Description |
 |-------------|---------|-------------|
 | `QSR_SERVER_CAPACITY` | `4` | Max concurrent requests |
-| `QSR_SERVER_NUM_SLOTS` | `16` | Total internal slots |
-| `QSR_SERVER_BLOCKS_PER_SLOT` | `4200` | KV blocks per slot (×16 = tokens) |
-| `QSR_SERVER_PRODUCTION` | `0` | Production mode: skip validation slots |
+| `QSR_SERVER_NUM_SLOTS` | `8` | Total internal slots |
+| `QSR_SERVER_BLOCKS_PER_SLOT` | `16384` | KV blocks per slot (×16 = tokens) ⇒ 256K context |
+| `QSR_SERVER_PRODUCTION` | `1` | Production mode: skip validation slots |
+| `QSR_DEBUG_REQUESTS` | `1` | Log raw request/response (input + output) for debugging |
 | `QSR_SERVED_MODEL_NAME` | model ID | Advertised model name(s) |
 | `QSR_SERVER_ENABLE_CUDAGRAPH` | `1` | Enable CUDA Graph capture |
 | `QSR_SERVER_ENABLE_PREFIX_CACHE` | `1` | Enable prefix caching |
@@ -200,6 +201,22 @@ python -m pytest tests/ -q
 | 16384              | 256K        | 3        | 6                        |
 | 8192               | 128K        | 4        | 8                        |
 | 4200               | 67K         | 4        | 16                       |
+
+The deployed production runtime (`~/vllm_server/vllm_ctl.sh`) currently runs
+`CAPACITY=2`, `NUM_SLOTS=2`, `BLOCKS_PER_SLOT=16384` (256K).
+
+## Metrics & Observability
+
+`GET /metrics` exposes Prometheus metrics in the vLLM naming convention
+(`vllm:*`), scraped by the local Prometheus container. They cover speed
+(`e2e_request_latency_seconds`, `time_to_first_token_seconds`,
+`request_time_per_output_token_seconds`, prompt/generation token histograms
+and throughput counters), stability/reliability (`num_requests_running`,
+`num_requests_waiting`, `request_success_total` by finish reason,
+`request_errors_total` by status code, KV-cache utilisation), and accuracy
+(`bootstrap_checks_ok/failed_total` speculative-prefill correctness, prefix
+cache hit rate). See [`server/README.md`](server/README.md#metrics) for the
+full metric-by-metric reference and example PromQL.
 
 ## Development
 

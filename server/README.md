@@ -3,38 +3,73 @@
 The server exposes the fixed-slot engine (`server/engine.py`'s
 `ServerEngine`, a thin continuous-batching wrapper around the ONE
 production-validated `DirectModelRunner` runtime in
-`runtime/direct_model_runner.py`) through an OpenAI-compatible interface.
-Do not add multi-model or multi-GPU routing here.
+`runtime/direct_model_runner.py`) through OpenAI- AND Anthropic-compatible
+interfaces. Do not add multi-model or multi-GPU routing here.
 
 ## Endpoints
 
-- `POST /v1/chat/completions`, `POST /v1/completions` — non-streaming,
-  greedy-only (temperature 0 / top_p 1.0 / n 1; anything else is a clean
-  400, not a crash). A request whose `prompt + max_tokens` would exceed the
-  per-slot capacity is rejected with a clean 400 BEFORE it reaches the
-  runtime. Each response carries non-standard
-  `debug_committed_token_ids` / `debug_prompt_token_ids`, used solely by
-  `benchmarks/server_e2e_check.py` (any real OpenAI client ignores them).
+- `POST /v1/chat/completions` — OpenAI chat. Streaming (`stream=true`,
+  SSE) and non-streaming. Thinking is streamed as `reasoning_content`
+  deltas (vLLM-compatible).
+- `POST /v1/completions` — OpenAI text completion (non-streaming).
+- `POST /v1/messages` — Anthropic Messages API (Claude Desktop). Streaming
+  (`message_start` / `content_block_*` / `message_delta` / `message_stop`
+  SSE) and non-streaming. Thinking is emitted as a `thinking` content block.
+- `POST /v1/messages/count_tokens` — Anthropic token counting (Claude
+  Desktop calls this before sending).
+- `GET /v1/models` — model card; `max_model_len` reports the live per-slot
+  context ceiling (`capacity_tokens_per_slot`).
+- `GET /metrics` — Prometheus exposition (vLLM naming; see **Metrics** below).
 - `GET /health` — liveness + slot occupancy.
 - `GET /debug/stats` — the engine's admission/round counters plus the P0
   prompt-prefix-overlap, P4a prefix-cache hit-rate, and P4b session-affinity
   instrumentation.
 
+Decoding is greedy (MTP verify requires a greedy match). `n != 1` is a clean
+400. A request whose `prompt + max_tokens + K` would exceed the per-slot
+capacity is rejected with a clean 400 BEFORE it reaches the runtime (this is
+what keeps the server from triggering the known whole-batch attention crash).
+Non-streaming responses carry non-standard `debug_committed_token_ids` /
+`debug_prompt_token_ids`, used solely by `benchmarks/server_e2e_check.py`
+(real clients ignore them).
+
 ## Configuration
 
-Set via env (read at import) or `python -m server.app` flags:
+Set via env (read at import) or `python -m server.app` flags. "Deployed" is
+what `~/vllm_server/vllm_ctl.sh` actually sets for the production runtime.
 
-| Env | Flag | Default | Meaning |
-| --- | --- | --- | --- |
-| `QSR_SERVER_CAPACITY` | `--capacity` | 4 | concurrent production slots |
-| `QSR_SERVER_NUM_SLOTS` | `--num-slots` | 16 | total slots (prod + ref + diag + captured-graph warmup) |
-| `QSR_SERVER_BLOCKS_PER_SLOT` | `--blocks-per-slot` | 4200 | per-slot KV ceiling (`× block_size` tokens) |
-| `QSR_SERVER_ENABLE_CUDAGRAPH` | `--no-cudagraph` | 1 | captured decode graph |
-| `QSR_SERVER_ENABLE_PREFIX_CACHE` | `--no-prefix-cache` | 1 | persistent prefix cache (P4a) |
-| `QSR_SERVER_ENABLE_SESSION_AFFINITY` | `--session-affinity` | 0 | opt-in session-affinity warm-slot retention (P4b) |
-| `QSR_SERVER_SESSION_TTL_S` | `--session-ttl-s` | 30.0 | warm-slot retention TTL in seconds (P4b) |
-| `QSR_SERVER_KV_CACHE_DTYPE` | — | fp8_e4m3 | KV cache dtype |
-| `QSR_SERVER_GPU_MEM_UTIL` | — | 0.85 | vLLM `gpu_memory_utilization` |
+| Env | Flag | Code default | Deployed | Meaning |
+| --- | --- | --- | --- | --- |
+| `QSR_SERVER_CAPACITY` | `--capacity` | 4 | 2 | concurrent production slots |
+| `QSR_SERVER_NUM_SLOTS` | `--num-slots` | 8 | 2 | total physical slots |
+| `QSR_SERVER_BLOCK_SIZE` | — | 16 | 16 | KV block size (tokens/block) |
+| `QSR_SERVER_BLOCKS_PER_SLOT` | `--blocks-per-slot` | 16384 | 16384 | per-slot KV ceiling (`× block_size` tokens) ⇒ **256K** |
+| `QSR_SERVER_ENABLE_CUDAGRAPH` | `--no-cudagraph` | 1 | 0 | captured decode graph |
+| `QSR_SERVER_ENABLE_PREFIX_CACHE` | `--no-prefix-cache` | 1 | 1 | persistent prefix cache (P4a) |
+| `QSR_SERVER_ENABLE_SESSION_AFFINITY` | `--session-affinity` | 0 | 0 | opt-in warm-slot retention (P4b) |
+| `QSR_SERVER_SESSION_TTL_S` | `--session-ttl-s` | 30.0 | 30.0 | warm-slot retention TTL seconds (P4b) |
+| `QSR_SERVER_KV_CACHE_DTYPE` | — | fp8_e4m3 | fp8_e4m3 | KV cache dtype |
+| `QSR_SERVER_GPU_MEM_UTIL` | — | 0.85 | 0.85 | vLLM `gpu_memory_utilization` |
+| `QSR_SERVER_PRODUCTION` | — | 1 | 1 | production slot layout (vs. diagnostic layout) |
+| `QSR_SERVED_MODEL_NAME` | — | engine MODEL | `qwen3.6-rt` | name(s) reported by `/v1/models` (space-separated list) |
+| `QSR_DEBUG_REQUESTS` | — | 1 | 1 | log raw request/response (see **Raw I/O logging**); legacy alias `QSR_DEBUG_ANTHROPIC` |
+
+CLI also accepts `--host` / `--port` (default `127.0.0.1:8000`).
+
+### Long context (256K)
+
+`blocks_per_slot` is the per-slot KV capacity CEILING
+(`blocks_per_slot * block_size` tokens); `capacity_ok` rejects any request
+whose `prompt + max_tokens + K` would exceed it BEFORE it reaches the
+runtime. The default **16384 ⇒ 262144-token (256K) ceiling**. The KV cache is
+a single shared `BlockPool` of ~40000 blocks (sized in `engine.py`
+`_load_model` to fit the GPU with headroom for activations/GDN snapshots);
+blocks are allocated FROM that pool ON DEMAND per slot, not reserved up front,
+so idle `vllm:kv_cache_used_blocks` is 0. Two simultaneous 256K requests
+(2 × 16384 = 32768 blocks) fit within the pool with spare for the prefix
+cache. The previous deployed value (4200 ⇒ 67200) wrongly rejected real
+long-context requests (e.g. `prompt 25843 + max_tokens 64000`); see
+`tests/test_format_regression.py`.
 
 ### Prefix cache (P4a)
 
@@ -46,15 +81,14 @@ conversation, or unrelated requests sharing a system prompt / codebase
 bundle, skip re-prefilling the cached prefix. The hit depth `L` and the
 prefill tokens saved are reported by `/debug/stats` under
 `prefix_cache_hits` / `prefix_cache_misses` / `prefix_cache_hit_rate` /
-`prefix_cache_hit_L_samples` / `prefix_cache_hit_tokens_saved`.
+`prefix_cache_hit_L_samples` / `prefix_cache_hit_tokens_saved`, and the
+counters are exported as `vllm:prefix_cache_hits_total` /
+`vllm:prefix_cache_misses_total` / `vllm:prefix_cache_hit_rate`.
 
 `--no-prefix-cache` (or `QSR_SERVER_ENABLE_PREFIX_CACHE=0`) rolls back to
-the pre-P4a server **byte-for-byte**: the runner is constructed with no
-cache flags, `mtp_prefill_with_cache` delegates straight to
-`mtp_prefill_batch`, and `prefix_cache_hits` stays 0. `_finish_request`
-still does an unconditional `reset_slot` in P4a — the content-hash cache
-survives reset by design (R10). Session affinity (`session_id` + warm-slot
-TTL retention) is the separate P4b optimization (below).
+the pre-P4a server **byte-for-byte**. `_finish_request` still does an
+unconditional `reset_slot` in P4a — the content-hash cache survives reset by
+design (R10).
 
 ### Session affinity (P4b)
 
@@ -65,46 +99,90 @@ the server retains the finished slot **warm** for `QSR_SERVER_SESSION_TTL_S`
 **zero restore** — it skips the GDN-checkpoint copy + block `touch` that a
 content-hash hit (P4a) otherwise performs, via the runtime's gated
 `mtp_prefill_warm_continue`. The content-hash cache (P4a) remains the
-correctness-bearing fallback: if the next turn's prompt does not reproduce the
-retained slot's committed prefix exactly (the tokenizer re-segments at the turn
-boundary, and the runtime's committed boundary can run a few tokens past the
-`max_tokens`-truncated response), the request falls back to the normal
-cold/content-hash path. A retained slot's blocks stay pinned (`ref_cnt >= 1`)
-against `capacity=4`, bounded by the TTL; expiry (or shutdown/crash) resets +
-releases them exactly once (published blocks keep their hash, so they stay
-hit-able at `ref_cnt == 0`, R10). Requires the prefix cache:
+correctness-bearing fallback if the next turn's prompt does not reproduce the
+retained slot's committed prefix exactly. Requires the prefix cache:
 `--session-affinity` + `--no-prefix-cache` is refused at startup. Without a
-`session_id` (or with the flag off) behavior is byte-for-byte P4a
-(`_finish_request` does the unconditional `reset_slot`). `/debug/stats` reports
-`session_warm_continuations` (+ a bounded `session_warm_continuation_samples`
-list), `session_retentions`, `session_expirations`, and `session_warm_fallbacks`;
-a warm turn advances `session_warm_continuations` but NOT `prefix_cache_hits`
-(the definitive zero-restore signal).
+`session_id` (or with the flag off) behavior is byte-for-byte P4a.
+`/debug/stats` reports `session_warm_continuations`, `session_retentions`,
+`session_expirations`, and `session_warm_fallbacks`; a warm turn advances
+`session_warm_continuations` but NOT `prefix_cache_hits` (the definitive
+zero-restore signal).
 
-### Long context (`blocks_per_slot`)
+## Metrics
 
-`blocks_per_slot` is the fixed per-slot KV capacity ceiling
-(`blocks_per_slot * block_size` tokens); `capacity_ok` rejects any request
-whose `prompt + max_tokens + K` would exceed it BEFORE it reaches the
-runtime. The default 4200 (⇒ 67200-token ceiling) admits a real ≥64K
-request (`ceil((65536 + max_tokens)/16) ≈ 4113`). The KV cache is allocated
-up front for the whole shared `BlockPool` (`(num_slots + 1) *
-blocks_per_slot` blocks), so this is a fixed startup cost paid regardless
-of how many slots are active: at `num_slots=16` / `blocks_per_slot=4200`
-the server starts at ~79.5 GiB of the 95.6 GiB card (verified — see
-`notes/prefix-cache-implementation-log.md`, P4a). A single 64K request is
-admissible; 4×64K-simultaneous is gated by prefill activation memory (a
-pre-existing runtime characteristic, session-notes §16.4), not block
-availability — reduced-concurrency 64K is the achievable shape.
+`GET /metrics` returns Prometheus text in the vLLM naming convention
+(`vllm:*`, all labelled `model_name`), scraped by the local Prometheus
+(`~/vllm_server` docker `vllm-prometheus`, job `vllm`, 15s interval).
+
+**Performance / speed** (the core focus; app-layer, recorded per request in
+`server/metrics.py`, labelled by `endpoint` ∈ {`chat`, `completions`,
+`messages`}):
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `vllm:e2e_request_latency_seconds` | histogram | request received → response complete |
+| `vllm:time_to_first_token_seconds` | histogram | streaming time to first generated token (TTFT) |
+| `vllm:request_time_per_output_token_seconds` | histogram | `(e2e − ttft) / (gen_tokens − 1)` (TPOT) |
+| `vllm:request_prompt_tokens` | histogram | prompt-length distribution |
+| `vllm:request_generation_tokens` | histogram | generation-length distribution |
+| `vllm:prompt_tokens_total` | counter | total prompt tokens processed (throughput) |
+| `vllm:generation_tokens_total` | counter | total generation tokens produced (throughput) |
+
+**Stability / reliability:**
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `vllm:num_requests_running` | gauge | requests currently generating |
+| `vllm:num_requests_waiting` | gauge | requests queued for a slot |
+| `vllm:num_free_slots` | gauge | free production slots |
+| `vllm:request_success_total` | counter | successful requests by `endpoint` + `finish_reason` (`stop`/`length`/`tool_calls`) |
+| `vllm:request_errors_total` | counter | rejected/failed requests by `endpoint` + status `code` (400 capacity/invalid, 500 internal) |
+| `vllm:requests_completed_total` | counter | engine-level completed requests |
+| `vllm:kv_cache_usage_perc` | gauge | KV cache utilisation (0–1) |
+| `vllm:kv_cache_total_blocks` / `vllm:kv_cache_used_blocks` | gauge | KV block pool size / in use |
+| `vllm:capacity_tokens_per_slot` | gauge | live per-slot context ceiling (256K = 262144) |
+
+**Accuracy / correctness:**
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `vllm:bootstrap_checks_ok_total` | counter | speculative prefills matching the independent reference prefill |
+| `vllm:bootstrap_checks_failed_total` | counter | speculative prefills that DIVERGED from reference (non-zero = correctness problem) |
+| `vllm:prefix_cache_hit_rate` | gauge | prefix-cache hit rate (warm-restart correctness + speed) |
+| `vllm:prefix_cache_hits_total` / `vllm:prefix_cache_misses_total` | counter | prefix-cache hits / misses |
+
+Useful PromQL:
+- p50/p99 latency: `histogram_quantile(0.99, sum(rate(vllm:e2e_request_latency_seconds_bucket[5m])) by (le))`
+- p99 TTFT: `histogram_quantile(0.99, sum(rate(vllm:time_to_first_token_seconds_bucket[5m])) by (le))`
+- output throughput (tok/s): `sum(rate(vllm:generation_tokens_total[1m]))`
+- error rate: `sum(rate(vllm:request_errors_total[5m])) / sum(rate(vllm:request_success_total[5m]) + rate(vllm:request_errors_total[5m]))`
+
+## Raw I/O logging
+
+With `QSR_DEBUG_REQUESTS=1` (default ON) every request logs, to the service
+log (`~/vllm_server/logs/current.log`):
+
+- `<ENDPOINT> RAW REQUEST (N bytes): <full JSON body>` — the verbatim client
+  request (OpenAI and Anthropic alike).
+- `<ENDPOINT> PARSED MESSAGES: <parsed chat messages>` — what the format
+  layer produced.
+- `<ENDPOINT> DECODED PROMPT (N ids, M chars): <text>` — the EXACT input fed
+  to the model.
+- `<ENDPOINT> RAW OUTPUT (N tokens, finish=..., M chars): <text>` and
+  `<ENDPOINT> VISIBLE OUTPUT (M chars): <text>` — the model's raw decoded
+  output and the thinking-stripped visible text.
+
+This is how format/length bugs are diagnosed (compare RAW REQUEST → PARSED →
+DECODED PROMPT to see whether a user message survived). Set
+`QSR_DEBUG_REQUESTS=0` to disable in production. When a real request exposes a
+bug, capture its RAW REQUEST line into `tests/fixtures/` and add a case to
+`tests/test_format_regression.py`.
 
 ## Validation
 
 `python -m benchmarks.server_e2e_check` starts the real server (uvicorn +
 genuine HTTP over a real socket) and verifies: a basic round-trip,
 independent-reference-replay correctness, genuine concurrent batching,
-defensive rejections, the P4a turn-1/turn-2 prefix-cache hit (the hit
-engages, INV1 end-to-end token match vs an independent cold reference, and
-a TTFT drop), and the P4b session-affinity warm-continue (turn 2 continues
-the retained warm slot in place: `session_warm_continuations` +1 while
-`prefix_cache_hits` does NOT advance — zero restore — plus the exact-prefix
-precondition, INV1 end-to-end match, and a TTFT drop).
+defensive rejections, the P4a turn-1/turn-2 prefix-cache hit, and the P4b
+session-affinity warm-continue. `tests/test_format_regression.py` (CPU-only,
+runs in CI) locks the real captured request shapes and the 256K capacity fix.

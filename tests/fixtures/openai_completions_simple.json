@@ -1,0 +1,10 @@
+{
+  "model": "qwen3.6-rt",
+  "prompt": "Translate the following English sentence to French: Hello, how are you?",
+  "max_tokens": 256,
+  "temperature": null,
+  "top_p": null,
+  "n": null,
+  "stream": false,
+  "session_id": null
+}

@@ -1,0 +1,226 @@
+"""Prometheus-style request metrics for the BlackForge server.
+
+Hand-rolled (no ``prometheus_client`` dependency) to match the existing
+hand-rolled ``/metrics`` endpoint in ``server/app.py`` and to honour the
+repo's "no new dependencies" rule. Metric names follow the vLLM convention
+(``vllm:*``) so the existing Prometheus scrape config and dashboards keep
+working whether the service runs as this custom runtime or as ``vllm serve``.
+
+What this module records (all measured at the request layer, so every value
+is real, not estimated):
+
+Performance:
+- ``vllm:e2e_request_latency_seconds``      end-to-end latency per request
+- ``vllm:time_to_first_token_seconds``      streaming time-to-first-token
+- ``vllm:request_time_per_output_token_seconds``  (e2e - ttft) / (gen - 1)
+- ``vllm:request_prompt_tokens``            prompt-length distribution
+- ``vllm:request_generation_tokens``        generation-length distribution
+- ``vllm:prompt_tokens_total`` / ``vllm:generation_tokens_total``  throughput
+
+Reliability:
+- ``vllm:request_success_total``            labelled by endpoint + finish_reason
+- ``vllm:request_errors_total``             labelled by endpoint + status code
+
+Thread-safety: every mutation takes ``_LOCK``. In practice all recording
+happens on the asyncio event-loop thread, but the lock is cheap insurance
+against the engine thread's callbacks.
+"""
+
+from __future__ import annotations
+
+import threading
+
+_LOCK = threading.Lock()
+
+# vLLM-compatible histogram bucket boundaries.
+LATENCY_BUCKETS = (0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 60.0, 120.0, 300.0)
+TTFT_BUCKETS = (0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0)
+TPOT_BUCKETS = (0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0)
+PROMPT_TOKEN_BUCKETS = (16, 64, 256, 1024, 4096, 16384, 65536, 262144)
+GENERATION_TOKEN_BUCKETS = (16, 64, 256, 1024, 4096, 16384, 65536)
+
+
+class _Histogram:
+    """Cumulative-bucket histogram. ``series`` maps a label tuple to a list of
+    ``len(buckets)`` cumulative counts plus ``[sum, count]``."""
+
+    def __init__(self, buckets: tuple[float, ...]) -> None:
+        self.buckets = buckets
+        self.series: dict[tuple, list[float]] = {}
+
+    def observe(self, value: float, labels: tuple = ()) -> None:
+        with _LOCK:
+            entry = self.series.get(labels)
+            if entry is None:
+                entry = [0.0] * (len(self.buckets) + 2)
+                self.series[labels] = entry
+            for i, bound in enumerate(self.buckets):
+                if value <= bound:
+                    entry[i] += 1
+            entry[-2] += value  # sum
+            entry[-1] += 1  # count
+
+
+class _Counter:
+    def __init__(self) -> None:
+        self.series: dict[tuple, float] = {}
+
+    def inc(self, amount: float = 1.0, labels: tuple = ()) -> None:
+        with _LOCK:
+            self.series[labels] = self.series.get(labels, 0.0) + amount
+
+
+# -- global metric instances -------------------------------------------------
+E2E_LATENCY = _Histogram(LATENCY_BUCKETS)
+TTFT = _Histogram(TTFT_BUCKETS)
+TPOT = _Histogram(TPOT_BUCKETS)
+PROMPT_TOKENS_HIST = _Histogram(PROMPT_TOKEN_BUCKETS)
+GENERATION_TOKENS_HIST = _Histogram(GENERATION_TOKEN_BUCKETS)
+PROMPT_TOKENS_TOTAL = _Counter()
+GENERATION_TOKENS_TOTAL = _Counter()
+REQUEST_SUCCESS = _Counter()  # labels: (endpoint, finish_reason)
+REQUEST_ERRORS = _Counter()  # labels: (endpoint, status_code)
+
+
+def record_request(
+    endpoint: str,
+    prompt_tokens: int,
+    generation_tokens: int,
+    finish_reason: str,
+    e2e_seconds: float,
+    ttft_seconds: float | None = None,
+) -> None:
+    """Record one completed inference request (streaming or not)."""
+    ep = (endpoint,)
+    PROMPT_TOKENS_HIST.observe(float(prompt_tokens), ep)
+    GENERATION_TOKENS_HIST.observe(float(generation_tokens), ep)
+    PROMPT_TOKENS_TOTAL.inc(float(prompt_tokens), ep)
+    GENERATION_TOKENS_TOTAL.inc(float(generation_tokens), ep)
+    E2E_LATENCY.observe(e2e_seconds, ep)
+    REQUEST_SUCCESS.inc(1.0, (endpoint, finish_reason))
+    if ttft_seconds is not None and generation_tokens > 1:
+        TTFT.observe(ttft_seconds, ep)
+        TPOT.observe((e2e_seconds - ttft_seconds) / (generation_tokens - 1), ep)
+
+
+def record_error(endpoint: str, status_code: int) -> None:
+    REQUEST_ERRORS.inc(1.0, (endpoint, str(status_code)))
+
+
+def _fmt(value: float) -> str:
+    # Counters/sums are integral-ish; keep ints clean, floats with precision.
+    if value == int(value):
+        return str(int(value))
+    return f"{value:.6g}"
+
+
+def _render_histogram(
+    lines: list[str], name: str, help_text: str, model_name: str, hist: _Histogram
+) -> None:
+    if not hist.series:
+        return
+    lines.append(f"# HELP {name} {help_text}")
+    lines.append(f"# TYPE {name} histogram")
+    for labels, entry in sorted(hist.series.items()):
+        base = f'model_name="{model_name}"'
+        for key, value in zip(("endpoint",), labels):
+            base += f',{key}="{value}"'
+        cumulative = 0.0
+        for bound, count in zip(hist.buckets, entry[: len(hist.buckets)]):
+            cumulative = count  # entries are already cumulative
+            lines.append(f'{name}_bucket{{{base},le="{bound}"}} {_fmt(cumulative)}')
+        lines.append(f'{name}_bucket{{{base},le="+Inf"}} {_fmt(entry[-1])}')
+        lines.append(f"{name}_sum{{{base}}} {_fmt(entry[-2])}")
+        lines.append(f"{name}_count{{{base}}} {_fmt(entry[-1])}")
+
+
+def _render_counter(
+    lines: list[str],
+    name: str,
+    help_text: str,
+    model_name: str,
+    counter: _Counter,
+    label_names: tuple[str, ...],
+) -> None:
+    if not counter.series:
+        return
+    lines.append(f"# HELP {name} {help_text}")
+    lines.append(f"# TYPE {name} counter")
+    for labels, value in sorted(counter.series.items()):
+        parts = [f'model_name="{model_name}"']
+        for key, val in zip(label_names, labels):
+            parts.append(f'{key}="{val}"')
+        lines.append(f"{name}{{{','.join(parts)}}} {_fmt(value)}")
+
+
+def render(model_name: str) -> list[str]:
+    """Render all app-layer request metrics as Prometheus exposition lines."""
+    lines: list[str] = []
+    _render_histogram(
+        lines,
+        "vllm:e2e_request_latency_seconds",
+        "End-to-end request latency in seconds (request received -> response complete).",
+        model_name,
+        E2E_LATENCY,
+    )
+    _render_histogram(
+        lines,
+        "vllm:time_to_first_token_seconds",
+        "Streaming time to first generated token in seconds.",
+        model_name,
+        TTFT,
+    )
+    _render_histogram(
+        lines,
+        "vllm:request_time_per_output_token_seconds",
+        "Mean time per output token in seconds ((e2e - ttft) / (generation_tokens - 1)).",
+        model_name,
+        TPOT,
+    )
+    _render_histogram(
+        lines,
+        "vllm:request_prompt_tokens",
+        "Distribution of prompt length in tokens.",
+        model_name,
+        PROMPT_TOKENS_HIST,
+    )
+    _render_histogram(
+        lines,
+        "vllm:request_generation_tokens",
+        "Distribution of generation length in tokens.",
+        model_name,
+        GENERATION_TOKENS_HIST,
+    )
+    _render_counter(
+        lines,
+        "vllm:prompt_tokens_total",
+        "Total prompt tokens processed.",
+        model_name,
+        PROMPT_TOKENS_TOTAL,
+        ("endpoint",),
+    )
+    _render_counter(
+        lines,
+        "vllm:generation_tokens_total",
+        "Total generation tokens produced.",
+        model_name,
+        GENERATION_TOKENS_TOTAL,
+        ("endpoint",),
+    )
+    _render_counter(
+        lines,
+        "vllm:request_success_total",
+        "Total successful requests by endpoint and finish reason.",
+        model_name,
+        REQUEST_SUCCESS,
+        ("endpoint", "finish_reason"),
+    )
+    _render_counter(
+        lines,
+        "vllm:request_errors_total",
+        "Total rejected/failed requests by endpoint and status code.",
+        model_name,
+        REQUEST_ERRORS,
+        ("endpoint", "code"),
+    )
+    return lines

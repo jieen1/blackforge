@@ -1,0 +1,14 @@
+{
+  "model": "qwen3.6-rt",
+  "messages": [
+    {"role": "user", "content": "What is the capital of France? One word."}
+  ],
+  "max_tokens": 100,
+  "temperature": null,
+  "top_p": null,
+  "n": null,
+  "stream": false,
+  "tools": null,
+  "tool_choice": null,
+  "session_id": null
+}
