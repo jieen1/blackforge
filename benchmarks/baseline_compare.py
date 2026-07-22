@@ -36,24 +36,37 @@ def run_attention_microbench(baseline: dict) -> dict:
     """Run attention kernel microbench and compare."""
     params = baseline["attention_kernel_microbench"]["_params"]
     script = os.path.join(_REPO_ROOT, "benchmarks/kernel_microbench_split.py")
-    cmd = f"{VLLM_PYTHON} {script} {params} --json"
+    cmd = f"{VLLM_PYTHON} {script} {params}"
     print(f"  Running: {cmd}")
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True, cwd=_REPO_ROOT)
     if result.returncode != 0:
         print(f"  ⚠ Microbench failed: {result.stderr[-200:]}")
         return {"status": "error", "error": result.stderr[-200:]}
 
-    # Parse JSON output from last line
-    lines = result.stdout.strip().split("\n")
-    for line in reversed(lines):
-        line = line.strip()
-        if line.startswith("{"):
-            try:
-                data = json.loads(line)
-                return data
-            except json.JSONDecodeError:
-                continue
-    return {"status": "error", "error": "no JSON in output", "stdout": result.stdout[-500:]}
+    # Parse text output:
+    # TIME: 1.883 ms/call   eff_KV_BW: 570 GB/s
+    # FLASHINFER: 2.117 ms/call   eff_KV_BW: 507 GB/s   ratio(sm120/fi)=0.889x
+    # CORRECTNESS: cos=0.99939835 max_rel=0.041419
+    import re as _re
+    out = result.stdout
+    data = {}
+    m = _re.search(r"TIME:\s+([\d.]+)\s+ms/call\s+eff_KV_BW:\s+([\d.]+)", out)
+    if m:
+        data["sm120_ms"] = float(m.group(1))
+        data["eff_kv_bw_gb_s"] = float(m.group(2))
+    m = _re.search(r"FLASHINFER:\s+([\d.]+)\s+ms/call", out)
+    if m:
+        data["flashinfer_ms"] = float(m.group(1))
+    m = _re.search(r"ratio\(sm120/fi\)=([\d.]+)", out)
+    if m:
+        ratio = float(m.group(1))
+        data["speedup_vs_flashinfer"] = round(1.0 / ratio, 2) if ratio > 0 else 0
+    m = _re.search(r"cos=([\d.]+)", out)
+    if m:
+        data["correctness_cos"] = float(m.group(1))
+    if not data:
+        return {"status": "error", "error": "no parseable output", "stdout": out[-500:]}
+    return data
 
 
 def run_warm_throughput(baseline: dict) -> dict:
@@ -61,7 +74,7 @@ def run_warm_throughput(baseline: dict) -> dict:
     cfg = baseline["e2e_warm_throughput"]["ctx64k_c4"]
     params = cfg["_params"]
     script = os.path.join(_REPO_ROOT, "benchmarks/prefix_cache_warm_throughput_check.py")
-    cmd = f"{VLLM_PYTHON} {script} {params} --json"
+    cmd = f"{VLLM_PYTHON} {script} {params}"
     print(f"  Running: {cmd}")
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True,
                             cwd=_REPO_ROOT, timeout=600)
@@ -69,15 +82,30 @@ def run_warm_throughput(baseline: dict) -> dict:
         print(f"  ⚠ Throughput check failed: {result.stderr[-200:]}")
         return {"status": "error", "error": result.stderr[-200:]}
 
-    lines = result.stdout.strip().split("\n")
-    for line in reversed(lines):
-        line = line.strip()
-        if line.startswith("{"):
-            try:
-                return json.loads(line)
-            except json.JSONDecodeError:
-                continue
-    return {"status": "error", "error": "no JSON in output", "stdout": result.stdout[-500:]}
+    # Parse text output for warm_accepted_tok_s
+    import re as _re
+    out = result.stdout
+    data = {}
+    m = _re.search(r"warm[_ ]accepted[_ ]tok(?:ens)?/s[:\s=]+([\d.]+)", out, _re.IGNORECASE)
+    if not m:
+        m = _re.search(r"([\d.]+)\s*(?:accepted\s+)?tok(?:ens)?/s", out)
+    if m:
+        data["warm_accepted_tok_s"] = float(m.group(1))
+    m = _re.search(r"acceptance[_ ]rate[:\s=]+([\d.]+)", out, _re.IGNORECASE)
+    if m:
+        data["acceptance_rate"] = float(m.group(1))
+    if not data:
+        # Try JSON fallback (in case --json is added later)
+        lines = out.strip().split("\n")
+        for line in reversed(lines):
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    return json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+        return {"status": "error", "error": "no parseable output", "stdout": out[-500:]}
+    return data
 
 
 def compare_metric(name: str, baseline_val: float, current_val: float,
