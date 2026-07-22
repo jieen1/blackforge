@@ -21,6 +21,31 @@ _PARAM_RE = re.compile(
 )
 
 
+def _repair_json(value: str) -> str:
+    """Attempt to repair common JSON formatting errors from model output.
+
+    Models occasionally produce near-valid JSON with predictable mutations:
+    - ``{("key": ...)}`` instead of ``[{"key": ...}]`` (set-literal confusion)
+    - Trailing commas before ``]`` or ``}``
+    """
+    repaired = value.strip()
+    # Pattern: {("key": val, ...)}] -> [{"key": val, ...}]
+    # The model sometimes wraps a dict in set-literal syntax {( ... )}
+    # instead of putting it in an array [{ ... }].
+    if repaired.startswith("{("):
+        inner = repaired[2:]  # strip leading {(
+        if inner.endswith("})]"):
+            inner = inner[:-3] + "}]"
+        elif inner.endswith(")}"):
+            inner = inner[:-2] + "}]"
+        elif inner.endswith(")"):
+            inner = inner[:-1] + "}]"
+        repaired = "[{" + inner
+    # Trailing commas: ,] or ,}
+    repaired = re.sub(r",\s*([}\]])", r"\1", repaired)
+    return repaired
+
+
 def parse_tool_calls(text: str) -> tuple[str, list[dict]]:
     """Parse tool calls from model output.
 
@@ -39,7 +64,11 @@ def parse_tool_calls(text: str) -> tuple[str, list[dict]]:
             try:
                 arguments[param_name] = json.loads(param_value)
             except (json.JSONDecodeError, ValueError):
-                arguments[param_name] = param_value
+                # Attempt repair of common model JSON errors
+                try:
+                    arguments[param_name] = json.loads(_repair_json(param_value))
+                except (json.JSONDecodeError, ValueError):
+                    arguments[param_name] = param_value
         tool_calls.append({"name": func_name, "arguments": arguments})
     visible = _TOOL_CALL_RE.sub("", text).strip()
     return visible, tool_calls
