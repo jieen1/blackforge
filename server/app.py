@@ -315,6 +315,8 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: str | dict | None = None
     session_id: str | None = None
     response_format: dict | None = None
+    logprobs: bool | None = False
+    top_logprobs: int | None = None
     # Forwarded to the chat template (e.g. {"enable_thinking": False} for
     # non-thinking mode). Mirrors vLLM's chat_template_kwargs request field.
     chat_template_kwargs: dict | None = None
@@ -331,6 +333,8 @@ class CompletionRequest(BaseModel):
     n: int | None = None
     stream: bool | None = False
     response_format: dict | None = None
+    logprobs: bool | None = False
+    top_logprobs: int | None = None
     # P4b session affinity (opt-in) -- see ChatCompletionRequest.session_id.
     session_id: str | None = None
 
