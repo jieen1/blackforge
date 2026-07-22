@@ -155,7 +155,7 @@ def main() -> None:
     print(f"\nPer-round GPU time: {per_round_ms:.2f} ms")
     print(f"Per-round per-slot: {per_round_ms / args.concurrency:.2f} ms")
 
-    print(f"\nTop 20 kernels by GPU time:")
+    print("\nTop 20 kernels by GPU time:")
     print(f"{'Kernel':<60} {'ms':>10} {'%':>7} {'Category':<12}")
     print("-" * 91)
     sorted_kernels = sorted(kernel_details.items(), key=lambda x: -x[1])[:20]
