@@ -32,6 +32,7 @@ from typing import Any
 
 from runtime.sampling import SamplingParams
 from server.tracing import tracer
+from runtime.structured_output import GrammarState, ResponseFormat
 
 os.environ.setdefault("USE_LIBUV", "0")
 os.environ.setdefault("SM120_GQA_USE_V2_DECODE_KERNEL", "1")
@@ -83,6 +84,7 @@ class GenerationRequest:
     session_id: str | None = None
     stream_channel: StreamChannel | None = None
     sampling_params: SamplingParams = field(default_factory=SamplingParams)
+    response_format: dict | None = None
 
 
 class StreamChannel:
@@ -353,6 +355,7 @@ class ServerEngine:
         max_tokens: int,
         session_id: str | None = None,
         sampling_params: SamplingParams | None = None,
+        response_format: dict | None = None,
     ) -> dict:
         """Submit a generation request. Resolves when generation completes."""
         loop = asyncio.get_running_loop()
@@ -364,6 +367,7 @@ class ServerEngine:
             future=fut,
             session_id=session_id,
             sampling_params=sampling_params or SamplingParams(),
+            response_format=response_format,
         )
         self._req_deque.append(req)
         try:
@@ -379,6 +383,7 @@ class ServerEngine:
         session_id: str | None = None,
         sampling_params: SamplingParams | None = None,
         cancel_ref: list | None = None,
+        response_format: dict | None = None,
     ):
         """Submit a streaming generation request. Yields token-id lists as
         each MTP round commits them. Final yield is the result dict."""
@@ -397,6 +402,7 @@ class ServerEngine:
             session_id=session_id,
             stream_channel=channel,
             sampling_params=sampling_params or SamplingParams(),
+            response_format=response_format,
         )
         self._req_deque.append(req)
         try:
@@ -563,6 +569,12 @@ class ServerEngine:
             "start_time": time.perf_counter(),
         }
         tracer.request_admitted(req.request_id, slot, len(req.prompt_ids))
+        # C3: initialize grammar state for structured output
+        fmt = ResponseFormat.from_api(req.response_format)
+        if fmt.is_constrained:
+            self.active[slot]["grammar"] = GrammarState(fmt, self.tok)
+        else:
+            self.active[slot]["grammar"] = None
 
     def _finish_request(
         self, slot: int, req: GenerationRequest, committed_tokens: list[int], finish_reason: str
@@ -822,8 +834,12 @@ class ServerEngine:
 
         # -- decode round (hot path, zero wait) --
         active_slots = list(self.active.keys())
-        greedy_slots = [s for s in active_slots if not self.active[s].get("sampled")]
-        sampled_slots = [s for s in active_slots if self.active[s].get("sampled")]
+        # C3: structured output requests use sampled path with grammar masking
+        grammar_slots = [s for s in active_slots if self.active[s].get("grammar") is not None]
+        greedy_slots = [s for s in active_slots
+                        if not self.active[s].get("sampled") and s not in grammar_slots]
+        sampled_slots = [s for s in active_slots
+                         if self.active[s].get("sampled") or s in grammar_slots]
 
         self.stats["rounds"] += 1
         self.stats["round_batch_sizes"].append(len(active_slots))
@@ -854,6 +870,10 @@ class ServerEngine:
                 st["committed_tokens"].append(tok)
                 st["last_token"] = tok
                 st["last_progress_round"] = self.stats["rounds"]
+                # C3: advance grammar state
+                grammar = st.get("grammar")
+                if grammar is not None:
+                    grammar.accept(tok)
                 if req.stream_channel is not None:
                     self._stream_put(req.stream_channel, [tok])
                 if len(st["committed_tokens"]) >= req.max_tokens:
@@ -900,6 +920,11 @@ class ServerEngine:
                 if finish_reason is None:
                     st["anchor"] = decision["next_anchor"]
                     st["drafts"] = decision["next_draft_tokens"]
+                    # C3: advance grammar state for committed tokens
+                    grammar = st.get("grammar")
+                    if grammar is not None:
+                        for _t in kept:
+                            grammar.accept(_t)
                     tracer.decode_round(req.request_id, self.stats["rounds"], len(kept), _round_ms)
                     continue
 
