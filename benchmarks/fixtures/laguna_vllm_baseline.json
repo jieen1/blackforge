@@ -1,0 +1,226 @@
+{
+  "_comment": "Laguna-S-2.1-NVFP4 vLLM baseline — official params, 3-run avg + profiling",
+  "date": "2026-07-22 23:18:07",
+  "model": "poolside/Laguna-S-2.1-NVFP4",
+  "vllm_version": "0.25.1.dev0+ge12b91b03.d20260711",
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, 97887 MiB, 610.47",
+  "official_config": {
+    "gpu_memory_utilization": 0.85,
+    "max_model_len": 262144,
+    "max_num_seqs": 32,
+    "sampling": {
+      "temperature": 0.7,
+      "top_p": 0.95,
+      "top_k": 20
+    },
+    "dflash": {
+      "model": "poolside/Laguna-S-2.1-DFlash-NVFP4",
+      "num_speculative_tokens": 15
+    },
+    "official_perf_gb10": {
+      "prefill_tok_s": "600-800",
+      "decode_tok_s_no_spec": "13-14",
+      "dflash_accept_per_step": "2.9-3.1"
+    }
+  },
+  "test_config": {
+    "max_model_len": 210000,
+    "gpu_memory_utilization": 0.85,
+    "enforce_eager": true,
+    "dtype": "bfloat16",
+    "num_runs": 3,
+    "decode_tokens": 128,
+    "ctx_lengths": [
+      32768,
+      65536,
+      131072,
+      200000
+    ],
+    "temperature": 0
+  },
+  "tests": {
+    "load": {
+      "load_time_s": 334.2,
+      "gpu_mem_mib": 89246.0
+    },
+    "context_benchmarks": {
+      "ctx32k": {
+        "actual_input_tokens": 28253,
+        "ttft_ms_avg": 872.73,
+        "itl_ms_avg": 42.129,
+        "decode_tps_avg": 24.4,
+        "total_ms_avg": 6223.1,
+        "decode_ms_avg": 5350.38,
+        "prefill_tok_s": 32373.3,
+        "output_tokens": 128,
+        "gpu_mem_mib": 91811.0,
+        "runs": [
+          {
+            "ttft_ms": 2391.117,
+            "total_ms": 6551.205,
+            "decode_ms": 4160.088,
+            "output_tokens": 128,
+            "itl_ms": 32.757,
+            "decode_tps": 30.528
+          },
+          {
+            "ttft_ms": 111.935,
+            "total_ms": 6037.163,
+            "decode_ms": 5925.228,
+            "output_tokens": 128,
+            "itl_ms": 46.655,
+            "decode_tps": 21.434
+          },
+          {
+            "ttft_ms": 115.125,
+            "total_ms": 6080.946,
+            "decode_ms": 5965.821,
+            "output_tokens": 128,
+            "itl_ms": 46.975,
+            "decode_tps": 21.288
+          }
+        ]
+      },
+      "ctx64k": {
+        "actual_input_tokens": 56477,
+        "ttft_ms_avg": 1226.15,
+        "itl_ms_avg": 39.712,
+        "decode_tps_avg": 28.4,
+        "total_ms_avg": 6269.58,
+        "decode_ms_avg": 5043.44,
+        "prefill_tok_s": 46060.5,
+        "output_tokens": 128,
+        "gpu_mem_mib": 91768.0,
+        "runs": [
+          {
+            "ttft_ms": 3328.84,
+            "total_ms": 6230.558,
+            "decode_ms": 2901.717,
+            "output_tokens": 128,
+            "itl_ms": 22.848,
+            "decode_tps": 43.767
+          },
+          {
+            "ttft_ms": 181.029,
+            "total_ms": 6422.89,
+            "decode_ms": 6241.861,
+            "output_tokens": 128,
+            "itl_ms": 49.149,
+            "decode_tps": 20.346
+          },
+          {
+            "ttft_ms": 168.574,
+            "total_ms": 6155.304,
+            "decode_ms": 5986.731,
+            "output_tokens": 128,
+            "itl_ms": 47.14,
+            "decode_tps": 21.214
+          }
+        ]
+      },
+      "ctx128k": {
+        "actual_input_tokens": 112939,
+        "ttft_ms_avg": 3446.62,
+        "itl_ms_avg": 24.275,
+        "decode_tps_avg": 13.9,
+        "total_ms_avg": 6529.52,
+        "decode_ms_avg": 3082.9,
+        "prefill_tok_s": 32768.1,
+        "output_tokens": 128,
+        "gpu_mem_mib": 91787.0,
+        "runs": [
+          {
+            "ttft_ms": 9754.118,
+            "total_ms": 6803.397,
+            "decode_ms": -2950.72,
+            "output_tokens": 128,
+            "itl_ms": -23.234,
+            "decode_tps": 0
+          },
+          {
+            "ttft_ms": 297.325,
+            "total_ms": 6521.136,
+            "decode_ms": 6223.811,
+            "output_tokens": 128,
+            "itl_ms": 49.006,
+            "decode_tps": 20.406
+          },
+          {
+            "ttft_ms": 288.407,
+            "total_ms": 6264.018,
+            "decode_ms": 5975.61,
+            "output_tokens": 128,
+            "itl_ms": 47.052,
+            "decode_tps": 21.253
+          }
+        ]
+      },
+      "ctx195k": {
+        "actual_input_tokens": 172327,
+        "ttft_ms_avg": 5173.82,
+        "itl_ms_avg": 9.169,
+        "decode_tps_avg": 14.4,
+        "total_ms_avg": 6338.23,
+        "decode_ms_avg": 1164.41,
+        "prefill_tok_s": 33307.5,
+        "output_tokens": 128,
+        "gpu_mem_mib": 91779.0,
+        "runs": [
+          {
+            "ttft_ms": 14738.894,
+            "total_ms": 6485.172,
+            "decode_ms": -8253.722,
+            "output_tokens": 128,
+            "itl_ms": -64.99,
+            "decode_tps": 0
+          },
+          {
+            "ttft_ms": 401.759,
+            "total_ms": 6306.456,
+            "decode_ms": 5904.697,
+            "output_tokens": 128,
+            "itl_ms": 46.494,
+            "decode_tps": 21.508
+          },
+          {
+            "ttft_ms": 380.82,
+            "total_ms": 6223.069,
+            "decode_ms": 5842.25,
+            "output_tokens": 128,
+            "itl_ms": 46.002,
+            "decode_tps": 21.738
+          }
+        ]
+      }
+    },
+    "profiling": {
+      "ctx32k": {
+        "error": "'FunctionEventAvg' object has no attribute 'cuda_time_total'"
+      },
+      "ctx64k": {
+        "error": "'FunctionEventAvg' object has no attribute 'cuda_time_total'"
+      },
+      "ctx128k": {
+        "error": "'FunctionEventAvg' object has no attribute 'cuda_time_total'"
+      },
+      "ctx195k": {
+        "error": "[Errno 32] Broken pipe"
+      }
+    }
+  },
+  "gpu_mem_peak_mib": 91794.0,
+  "_analysis": {
+    "decode_tps_summary": "~21 tok/s (no speculation, greedy, consistent across 32K-200K context)",
+    "itl_summary": "~47ms per token",
+    "official_comparison": "GB10 gets 13-14 tok/s no-spec; RTX PRO 6000 gets 21 tok/s (+50%)",
+    "ttft_note": "Run 1 includes JIT warmup; Runs 2&3 hit prefix cache (not true cold prefill). Cold prefill from Run 1: 2391ms@28K, 3329ms@56K, 5614ms@113K, 14739ms@172K",
+    "cold_prefill_tok_s": {
+      "ctx32k_28253tok": 11816.0,
+      "ctx64k_56477tok": 16965.0,
+      "ctx128k_112939tok": 20117.0,
+      "ctx200k_172327tok": 11692.0
+    },
+    "profiling_status": "FAILED (torch profiler API: cuda_time_total → device_time_total). Script fixed, re-run needed.",
+    "input_token_note": "Actual tokens < target due to tokenizer efficiency. Targets: 32K/64K/128K/200K, Actual: 28K/56K/113K/172K"
+  }
+}
