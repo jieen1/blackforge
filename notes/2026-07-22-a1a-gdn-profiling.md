@@ -42,3 +42,40 @@ Per-round GPU time: **27.01 ms** (eager, c=1, 4K context)
 - [ ] 重跑 128K context profiling（需要更多 GPU 内存和时间）
 - [ ] 对比 CUDA Graph 模式下的占比（eager 有额外 Python 开销）
 - [ ] 按占比排序更新 M2 工作计划
+
+---
+
+## 128K Context Profiling（2026-07-22 续）
+
+### 测试条件
+- prompt_len=131072, concurrency=1, K=3, eager mode
+- 5 MTP verify rounds, torch.profiler
+
+### 修正后占比
+
+| 类别 | GPU time (ms/5 rounds) | 占比 | 关键 kernel |
+|---|---:|---:|---|
+| **NVFP4 GEMM** | ~95.5 | **53.7%** | cutlass sm120 NVFP4 (27.0% + 26.7%) |
+| **Attention (SM120)** | ~50.4 | **28.2%** | decode_v2_nativefp8 (15.8%), prefill_fp8 (11.2%), nvjet (1.0%) |
+| **GEMM (bf16/gemv)** | ~13.7 | 7.7% | wmma_bf16 (4.2%), gemvx (3.0%) |
+| **Other** | ~9.4 | 5.3% | fp8_quant, act_and_mul, DtoD |
+| **GDN 全栈** | ~6.9 | **3.9%** | delta_rule (1.5%), rms_norm (1.5%), conv1d (0.5%) |
+
+Per-round GPU time: **35.58 ms** (eager, c=1, 128K context)
+
+### 4K vs 128K 对比
+
+| 类别 | 4K 占比 | 128K 占比 | 变化 |
+|---|---:|---:|---|
+| NVFP4 GEMM | 71.1% | 53.7% | **↓17pp** |
+| Attention | 3.5% | 28.2% | **↑25pp** |
+| GDN | 5.1% | 3.9% | ↓1.2pp |
+| Other | 20.3% | 14.2% | ↓6pp |
+
+### 结论与 M2 优先级
+
+1. **NVFP4 GEMM 仍是最大杠杆**（54%），A2 autotune 收益最大
+2. **Attention 在 128K 下跃升到 28%**——自研 SM120 kernel 的 1.56× 加速
+   在此场景下贡献显著（~18% 端到端提速）
+3. **GDN 占比恒定 ~4%**（线性注意力，不随上下文增长），A1 融合收益有限
+4. **M2 排序建议**：A2 (GEMM) > attention 继续优化 > A3 (MTP 链路) >> A1 (GDN)
