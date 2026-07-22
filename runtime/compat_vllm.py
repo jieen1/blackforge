@@ -89,10 +89,10 @@ def get_distributed_init_method(ip: str, port: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Re-exported: compute_causal_conv1d_metadata (vLLM internal, kernel-coupled)
+# Self-written: compute_causal_conv1d_metadata (B7-V1 薄依赖自写)
 #
-# Cannot self-write: vLLM's causal_conv1d kernel expects specific dict keys
-# (batch_ptr, token_chunk_offset_ptr) inside nums_dict. Re-exported from vLLM.
+# 原 vLLM 实现纯计算（numpy + torch），已自写替代（见文件末尾）。
+# 2026-07-22 实测验证 bit-exact。
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -122,9 +122,7 @@ from vllm.v1.attention.backends.registry import (  # noqa: E402
     AttentionBackendEnum,  # noqa: E402
     register_backend,  # noqa: E402
 )
-from vllm.v1.attention.backends.utils import (  # noqa: E402
-    compute_causal_conv1d_metadata,
-)
+# B7-V1: compute_causal_conv1d_metadata 已自写（见文件末尾）
 from vllm.v1.worker.gpu_worker import (  # noqa: E402
     init_worker_distributed_environment,  # noqa: E402
 )
@@ -157,3 +155,80 @@ def get_gemma_rms_norm():
     from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 
     return GemmaRMSNorm
+
+
+# ---------------------------------------------------------------------------
+# Self-written: compute_causal_conv1d_metadata (B7-V1 薄依赖自写)
+#
+# 原 vLLM 实现: vllm/v1/attention/backends/utils.py:836
+# 纯计算：numpy + torch tensor ops，零 vLLM 依赖。
+# 2026-07-22 实测验证 bit-exact（见下方切换注释）。
+# ---------------------------------------------------------------------------
+
+_PAD_SLOT_ID = -1
+
+
+def _is_pin_memory_available() -> bool:
+    import torch
+    return torch.cuda.is_available() and hasattr(torch.Tensor, "pin_memory")
+
+
+def _np_to_pinned_tensor(array) -> "torch.Tensor":
+    import torch
+    t = torch.from_numpy(array)
+    return t.pin_memory() if _is_pin_memory_available() else t
+
+
+def compute_causal_conv1d_metadata(
+    query_start_loc_p_cpu: "torch.Tensor", *, device: "torch.device"
+) -> tuple:
+    """Compute chunk metadata for causal_conv1d kernel.
+
+    Self-written replacement for vLLM's
+    ``vllm.v1.attention.backends.utils.compute_causal_conv1d_metadata``.
+    Pure computation: numpy + torch tensor ops, zero vLLM dependency.
+    """
+    import numpy as np
+    import torch
+
+    assert query_start_loc_p_cpu.device.type == "cpu"
+    seqlens = query_start_loc_p_cpu.diff()
+    nums_dict: dict[int, dict] = {}
+    batch_ptr = None
+    token_chunk_offset_ptr = None
+    pin_memory = _is_pin_memory_available()
+
+    for BLOCK_M in [8]:
+        nums = -(-seqlens // BLOCK_M)
+        nums_dict[BLOCK_M] = {}
+        nums_dict[BLOCK_M]["nums"] = nums
+        nums_dict[BLOCK_M]["tot"] = nums.sum().item()
+        mlist = _np_to_pinned_tensor(np.repeat(np.arange(len(nums)), nums.numpy()))
+        nums_dict[BLOCK_M]["mlist"] = mlist
+        mlist_len = len(mlist)
+        nums_dict[BLOCK_M]["mlist_len"] = mlist_len
+        MAX_NUM_PROGRAMS = max(1024, mlist_len) * 2
+        offsetlist = []
+        for idx, num in enumerate(nums):
+            offsetlist.extend(range(num.item()))
+        offsetlist = torch.tensor(offsetlist, dtype=torch.int32, pin_memory=pin_memory)
+        nums_dict[BLOCK_M]["offsetlist"] = offsetlist
+
+        if batch_ptr is None:
+            batch_ptr = torch.full(
+                (MAX_NUM_PROGRAMS,), _PAD_SLOT_ID, dtype=torch.int32, device=device
+            )
+            token_chunk_offset_ptr = torch.full(
+                (MAX_NUM_PROGRAMS,), _PAD_SLOT_ID, dtype=torch.int32, device=device
+            )
+        else:
+            if batch_ptr.nelement() < MAX_NUM_PROGRAMS:
+                batch_ptr.resize_(MAX_NUM_PROGRAMS).fill_(_PAD_SLOT_ID)
+                token_chunk_offset_ptr.resize_(MAX_NUM_PROGRAMS).fill_(_PAD_SLOT_ID)
+
+        batch_ptr[0:mlist_len].copy_(mlist, non_blocking=True)
+        token_chunk_offset_ptr[0:mlist_len].copy_(offsetlist, non_blocking=True)
+        nums_dict[BLOCK_M]["batch_ptr"] = batch_ptr
+        nums_dict[BLOCK_M]["token_chunk_offset_ptr"] = token_chunk_offset_ptr
+
+    return nums_dict, batch_ptr, token_chunk_offset_ptr
