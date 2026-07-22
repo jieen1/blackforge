@@ -29,18 +29,18 @@
 
 ## 0. 执行看板：先做什么（2026-07-22 复盘）
 
-**已完成**：B1/C1 采样全链路 · C5 取消 + timeout · D1 watchdog · A5/B4 chunked prefill 解耦调度 · A1a profiling（4K+128K）· A2 shape survey · B7-V0 fork 存档 · B7-V1 compat 收口骨架 · 速度基线冻结 · soak 脚本 · Laguna L0 显存账本（主模型 + DFlash 权重已就位）
+**已完成**：B1/C1 采样全链路 · C5 取消 + timeout · D1 watchdog · A5/B4 chunked prefill 解耦调度 · A1a profiling（4K+128K）· A2 shape survey + autotune 调查（杠杆有限，降级） · B7-V0 fork 存档 · **B7-V1 收官**（bind_kv_cache/set_forward_context/compute_causal_conv1d_metadata 自写 + FLA 切上游 + 死代码清理） · 速度基线冻结 · soak 脚本 · **Laguna L0 关账**（DFlash 校验 + vLLM 冒烟 + 显存账本） · **L1 eager 正确性 4/4** · **A6 split-K 调查**（adaptive split 需 kernel 改动，deferred M2→M3） · golden fixtures 落盘 + 验证通过
 
 **关键证据（决定了下面的排序）**：A1a 实证 NVFP4 GEMM 占 **71%@4K / 54%@128K**、attention 28%@128K、**GDN 恒定仅 ~4%** —— A1 GDN 融合降级暂缓，A2 升为头号杠杆，新增 A6（attention 长上下文优化）。
 
 **执行顺序**：
 
-1. 🔥 **golden fixtures 落盘** —— 一切替换的裁判（尚未落盘），不做完不得开始任何替换
-2. 🔥 **A2 NVFP4 GEMM autotune / 自研** —— 最大杠杆，兼去 vLLM 化 V2 第一项
-3. 🔥 **B7-V1 收官** —— 薄依赖自写 + FLA 切上游 + 独立建仓门禁（干净 venv 起服务）
-4. 🔥 **D4 首次 24h soak + 例行化** —— 性能大改前的护栏
-5. 🔥 **L0 收尾（待办点，开发执行）** —— DFlash 校验（config / draft 机制 / K=15 形状）+ pinned vLLM 加载 Laguna 冒烟
-6. ⏭ A6 attention 长上下文优化 · A3 MTP 融合 · L1 Laguna 冒烟租户
+1. ✅ **golden fixtures 落盘** —— 录制+验证+基线对比三件套，parity bit-exact
+2. ✅ **A2 NVFP4 GEMM autotune 调查** —— 数据证明杠杆有限（max 4.8% e2e），降级为 down_proj tile 单项
+3. ✅ **B7-V1 收官** —— bind_kv_cache/set_forward_context/conv1d_metadata 自写 + FLA 切上游 + 死代码清理
+4. ⏭ **D4 首次 24h soak** —— 用户批准暂缓（"先不做"）
+5. ✅ **L0 收尾 + L1 冒烟** —— DFlash 校验关账 + vLLM 冒烟通过 + 基准数据落盘 + eager 正确性 4/4
+6. 🔥 A6 attention 长上下文（调查完成，实现需 kernel adaptive split）· A3 MTP 融合 · ~~L1~~ ✅
 7. ⏭ B5 模块化 + E1 抽象层 · D2/D3 观测细化 · C3 结构化输出
 8. ⏸ B2 动态 KV · A4 显存换速度 · C2/C4/C6 · D6 自动回退 · E2 Qwen3 · L2/L3（按原里程碑走）
 9. 🧊 暂缓：**A1 GDN 融合**（占比仅 ~4%，A2/A6 榨干后再评）；远期：B6 多 GPU · V3 零依赖门禁
