@@ -29,7 +29,7 @@
 
 ## 0. 执行看板：先做什么（2026-07-22 复盘）
 
-**已完成**：B1/C1 采样全链路 · C5 取消 + timeout · D1 watchdog · A5/B4 chunked prefill 解耦调度 · A1a profiling（4K+128K）· A2 shape survey + autotune 调查（杠杆有限，降级） · B7-V0 fork 存档 · **B7-V1 收官**（bind_kv_cache/set_forward_context/compute_causal_conv1d_metadata 自写 + FLA 切上游 + 死代码清理） · 速度基线冻结 · soak 脚本 · **Laguna L0 关账**（DFlash 校验 + vLLM 冒烟 + 显存账本） · **L1 eager 正确性 4/4** · **A6 split-K 调查**（adaptive split 需 kernel 改动，deferred M2→M3） · golden fixtures 落盘 + 验证通过
+**已完成**：B1/C1 采样全链路 · C5 取消 + timeout · D1 watchdog · A5/B4 chunked prefill 解耦调度 · A1a profiling（4K+128K）· A2 shape survey + autotune 调查（杠杆有限，降级） · B7-V0 fork 存档 · **B7-V1 收官**（bind_kv_cache/set_forward_context/compute_causal_conv1d_metadata 自写 + FLA 切上游 + 死代码清理） · 速度基线冻结 · soak 脚本 · **Laguna L0 关账**（DFlash 校验 + vLLM 冒烟 + 显存账本） · **L1 eager 正确性 4/4** · **A6 split-K 调查**（adaptive split 需 kernel 改动，deferred M2→M3） · golden fixtures 落盘 + 验证通过 · **A3 关闭**（nsys 验证 CUDA Graph 已消除 launch overhead，K-step batching 收益 <1.5%） · **D2 引擎集成**（MTP accept/prefix cache/KV 指标接入） · **D3 请求级 tracing**（admission→prefill→decode→finish 全链路 span） · **C3 结构化输出**（JSON mode/json_schema via xgrammar） · **C4 流式工具调用增量**（tool_call 参数边生成边推送） · **C6 Anthropic prompt caching 语义**（cache_read_input_tokens 映射）
 
 **关键证据（决定了下面的排序）**：A1a 实证 NVFP4 GEMM 占 **71%@4K / 54%@128K**、attention 28%@128K、**GDN 恒定仅 ~4%** —— A1 GDN 融合降级暂缓，A2 升为头号杠杆，新增 A6（attention 长上下文优化）。
 
@@ -40,8 +40,8 @@
 3. ✅ **B7-V1 收官** —— bind_kv_cache/set_forward_context/conv1d_metadata 自写 + FLA 切上游 + 死代码清理
 4. ⏭ **D4 首次 24h soak** —— 用户批准暂缓（"先不做"）
 5. ✅ **L0 收尾 + L1 冒烟** —— DFlash 校验关账 + vLLM 冒烟通过 + 基准数据落盘 + eager 正确性 4/4
-6. 🔥 A6 attention 长上下文（调查完成，实现需 kernel adaptive split）· A3 MTP 融合 · ~~L1~~ ✅
-7. ⏭ B5 模块化 + E1 抽象层 · D2/D3 观测细化 · C3 结构化输出
+6. ✅ A6 attention 长上下文（调查完成，实现需 kernel adaptive split，deferred M3）· ~~A3 MTP 融合~~ 关闭 · ~~L1~~ ✅
+7. 🔥 B5 模块化 + E1 抽象层 · ~~D2/D3 观测细化~~ ✅ · ~~C3 结构化输出~~ ✅ · ~~C4 流式工具调用~~ ✅ · ~~C6 prompt caching~~ ✅
 8. ⏸ B2 动态 KV · A4 显存换速度 · C2/C4/C6 · D6 自动回退 · E2 Qwen3 · L2/L3（按原里程碑走）
 9. 🧊 暂缓：**A1 GDN 融合**（占比仅 ~4%，A2/A6 榨干后再评）；远期：B6 多 GPU · V3 零依赖门禁
 
