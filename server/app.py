@@ -120,8 +120,14 @@ SERVER_PRODUCTION = os.environ.get("QSR_SERVER_PRODUCTION", "1") != "0"
 engine: ServerEngine | None = None
 
 
-async def _tokenize_chat(engine_ref, messages, tools=None):
-    """Run apply_chat_template in a thread to avoid blocking the event loop."""
+async def _tokenize_chat(engine_ref, messages, tools=None, chat_template_kwargs=None):
+    """Run apply_chat_template in a thread to avoid blocking the event loop.
+
+    ``chat_template_kwargs`` is forwarded verbatim to the Jinja template, so the
+    official Qwen3.6 ``{"enable_thinking": False}`` toggle (and any other template
+    option) is honored exactly as in stock vLLM. Without this the template always
+    defaults to thinking mode and the toggle sent by clients is silently ignored.
+    """
     loop = asyncio.get_running_loop()
     fn = functools.partial(
         engine_ref.tok.apply_chat_template,
@@ -130,6 +136,7 @@ async def _tokenize_chat(engine_ref, messages, tools=None):
         tokenize=True,
         add_generation_prompt=True,
         return_dict=False,
+        **(chat_template_kwargs or {}),
     )
     return await loop.run_in_executor(None, fn)
 
@@ -342,6 +349,9 @@ class ChatCompletionRequest(BaseModel):
     tools: list[dict] | None = None
     tool_choice: str | dict | None = None
     session_id: str | None = None
+    # Forwarded to the chat template (e.g. {"enable_thinking": False} for
+    # non-thinking mode). Mirrors vLLM's chat_template_kwargs request field.
+    chat_template_kwargs: dict | None = None
 
 
 class CompletionRequest(BaseModel):
@@ -441,7 +451,10 @@ async def chat_completions(req: ChatCompletionRequest):
     # Convert tools for the chat template
     tools = convert_tools_to_chat_template(req.tools)
 
-    prompt_ids = await _tokenize_chat(engine, chat_messages, tools=tools)
+    prompt_ids = await _tokenize_chat(
+        engine, chat_messages, tools=tools,
+        chat_template_kwargs=req.chat_template_kwargs,
+    )
     await _debug_log_input(
         "OPENAI /v1/chat/completions", req.model_dump(), chat_messages, prompt_ids
     )
@@ -585,28 +598,36 @@ async def chat_completions(req: ChatCompletionRequest):
     # Non-streaming path
     result = await engine.submit(prompt_ids, max_tokens, session_id=req.session_id)
     raw_text = await _tokenize_decode(engine, result["committed_token_ids"])
-    # Prepend  for strip_thinking (chat template injects it in prompt)
-    _raw_for_strip = (
-        raw_text
-        if raw_text.startswith(chr(60) + "think" + chr(62))
-        else (chr(60) + "think" + chr(62) + "\n" + raw_text)
-    )
-    text = strip_thinking(_raw_for_strip)
-    # Extract reasoning_content (thinking) for non-streaming response
-    # Generated tokens start with thinking content (no  prefix since
-    # the chat template injected it in the prompt). Prepend  to extract.
-    reasoning_content = None
     _THINK_OPEN = chr(60) + "think" + chr(62)
     _THINK_CLOSE = chr(60) + "/think" + chr(62)
-    _raw_with_think = (
-        raw_text if raw_text.startswith(_THINK_OPEN) else _THINK_OPEN + "\n" + raw_text
+    # Non-thinking mode (chat_template_kwargs={"enable_thinking": False}): the
+    # template already emitted a closed empty  block, so the generated
+    # tokens ARE the answer -- there is no reasoning to strip. In thinking mode
+    # the tokens start with the reasoning body (the opening  tag was
+    # injected by the prompt), which we wrap and strip below.
+    _non_thinking = bool(
+        req.chat_template_kwargs
+        and req.chat_template_kwargs.get("enable_thinking") is False
     )
-    if _THINK_CLOSE in _raw_with_think:
-        start = _raw_with_think.index(_THINK_OPEN) + len(_THINK_OPEN)
-        if start < len(_raw_with_think) and _raw_with_think[start] == "\n":
-            start += 1
-        end = _raw_with_think.index(_THINK_CLOSE)
-        reasoning_content = _raw_with_think[start:end].strip().replace("\ufffd", "")
+    reasoning_content = None
+    if _non_thinking:
+        text = raw_text.replace("\ufffd", "").strip()
+    else:
+        _raw_for_strip = (
+            raw_text
+            if raw_text.startswith(_THINK_OPEN)
+            else (_THINK_OPEN + "\n" + raw_text)
+        )
+        text = strip_thinking(_raw_for_strip)
+        _raw_with_think = (
+            raw_text if raw_text.startswith(_THINK_OPEN) else _THINK_OPEN + "\n" + raw_text
+        )
+        if _THINK_CLOSE in _raw_with_think:
+            start = _raw_with_think.index(_THINK_OPEN) + len(_THINK_OPEN)
+            if start < len(_raw_with_think) and _raw_with_think[start] == "\n":
+                start += 1
+            end = _raw_with_think.index(_THINK_CLOSE)
+            reasoning_content = _raw_with_think[start:end].strip().replace("\ufffd", "")
     metrics.record_request(
         "chat",
         result["prompt_tokens"],
