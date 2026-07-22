@@ -2,17 +2,26 @@
 
 ## Project Structure & Module Organization
 
-This repository currently contains the implementation plan in
-`项目实施规划.md`. Build the runtime according to its proposed, intentionally
-narrow structure:
+Actual structure (post-B5 modularization, 2026-07-22):
 
-- `model/`: Qwen3.6 configuration, layers, and MTP implementation.
-- `loader/`: Hugging Face/NVFP4 loading and offline weight packing.
-- `runtime/`: engine, fixed-slot scheduler, cache, CUDA Graphs, and sampling.
-- `kernels/`: SM120 CUDA kernels and their Python/C++ bindings.
-- `server/`: OpenAI-compatible streaming API.
-- `oracle/`, `tests/`, and `benchmarks/`: correctness references, regression
-  tests, and reproducible performance measurements.
+- `runtime/`: Core inference engine (B5 模块化后拆分为 5 个域):
+  - `direct_model_runner.py`: Main runner class (4550 lines, MTP/prefill/decode)
+  - `block_pool.py`: Paging/prefix-cache infrastructure (Block, BlockPool, hash)
+  - `metadata_builders.py`: Attention/GDN metadata construction
+  - `cuda_graphs.py`: CUDA Graph capture/replay (CapturedBatchDecodeGraph, CapturedMTPDraftStepGraph)
+  - `mtp_accept.py`: MTP accept/reject logic (pure functions)
+  - `compat_vllm.py`: B7-V1 single-point vLLM dependency consolidation
+  - `sampling.py`: Temperature/top-k/top-p sampling primitives
+  - `engine.py`, `slot_manager.py`, `hybrid_cache.py`, `op_registry.py`
+- `server/`: OpenAI + Anthropic dual-protocol API (streaming, tools, thinking)
+  - `app.py`: FastAPI application
+  - `engine.py`: Continuous-batching server engine
+  - `formats/`: Protocol adapters (openai, anthropic, stream, tools, thinking)
+- `benchmarks/`: Reproducible performance measurements + fixtures
+  - `fixtures/`: speed_baseline.json, golden/, laguna_vllm_baseline.json
+- `tests/`: 216 tests (CPU-only, no model weights required)
+- `notes/`: Design documents and investigation records
+- `docs/`: roadmap.md, architecture.md
 
 Keep components small and layer boundaries explicit. Register replaceable
 operations through a shared `OpRegistry`; do not embed backend-specific calls
