@@ -599,12 +599,17 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             visible_text, tool_calls = proc.finalize()
             if tool_calls:
                 finish = "tool_calls"
+            _lp_final = None
+            if req.logprobs and final_result:
+                _lp_final = _format_logprobs_openai(
+                    engine, final_result.get("logprobs"),
+                )
             done = {
                 "id": cmpl_id,
                 "object": "chat.completion.chunk",
                 "created": created,
                 "model": model_name,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": finish, "logprobs": None}],
+                "choices": [{"index": 0, "delta": {}, "finish_reason": finish, "logprobs": _lp_final}],
             }
             yield f"data: {_json.dumps(done)}\n\n"
             metrics.record_request(
