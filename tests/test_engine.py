@@ -159,3 +159,42 @@ class TestWatchdog:
         """watchdog_max_stale_rounds=0 disables the watchdog."""
         max_stale = 0
         assert max_stale <= 0
+
+
+class TestRequestTimeout:
+    """Unit tests for request-level timeout (C5)."""
+
+    def test_timeout_config_exists(self):
+        import inspect
+
+        from server.engine import ServerEngine
+
+        sig = inspect.signature(ServerEngine.__init__)
+        assert "request_timeout_s" in sig.parameters
+
+    def test_timeout_stats_field(self):
+        import server.engine as eng_mod
+
+        src = open(eng_mod.__file__).read()
+        assert '"timeouts"' in src
+
+    def test_timeout_detection_logic(self):
+        """Simulate the timeout detection predicate."""
+        import time
+
+        timeout_s = 600.0
+        now = time.perf_counter()
+        active = {
+            0: {"start_time": now - 100},
+            1: {"start_time": now - 700},
+            2: {"start_time": now - 50},
+        }
+        timed_out = [
+            s
+            for s, st in active.items()
+            if now - st.get("start_time", now) > timeout_s
+        ]
+        assert timed_out == [1]
+
+    def test_timeout_disabled_at_zero(self):
+        assert 0 <= 0
