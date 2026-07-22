@@ -1,36 +1,53 @@
 {
-  "model": "claude-3-5-sonnet",
+  "model": "claude-sonnet-4-6",
   "max_tokens": 64000,
   "stream": true,
   "system": [
     {
       "type": "text",
+      "text": "x-anthropic-billing-header: cc_version=2.1.215.0e0; cc_entrypoint=claude-desktop-3p;"
+    },
+    {
+      "type": "text",
       "text": "You are Claude, an AI assistant made by Anthropic. You are helping a software engineer debug and improve a Python codebase. Always explain your reasoning, cite the relevant code, and suggest tests. Be precise and concise.",
-      "cache_control": {"type": "ephemeral"}
+      "cache_control": {
+        "type": "ephemeral"
+      }
     },
     {
       "type": "text",
       "text": "The user is working on a vLLM-based inference runtime. Project conventions: Python 3.12, four-space indentation, snake_case functions, PascalCase classes, type annotations on public interfaces.",
-      "cache_control": {"type": "ephemeral"}
+      "cache_control": {
+        "type": "ephemeral"
+      }
     }
   ],
   "messages": [
     {
       "role": "user",
       "content": [
-        {"type": "text", "text": "Here is my scheduler code:\n\ndef schedule(jobs):\n    ready = [j for j in jobs if j.state == 'ready']\n    return sorted(ready, key=lambda j: j.priority)\n\nWhy does it sometimes drop the highest-priority job?"}
+        {
+          "type": "text",
+          "text": "Here is my scheduler code:\n\ndef schedule(jobs):\n    ready = [j for j in jobs if j.state == 'ready']\n    return sorted(ready, key=lambda j: j.priority)\n\nWhy does it sometimes drop the highest-priority job?"
+        }
       ]
     },
     {
       "role": "assistant",
       "content": [
-        {"type": "text", "text": "The sort is ascending, so the highest numeric priority ends up last. If you only take the first element elsewhere, you get the lowest priority."}
+        {
+          "type": "text",
+          "text": "The sort is ascending, so the highest numeric priority ends up last. If you only take the first element elsewhere, you get the lowest priority."
+        }
       ]
     },
     {
       "role": "user",
       "content": [
-        {"type": "text", "text": "Good catch. Please rewrite it to sort descending and add a unit test."}
+        {
+          "type": "text",
+          "text": "Good catch. Please rewrite it to sort descending and add a unit test."
+        }
       ]
     }
   ],
@@ -40,11 +57,22 @@
       "description": "Read the contents of a file from the workspace.",
       "input_schema": {
         "type": "object",
-        "properties": {"path": {"type": "string", "description": "Relative file path"}},
-        "required": ["path"]
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Relative file path"
+          }
+        },
+        "required": [
+          "path"
+        ]
       }
     }
   ],
-  "thinking": {"type": "enabled", "budget_tokens": 10000},
-  "metadata": {"user_id": "user_abc123"}
+  "thinking": {
+    "type": "adaptive"
+  },
+  "metadata": {
+    "user_id": "user_abc123"
+  }
 }

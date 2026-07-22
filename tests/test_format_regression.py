@@ -144,3 +144,67 @@ def test_claude_desktop_fixture_max_tokens_fits_256k():
     body = _load("anthropic_claude_desktop.json")
     representative_prompt_tokens = 25843  # the real failing request's prompt length
     assert _capacity_ok(representative_prompt_tokens, body["max_tokens"], NEW_BLOCKS_PER_SLOT)
+
+
+def test_billing_header_stripped_from_system():
+    """Claude Desktop sends a leading ``x-anthropic-billing-header`` system
+    block (per-request hash). It must NOT reach the model: it pollutes the
+    prompt and defeats prefix caching. Mirrors vLLM's anthropic layer."""
+    body = _load("anthropic_claude_desktop.json")
+    parsed = anthropic_format.parse_messages(body)
+    sys_msg = next(m for m in parsed if m["role"] == "system")
+    assert "x-anthropic-billing-header" not in sys_msg["content"]
+    # the real system prompt survives
+    assert "You are Claude, an AI assistant" in sys_msg["content"]
+
+
+def test_billing_header_stripped_from_user_content():
+    body = {
+        "system": "sys",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "x-anthropic-billing-header: cc_version=1; cc_entrypoint=x;",
+                    },
+                    {"type": "text", "text": "the real user question"},
+                ],
+            }
+        ],
+    }
+    parsed = anthropic_format.parse_messages(body)
+    user = next(m for m in parsed if m["role"] == "user")
+    assert "x-anthropic-billing-header" not in user["content"]
+    assert "the real user question" in user["content"]
+
+
+def test_anthropic_close_thinking_emits_signature_delta():
+    """Claude Desktop requires a ``signature_delta`` before the
+    ``content_block_stop`` of a thinking block; without it the client drops the
+    thinking block AND the tool_use that follows -- the root cause of the user's
+    AskUserQuestion selection coming back as an empty "(no content)" message.
+    This locks the streaming-format fix."""
+    import json as _json
+
+    from server.app import _anthropic_close_thinking
+
+    events = _anthropic_close_thinking(0, "abc123sig")
+    joined = "".join(events)
+    assert "signature_delta" in joined
+    assert "abc123sig" in joined
+    assert "content_block_stop" in joined
+    # signature_delta must precede content_block_stop
+    assert joined.index("signature_delta") < joined.index("content_block_stop")
+    # both events are well-formed SSE data lines that parse as JSON
+    payloads = [
+        line[len("data: ") :]
+        for ev in events
+        for line in ev.splitlines()
+        if line.startswith("data: ")
+    ]
+    parsed = [_json.loads(x) for x in payloads]
+    assert parsed[0]["delta"]["type"] == "signature_delta"
+    assert parsed[0]["delta"]["signature"] == "abc123sig"
+    assert parsed[1]["type"] == "content_block_stop"

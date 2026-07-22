@@ -14,6 +14,27 @@ from typing import Any
 from server.formats.content import extract_blocks, extract_text
 from server.formats.tools import format_tool_calls_anthropic, parse_tool_calls
 
+_BILLING_HEADER_PREFIX = "x-anthropic-billing-header"
+
+
+def _strip_billing_blocks(blocks: list[dict]) -> list[dict]:
+    """Drop Claude Code's per-request billing/attribution header blocks.
+
+    These carry a per-request hash that (a) pollutes the system prompt and
+    (b) defeats prefix caching. Mirrors vLLM's anthropic serving layer, which
+    skips any text block starting with ``x-anthropic-billing-header``.
+    """
+    return [
+        b
+        for b in blocks
+        if not (
+            isinstance(b, dict)
+            and b.get("type") == "text"
+            and isinstance(b.get("text"), str)
+            and b["text"].startswith(_BILLING_HEADER_PREFIX)
+        )
+    ]
+
 
 def parse_messages(body: dict) -> list[dict]:
     """Convert Anthropic Messages API request body to chat-template messages.
@@ -26,14 +47,19 @@ def parse_messages(body: dict) -> list[dict]:
     """
     chat_messages: list[dict] = []
 
-    # System message
-    system_text = extract_text(body.get("system"))
+    # System message (strip Claude Code's billing-header block first)
+    system_field = body.get("system")
+    if isinstance(system_field, list):
+        system_field = _strip_billing_blocks(system_field)
+    elif isinstance(system_field, str) and system_field.startswith(_BILLING_HEADER_PREFIX):
+        system_field = ""
+    system_text = extract_text(system_field)
     if system_text:
         chat_messages.append({"role": "system", "content": system_text})
 
     for msg in body.get("messages", []):
         role = msg.get("role", "user")
-        blocks = extract_blocks(msg.get("content"))
+        blocks = _strip_billing_blocks(extract_blocks(msg.get("content")))
 
         if role == "assistant":
             text_parts = []

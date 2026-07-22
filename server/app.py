@@ -148,6 +148,28 @@ async def _tokenize_decode(engine_ref, token_ids):
     return await loop.run_in_executor(None, fn)
 
 
+def _anthropic_close_thinking(block_index: int, signature: str) -> list[str]:
+    """SSE events that close an Anthropic ``thinking`` content block.
+
+    Emits the ``signature_delta`` Claude Desktop requires, then
+    ``content_block_stop``. Mirrors vLLM's anthropic streaming layer: without
+    the signature_delta the client rejects the thinking block and DROPS any
+    tool_use that follows (the assistant turn is recorded as thinking-only, so
+    the pending tool call -- e.g. AskUserQuestion -- is lost and the user's
+    selection comes back as an empty "(no content)" message).
+    """
+    sig_ev = {
+        "type": "content_block_delta",
+        "index": block_index,
+        "delta": {"type": "signature_delta", "signature": signature},
+    }
+    stop_ev = {"type": "content_block_stop", "index": block_index}
+    return [
+        "event: content_block_delta\ndata: " + json.dumps(sig_ev) + "\n\n",
+        "event: content_block_stop\ndata: " + json.dumps(stop_ev) + "\n\n",
+    ]
+
+
 def _endpoint_from_path(path: str) -> str:
     """Map a request path to a low-cardinality metrics endpoint label."""
     if path.startswith("/v1/chat/completions"):
@@ -963,6 +985,7 @@ async def anthropic_messages(request: Request):
             block_index = 0
             thinking_open = False
             thinking_closed = False
+            thinking_signature = ""
             text_open = False
 
             async for item in engine.submit_stream(prompt_ids, effective_max):
@@ -976,6 +999,7 @@ async def anthropic_messages(request: Request):
                 for td in proc.drain_thinking():
                     if not thinking_open:
                         thinking_open = True
+                        thinking_signature = uuid.uuid4().hex
                         bs = {
                             "type": "content_block_start",
                             "index": block_index,
@@ -992,11 +1016,8 @@ async def anthropic_messages(request: Request):
                 for delta in proc.drain_content():
                     if thinking_open and not thinking_closed:
                         thinking_closed = True
-                        yield (
-                            "event: content_block_stop\ndata: "
-                            + _json.dumps({"type": "content_block_stop", "index": block_index})
-                            + "\n\n"
-                        )
+                        for ev in _anthropic_close_thinking(block_index, thinking_signature):
+                            yield ev
                         block_index += 1
                     if not text_open:
                         text_open = True
@@ -1014,11 +1035,8 @@ async def anthropic_messages(request: Request):
                     yield f"event: content_block_delta\ndata: {_json.dumps(d)}\n\n"
 
             if thinking_open and not thinking_closed:
-                yield (
-                    "event: content_block_stop\ndata: "
-                    + _json.dumps({"type": "content_block_stop", "index": block_index})
-                    + "\n\n"
-                )
+                for ev in _anthropic_close_thinking(block_index, thinking_signature):
+                    yield ev
                 block_index += 1
             if text_open:
                 yield (
