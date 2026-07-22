@@ -58,3 +58,21 @@ A1a profiling 显示 128K 下 attention 占 28.2%（decode 15.8% + prefill 11.2%
 - 但 e2e 收益约 5%，需要权衡工程复杂度
 - 建议：先在 runner 中实现 context-aware split 选择，过门禁后合入
 - 优先级：P2（A2 降级后，A6 升为性能主线第一项）
+
+## 补充实验：全局改 _DECODE_TARGET_SPLITS_PER_REQ=128 的效果
+
+将 sm120_gqa.py 中 `_DECODE_TARGET_SPLITS_PER_REQ` 从 64 改为 128（kv_split_size=2048, max_splits=128）：
+
+| KV len | 改前 (split=4096, max=64) | 改后 (split=2048, max=128) | 变化 |
+|--------|--------------------------|--------------------------|------|
+| 32K    | 0.352ms                  | **0.597ms**              | **+70% 退化** |
+| 64K    | 0.640ms                  | 0.557ms                  | -13% 改善 |
+| 128K   | 1.080ms                  | 1.009ms                  | -6.6% 改善 |
+
+**结论：全局改不可行。** max_splits=128 的 workspace 开销在短上下文（32K）严重退化。
+原始 64 确实是最佳全局折中（confirmed）。
+
+**真正的解法：adaptive split（根据实际 kv_len 动态选择 split size）。**
+需要 kernel 级改动或多 CUDA Graph bucket，工程量大，归入 M2→M3。
+
+已回滚，保持 _DECODE_TARGET_SPLITS_PER_REQ=64。
