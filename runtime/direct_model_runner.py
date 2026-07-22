@@ -295,6 +295,12 @@ def build_vllm_config(
 
 
 from runtime.mtp_accept import determine_accept_reject, determine_accept_reject_batch
+from server.metrics import (
+    record_mtp_acceptance,
+    record_prefix_cache_hit,
+    record_prefix_cache_miss,
+    record_slot_kv_usage,
+)
 
 
 class DirectModelRunner:
@@ -2287,6 +2293,7 @@ class DirectModelRunner:
             return_hidden=True,
         )
         decision = determine_accept_reject(draft, verify_logits)
+        record_mtp_acceptance(decision["num_accepted"])
         committed_len = decision["num_accepted"] + 1
         # Real input tokens for positions kv_len_before..+committed_len-1:
         # anchor followed by the accepted drafts (NOT the recovery token --
@@ -3227,6 +3234,13 @@ class DirectModelRunner:
         else:
             L_per_slot = [0] * len(slots)
 
+        # D2: record prefix cache hit/miss metrics
+        for _L in L_per_slot:
+            if _L > 0:
+                record_prefix_cache_hit(_L // self.block_size)
+            else:
+                record_prefix_cache_miss()
+
         # For hit slots, restore cached prefix immediately
         for s, p, L in zip(slots, prompts_per_slot, L_per_slot):
             if L > 0:
@@ -4098,6 +4112,12 @@ class DirectModelRunner:
 
         # Per-slot reconciliation (sec 3.4): L = G <= A.
         L_per_slot = [self.reconcile_prefix_hit(p) for p in prompts_per_slot]
+        # D2: record prefix cache hit/miss metrics
+        for _L in L_per_slot:
+            if _L > 0:
+                record_prefix_cache_hit(_L // self.block_size)
+            else:
+                record_prefix_cache_miss()
         hit_idx = [i for i, L in enumerate(L_per_slot) if L > 0]
         cold_idx = [i for i, L in enumerate(L_per_slot) if L == 0]
 
@@ -4502,6 +4522,8 @@ class DirectModelRunner:
             )
 
         decisions = determine_accept_reject_batch(slots, drafts_by_slot, verify_logits, k)
+        for _s in slots:
+            record_mtp_acceptance(decisions[_s]["num_accepted"])
 
         real_new_tokens = {s: [anchors[s]] + decisions[s]["committed"][:-1] for s in slots}
         next_anchors = {s: decisions[s]["committed"][-1] for s in slots}
@@ -4510,6 +4532,7 @@ class DirectModelRunner:
         for s in slots:
             self.slot_kv_len[s] = kv_lens_before[s] + committed_lens[s]
             self.slot_num_accepted_tokens[s] = committed_lens[s]
+            record_slot_kv_usage(s, self.slot_kv_len[s] // self.block_size, self.blocks_per_slot)
         # P3.2 decode-position populate (per slot): publish any newly-FULL
         # committed blocks now that slot_kv_len advanced by each slot's REAL
         # committed length (only committed tokens; INV4). No-op off-flag.

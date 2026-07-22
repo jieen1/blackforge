@@ -885,6 +885,9 @@ async def metrics_endpoint():
     # success/error counters (recorded per request in the handlers above).
     lines.extend(metrics.render(ServerEngine.MODEL))
 
+    # D2: runtime-internal metrics (MTP acceptance, prefix cache depth, per-slot KV)
+    lines.append(metrics.render_d2_metrics(ServerEngine.MODEL))
+
     from fastapi.responses import PlainTextResponse
 
     return PlainTextResponse("\n".join(lines) + "\n", media_type="text/plain; charset=utf-8")
