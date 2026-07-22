@@ -452,7 +452,9 @@ async def chat_completions(req: ChatCompletionRequest):
     tools = convert_tools_to_chat_template(req.tools)
 
     prompt_ids = await _tokenize_chat(
-        engine, chat_messages, tools=tools,
+        engine,
+        chat_messages,
+        tools=tools,
         chat_template_kwargs=req.chat_template_kwargs,
     )
     await _debug_log_input(
@@ -606,17 +608,14 @@ async def chat_completions(req: ChatCompletionRequest):
     # the tokens start with the reasoning body (the opening  tag was
     # injected by the prompt), which we wrap and strip below.
     _non_thinking = bool(
-        req.chat_template_kwargs
-        and req.chat_template_kwargs.get("enable_thinking") is False
+        req.chat_template_kwargs and req.chat_template_kwargs.get("enable_thinking") is False
     )
     reasoning_content = None
     if _non_thinking:
         text = raw_text.replace("\ufffd", "").strip()
     else:
         _raw_for_strip = (
-            raw_text
-            if raw_text.startswith(_THINK_OPEN)
-            else (_THINK_OPEN + "\n" + raw_text)
+            raw_text if raw_text.startswith(_THINK_OPEN) else (_THINK_OPEN + "\n" + raw_text)
         )
         text = strip_thinking(_raw_for_strip)
         _raw_with_think = (
