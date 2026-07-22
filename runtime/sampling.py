@@ -109,14 +109,18 @@ def _apply_top_p(logits: torch.Tensor, p: float) -> torch.Tensor:
 def make_generator(
     seed: int | None, device: str | None = None
 ) -> torch.Generator | None:
-    """Create a seeded CPU generator for reproducible sampling.
+    """Create a seeded generator for reproducible sampling.
 
     Returns ``None`` when ``seed is None`` (non-deterministic sampling).
+    The generator is placed on CUDA if available (required by
+    ``torch.multinomial`` on CUDA tensors), otherwise CPU.
     """
     if seed is None:
         return None
     import torch as _torch
 
-    gen = _torch.Generator(device="cpu")
+    if device is None:
+        device = "cuda" if _torch.cuda.is_available() else "cpu"
+    gen = _torch.Generator(device=device)
     gen.manual_seed(seed)
     return gen
