@@ -60,13 +60,14 @@ def _check_invariant_for_k(runner, tok, slot: int, k: int) -> dict:
         runner.reset_slot(slot)
 
     calls = []
-    original = runner._mtp_forward
+    _target = runner.backend if hasattr(runner, "backend") else runner
+    original = _target._mtp_forward
 
     def instrumented(slot_arg, token_ids, hidden_states_in, start_pos, *, prior_kv_len, is_decode):
         calls.append({"start_pos": start_pos, "prior_kv_len": prior_kv_len, "num_tokens": len(token_ids)})
         return original(slot_arg, token_ids, hidden_states_in, start_pos, prior_kv_len=prior_kv_len, is_decode=is_decode)
 
-    runner._mtp_forward = instrumented
+    _target._mtp_forward = instrumented
     try:
         # mtp_prefill always proposes runner.num_speculative_tokens (K=3,
         # the runner's own configured production value) -- to stress-test
@@ -81,7 +82,7 @@ def _check_invariant_for_k(runner, tok, slot: int, k: int) -> dict:
             slot, shifted_input_ids, target_hidden, start_pos=0, num_new_tokens=len(prompt_ids), k=k
         )
     finally:
-        runner._mtp_forward = original
+        _target._mtp_forward = original
 
     mismatches = [c for c in calls if c["prior_kv_len"] != c["start_pos"]]
     return {

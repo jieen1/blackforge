@@ -187,9 +187,9 @@ def _run_profiled_decode_steps(runner, slots, anchors, drafts, num_steps):
     total_draft_tokens = 0
 
     # Monkey-patch sub-components for timing
-    orig_verify_batch_spec = runner.verify_batch_spec
+    orig_verify_batch_spec = (runner.backend if hasattr(runner, "backend") else runner).verify_batch_spec
     orig_accept_reject = determine_accept_reject_batch
-    orig_mtp_sync_and_propose_batch = runner._mtp_sync_and_propose_batch
+    orig_mtp_sync_and_propose_batch = (runner.backend if hasattr(runner, "backend") else runner)._mtp_sync_and_propose_batch
     orig_mtp_run_continuation_steps = runner._mtp_run_continuation_steps
 
     step_timing = StepTimings()
@@ -229,10 +229,11 @@ def _run_profiled_decode_steps(runner, slots, anchors, drafts, num_steps):
         return result
 
     # Patch
-    runner.verify_batch_spec = timed_verify_batch_spec
+    _target = runner.backend if hasattr(runner, "backend") else runner
+    _target.verify_batch_spec = timed_verify_batch_spec
     import runtime.direct_model_runner as rm
     rm.determine_accept_reject_batch = timed_accept_reject
-    runner._mtp_sync_and_propose_batch = timed_mtp_sync_and_propose_batch
+    _target._mtp_sync_and_propose_batch = timed_mtp_sync_and_propose_batch
 
     try:
         for step_idx in range(num_steps):
@@ -257,9 +258,9 @@ def _run_profiled_decode_steps(runner, slots, anchors, drafts, num_steps):
             timings.append(step_timing)
     finally:
         # Restore originals
-        runner.verify_batch_spec = orig_verify_batch_spec
+        _target.verify_batch_spec = orig_verify_batch_spec
         rm.determine_accept_reject_batch = orig_accept_reject
-        runner._mtp_sync_and_propose_batch = orig_mtp_sync_and_propose_batch
+        _target._mtp_sync_and_propose_batch = orig_mtp_sync_and_propose_batch
 
     return timings, total_committed, total_draft_tokens
 
