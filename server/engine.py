@@ -504,6 +504,8 @@ class ServerEngine:
         self, admit_now: list[tuple[int, GenerationRequest]], hit_depths: list[int]
     ) -> None:
         for (_slot, req), L in zip(admit_now, hit_depths):
+            # C6: store per-request hit depth for usage reporting
+            req._prefix_cache_hit_tokens = L
             if L > 0:
                 self.stats["prefix_cache_hits"] += 1
                 self.stats["prefix_cache_hit_tokens_saved"] += L
@@ -585,6 +587,7 @@ class ServerEngine:
             "finish_reason": finish_reason,
             "prompt_tokens": len(req.prompt_ids),
             "completion_tokens": len(committed_tokens),
+            "prefix_cache_hit_tokens": getattr(req, "_prefix_cache_hit_tokens", 0),
         }
         if req.stream_channel is not None:
             self._stream_close(req.stream_channel)

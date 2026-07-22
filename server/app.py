@@ -1037,7 +1037,12 @@ async def anthropic_messages(request: Request):
                     "model": model_name,
                     "stop_reason": None,
                     "stop_sequence": None,
-                    "usage": {"input_tokens": len(prompt_ids), "output_tokens": 0},
+                    "usage": {
+                        "input_tokens": len(prompt_ids),
+                        "output_tokens": 0,
+                        "cache_read_input_tokens": final_result.get("prefix_cache_hit_tokens", 0) if final_result else 0,
+                        "cache_creation_input_tokens": 0,
+                    },
                 },
             }
             yield f"event: message_start\ndata: {_json.dumps(msg_start)}\n\n"
