@@ -25,6 +25,7 @@ from runtime.metadata_builders import (
     build_attention_metadata,
     build_attention_metadata_batch,
 )
+from runtime.logprobs import compute_logprobs
 from runtime.mtp_accept import determine_accept_reject, determine_accept_reject_batch
 from server.metrics import (
     record_mtp_acceptance,
@@ -1988,6 +1989,9 @@ class Qwen36Backend:
         slots: list[int],
         anchors: dict[int, int],
         draft_tokens: dict[int, list[int]],
+        *,
+        return_logprobs: bool = False,
+        top_logprobs: int = 0,
     ) -> dict[int, dict]:
         """Batched analogue of ``mtp_verify_and_commit`` -- **Phase 2,
         2026-07-18 rewrite** (``notes/2026-07-17-post-ragged-round-next-steps.md``
@@ -2130,6 +2134,19 @@ class Qwen36Backend:
             k=k,
         )
 
+        # C2: compute logprobs from verify logits if requested
+        logprobs_by_slot: dict[int, list[dict]] = {}
+        if return_logprobs:
+            for i, s in enumerate(slots):
+                n_committed = committed_lens[s]
+                slot_logits = verify_logits[
+                    i * (k + 1) : i * (k + 1) + n_committed
+                ]
+                committed = decisions[s]["committed"]
+                logprobs_by_slot[s] = compute_logprobs(
+                    slot_logits, committed, top_k=top_logprobs,
+                )
+
         result: dict[int, dict] = {}
         for s in slots:
             self._r.slot_pending_draft_tokens[s] = next_drafts_batch[s]
@@ -2138,6 +2155,8 @@ class Qwen36Backend:
                 "next_anchor": next_anchors[s],
                 "next_draft_tokens": next_drafts_batch[s],
             }
+            if return_logprobs:
+                result[s]["logprobs"] = logprobs_by_slot[s]
         return result
 
 

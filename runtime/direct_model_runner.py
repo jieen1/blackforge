@@ -50,17 +50,13 @@ _SM120_BACKEND_PATH = "vllm.v1.attention.backends.sm120_gqa.SM120GQABackend"
 # 0 -> physical index 0), which real vLLM's convention never produces --
 from runtime.block_pool import (
     RESERVED_PHYSICAL_SLOTS,
-    NONE_HASH,
-    Block,
     BlockHash,
     BlockPool,
     ChunkedPrefillState,
-    FreeBlockQueue,
-    _initial_block_table,
     _physical_slot,
-    _ssm_spec_row,
     hash_block_tokens,
 )
+
 
 def _ensure_sm120_backend_registered() -> None:
     """register_backend() is a plain dict write (see registry.py's
@@ -241,6 +237,7 @@ from runtime.metadata_builders import (
     build_gdn_metadata_spec_batch,
 )
 
+
 def _install_triton_norm_ops_once() -> None:
     """Install Triton-fused RMSNorm ops (vLLM C ext lacks them on this machine).
     Must be called AFTER create_engine_config() because that call resets
@@ -285,10 +282,10 @@ def build_vllm_config(
     return config
 
 
-from runtime.mtp_accept import determine_accept_reject, determine_accept_reject_batch
-from runtime.model_spec import ModelSpec
 from runtime.backends.qwen36 import Qwen36Backend
 from runtime.cuda_graphs import CapturedBatchDecodeGraph, CapturedMTPDraftStepGraph
+from runtime.logprobs import compute_logprobs
+from runtime.model_spec import ModelSpec
 from server.metrics import (
     record_prefix_cache_hit,
     record_prefix_cache_miss,
@@ -1657,11 +1654,17 @@ class DirectModelRunner:
         token_ids: list[int],
         kv_lengths: list[int],
         params_list: list[SamplingParams],
-    ) -> list[int]:
+        *,
+        return_logprobs: bool = False,
+        top_logprobs: int = 0,
+    ) -> list[int] | tuple[list[int], list[dict]]:
         """Decode one token per slot with per-request sampling params.
 
         Falls back to greedy argmax for any slot whose params have
         ``temperature == 0``, preserving bit-identical behavior.
+
+        When ``return_logprobs`` is True, returns a tuple of
+        ``(token_ids, logprobs_list)`` instead of just token_ids.
         """
         logits = self._forward_batch(slot_ids, token_ids, kv_lengths)
         results: list[int] = []
@@ -1672,6 +1675,14 @@ class DirectModelRunner:
                 row = logits[i].unsqueeze(0)
                 gen = make_generator(params.seed)
                 results.append(int(sample_from_logits(row, params, generator=gen).item()))
+        if return_logprobs:
+            lp_list = [
+                compute_logprobs(
+                    logits[i].unsqueeze(0), [results[i]], top_k=top_logprobs,
+                )[0]
+                for i in range(len(results))
+            ]
+            return results, lp_list
         return results
 
     def verify_batch(
@@ -2637,6 +2648,13 @@ class DirectModelRunner:
         slots: list[int],
         anchors: dict[int, int],
         draft_tokens: dict[int, list[int]],
+        *,
+        return_logprobs: bool = False,
+        top_logprobs: int = 0,
     ) -> dict[int, dict]:
-        return self.backend.mtp_verify_and_commit_batch(slots, anchors, draft_tokens)
+        return self.backend.mtp_verify_and_commit_batch(
+            slots, anchors, draft_tokens,
+            return_logprobs=return_logprobs,
+            top_logprobs=top_logprobs,
+        )
 

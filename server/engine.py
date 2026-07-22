@@ -85,6 +85,8 @@ class GenerationRequest:
     stream_channel: StreamChannel | None = None
     sampling_params: SamplingParams = field(default_factory=SamplingParams)
     response_format: dict | None = None
+    logprobs: bool = False
+    top_logprobs: int = 0
 
 
 class StreamChannel:
@@ -356,6 +358,8 @@ class ServerEngine:
         session_id: str | None = None,
         sampling_params: SamplingParams | None = None,
         response_format: dict | None = None,
+        logprobs: bool = False,
+        top_logprobs: int = 0,
     ) -> dict:
         """Submit a generation request. Resolves when generation completes."""
         loop = asyncio.get_running_loop()
@@ -368,6 +372,8 @@ class ServerEngine:
             session_id=session_id,
             sampling_params=sampling_params or SamplingParams(),
             response_format=response_format,
+            logprobs=logprobs,
+            top_logprobs=top_logprobs,
         )
         self._req_deque.append(req)
         try:
@@ -384,6 +390,8 @@ class ServerEngine:
         sampling_params: SamplingParams | None = None,
         cancel_ref: list | None = None,
         response_format: dict | None = None,
+        logprobs: bool = False,
+        top_logprobs: int = 0,
     ):
         """Submit a streaming generation request. Yields token-id lists as
         each MTP round commits them. Final yield is the result dict."""
@@ -403,6 +411,8 @@ class ServerEngine:
             stream_channel=channel,
             sampling_params=sampling_params or SamplingParams(),
             response_format=response_format,
+            logprobs=logprobs,
+            top_logprobs=top_logprobs,
         )
         self._req_deque.append(req)
         try:
@@ -579,7 +589,8 @@ class ServerEngine:
             self.active[slot]["grammar"] = None
 
     def _finish_request(
-        self, slot: int, req: GenerationRequest, committed_tokens: list[int], finish_reason: str
+        self, slot: int, req: GenerationRequest, committed_tokens: list[int], finish_reason: str,
+        logprobs_data: list[dict] | None = None,
     ) -> None:
         tracer.request_finished(req.request_id, finish_reason)
         result = {
@@ -589,6 +600,8 @@ class ServerEngine:
             "completion_tokens": len(committed_tokens),
             "prefix_cache_hit_tokens": getattr(req, "_prefix_cache_hit_tokens", 0),
         }
+        if logprobs_data is not None:
+            result["logprobs"] = logprobs_data
         if req.stream_channel is not None:
             self._stream_close(req.stream_channel)
         self._resolve_future(req.future, result)
@@ -856,23 +869,42 @@ class ServerEngine:
             token_ids = [self.active[s]["last_token"] for s in slot_ids]
             kv_lengths = [self.runner.slot_kv_len[s] for s in slot_ids]
             params_list = [self.active[s]["req"].sampling_params for s in slot_ids]
-            next_tokens = self.runner.decode_batch_sampled(
-                slot_ids, token_ids, kv_lengths, params_list
+            any_lp = any(self.active[s]["req"].logprobs for s in slot_ids)
+            top_lp = max(
+                (self.active[s]["req"].top_logprobs for s in slot_ids),
+                default=0,
+            ) if any_lp else 0
+            decode_result = self.runner.decode_batch_sampled(
+                slot_ids, token_ids, kv_lengths, params_list,
+                return_logprobs=any_lp, top_logprobs=top_lp,
             )
-            for s, tok in zip(slot_ids, next_tokens):
+            if any_lp:
+                next_tokens, lp_batch = decode_result
+            else:
+                next_tokens = decode_result
+                lp_batch = None
+            for i, (s, tok) in enumerate(zip(slot_ids, next_tokens)):
                 st = self.active[s]
                 req: GenerationRequest = st["req"]
                 if len(st["committed_tokens"]) >= req.max_tokens:
-                    self._finish_request(s, req, st["committed_tokens"], "length")
+                    self._finish_request(
+                        s, req, st["committed_tokens"], "length",
+                        logprobs_data=st.get("logprobs_acc"),
+                    )
                     newly_finished.append(s)
                     continue
                 if tok == self.eos_token_id:
-                    self._finish_request(s, req, st["committed_tokens"], "stop")
+                    self._finish_request(
+                        s, req, st["committed_tokens"], "stop",
+                        logprobs_data=st.get("logprobs_acc"),
+                    )
                     newly_finished.append(s)
                     continue
                 st["committed_tokens"].append(tok)
                 st["last_token"] = tok
                 st["last_progress_round"] = self.stats["rounds"]
+                if lp_batch is not None and st["req"].logprobs:
+                    st.setdefault("logprobs_acc", []).append(lp_batch[i])
                 # C3: advance grammar state
                 grammar = st.get("grammar")
                 if grammar is not None:
@@ -880,16 +912,26 @@ class ServerEngine:
                 if req.stream_channel is not None:
                     self._stream_put(req.stream_channel, [tok])
                 if len(st["committed_tokens"]) >= req.max_tokens:
-                    self._finish_request(s, req, st["committed_tokens"], "length")
+                    self._finish_request(
+                        s, req, st["committed_tokens"], "length",
+                        logprobs_data=st.get("logprobs_acc"),
+                    )
                     newly_finished.append(s)
 
         # -- MTP verify/commit round (greedy path, unchanged) --
         if greedy_slots:
             _round_t0 = time.perf_counter()
+            any_lp_g = any(self.active[s]["req"].logprobs for s in greedy_slots)
+            top_lp_g = max(
+                (self.active[s]["req"].top_logprobs for s in greedy_slots),
+                default=0,
+            ) if any_lp_g else 0
             decisions = self.runner.mtp_verify_and_commit_batch(
                 greedy_slots,
                 {s: self.active[s]["anchor"] for s in greedy_slots},
                 {s: self.active[s]["drafts"] for s in greedy_slots},
+                return_logprobs=any_lp_g,
+                top_logprobs=top_lp_g,
             )
             _round_ms = (time.perf_counter() - _round_t0) * 1000
 
@@ -899,6 +941,8 @@ class ServerEngine:
                 decision = decisions[s]
                 new_tokens = decision["committed"]
                 na = decision.get("num_accepted", 0)
+                if req.logprobs and "logprobs" in decision:
+                    st.setdefault("logprobs_acc", []).extend(decision["logprobs"])
                 if 0 <= na < len(self.stats["mtp_acceptance_histogram"]):
                     self.stats["mtp_acceptance_histogram"][na] += 1
 
@@ -931,7 +975,10 @@ class ServerEngine:
                     tracer.decode_round(req.request_id, self.stats["rounds"], len(kept), _round_ms)
                     continue
 
-                self._finish_request(s, req, st["committed_tokens"], finish_reason)
+                self._finish_request(
+                    s, req, st["committed_tokens"], finish_reason,
+                    logprobs_data=st.get("logprobs_acc"),
+                )
                 newly_finished.append(s)
 
         for s in newly_finished:

@@ -140,6 +140,35 @@ async def _tokenize_decode(engine_ref, token_ids):
     return await loop.run_in_executor(None, fn)
 
 
+
+def _format_logprobs_openai(
+    engine_ref, raw_logprobs: list[dict] | None,
+) -> dict | None:
+    """Format raw logprobs data into OpenAI API logprobs structure."""
+    if not raw_logprobs:
+        return None
+    tok = engine_ref.tok
+    content_list = []
+    for entry in raw_logprobs:
+        token_str = tok.decode([entry["token_id"]])
+        item: dict = {
+            "token": token_str,
+            "logprob": entry["logprob"],
+            "bytes": list(token_str.encode("utf-8")),
+        }
+        top = []
+        for alt in entry.get("top_logprobs", []):
+            alt_str = tok.decode([alt["token_id"]])
+            top.append({
+                "token": alt_str,
+                "logprob": alt["logprob"],
+                "bytes": list(alt_str.encode("utf-8")),
+            })
+        item["top_logprobs"] = top
+        content_list.append(item)
+    return {"content": content_list}
+
+
 def _endpoint_from_path(path: str) -> str:
     """Map a request path to a low-cardinality metrics endpoint label."""
     if path.startswith("/v1/chat/completions"):
@@ -494,6 +523,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 sampling_params=sampling_params,
                 cancel_ref=_cancel_ref,
                 response_format=req.response_format,
+                logprobs=bool(req.logprobs),
+                top_logprobs=req.top_logprobs or 0,
             ):
                 if await request.is_disconnected():
                     if _cancel_ref[0]:
@@ -594,6 +625,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     # Non-streaming path
     result = await engine.submit(
         prompt_ids, max_tokens, session_id=req.session_id, sampling_params=sampling_params,
+        logprobs=bool(req.logprobs), top_logprobs=req.top_logprobs or 0,
     )
     raw_text = await _tokenize_decode(engine, result["committed_token_ids"])
     _THINK_OPEN = chr(60) + "think" + chr(62)
@@ -648,6 +680,10 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     )
     if reasoning_content:
         resp["choices"][0]["message"]["reasoning_content"] = reasoning_content
+    if req.logprobs:
+        resp["choices"][0]["logprobs"] = _format_logprobs_openai(
+            engine, result.get("logprobs"),
+        )
     return resp
 
 
@@ -666,6 +702,7 @@ async def completions(req: CompletionRequest, request: Request):
 
     result = await engine.submit(
         prompt_ids, max_tokens, session_id=req.session_id, sampling_params=sampling_params,
+        logprobs=bool(req.logprobs), top_logprobs=req.top_logprobs or 0,
     )
     _raw_comp = await _tokenize_decode(engine, result["committed_token_ids"])
     _raw_comp_full = (
@@ -694,7 +731,8 @@ async def completions(req: CompletionRequest, request: Request):
         "created": int(time.time()),
         "model": req.model or ServerEngine.MODEL,
         "choices": [
-            {"index": 0, "text": text, "finish_reason": result["finish_reason"], "logprobs": None}
+            {"index": 0, "text": text, "finish_reason": result["finish_reason"],
+             "logprobs": _format_logprobs_openai(engine, result.get("logprobs")) if req.logprobs else None}
         ],
         "usage": {
             "prompt_tokens": result["prompt_tokens"],
