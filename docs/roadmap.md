@@ -12,6 +12,7 @@
 
 ## 目录
 
+0. [执行看板：先做什么（2026-07-22 复盘）](#0-执行看板先做什么2026-07-22-复盘)
 1. [现状盘点：已锻成与未竟](#1-现状盘点已锻成与未竟)
 2. [规划原则与北极星指标](#2-规划原则与北极星指标)
 3. [路线总览与依赖关系](#3-路线总览与依赖关系)
@@ -25,6 +26,28 @@
 11. [不做清单](#11-不做清单)
 
 ---
+
+## 0. 执行看板：先做什么（2026-07-22 复盘）
+
+**已完成**：B1/C1 采样全链路 · C5 取消 + timeout · D1 watchdog · A5/B4 chunked prefill 解耦调度 · A1a profiling（4K+128K）· A2 shape survey · B7-V0 fork 存档 · B7-V1 compat 收口骨架 · 速度基线冻结 · soak 脚本 · Laguna L0 显存账本（主模型 + DFlash 权重已就位）
+
+**关键证据（决定了下面的排序）**：A1a 实证 NVFP4 GEMM 占 **71%@4K / 54%@128K**、attention 28%@128K、**GDN 恒定仅 ~4%** —— A1 GDN 融合降级暂缓，A2 升为头号杠杆，新增 A6（attention 长上下文优化）。
+
+**执行顺序**：
+
+1. 🔥 **golden fixtures 落盘** —— 一切替换的裁判（尚未落盘），不做完不得开始任何替换
+2. 🔥 **A2 NVFP4 GEMM autotune / 自研** —— 最大杠杆，兼去 vLLM 化 V2 第一项
+3. 🔥 **B7-V1 收官** —— 薄依赖自写 + FLA 切上游 + 独立建仓门禁（干净 venv 起服务）
+4. 🔥 **D4 首次 24h soak + 例行化** —— 性能大改前的护栏
+5. 🔥 **L0 收尾（待办点，开发执行）** —— DFlash 校验（config / draft 机制 / K=15 形状）+ pinned vLLM 加载 Laguna 冒烟
+6. ⏭ A6 attention 长上下文优化 · A3 MTP 融合 · L1 Laguna 冒烟租户
+7. ⏭ B5 模块化 + E1 抽象层 · D2/D3 观测细化 · C3 结构化输出
+8. ⏸ B2 动态 KV · A4 显存换速度 · C2/C4/C6 · D6 自动回退 · E2 Qwen3 · L2/L3（按原里程碑走）
+9. 🧊 暂缓：**A1 GDN 融合**（占比仅 ~4%，A2/A6 榨干后再评）；远期：B6 多 GPU · V3 零依赖门禁
+
+**一个月视界（2026-07-23 → 08-22，序号即上表）**：第 1 周并行推 ①fixtures + ③V1 收官 + ④soak 首跑 + ⑤L0 收尾；**②A2 是贯穿全月的主线**（fixtures 落盘后即开工，逐 shape 出成果、逐项过门禁）；第 2 周起 ⑥A6/A3 与 L1 冒烟接续进场；第 3–4 周 ⑦B5+E1 启动、D2/D3/C3 见缝插针。月末对账标尺 = 第 9 节 M2 出口判据（v1 档：ITL ≥10%）。
+
+**已裁决变更**：AIME26 评测撤销（`686f421`，五层质量证据已足）· A1 降级 · 新增 A6。
 
 ## 1. 现状盘点：已锻成与未竟
 
@@ -93,12 +116,13 @@ flowchart LR
 
 | 工作项 | 内容与关键动作 | 门禁（合入标准） | 优先级 / 工作量 / 里程碑 |
 |---|---|---|---|
-| **A1a** GDN 逐层 profiling | nsys 分解每个 GDN 层的完整 kernel 序列；建立单层 replay 基准；产出 decode step 时间占比账本，更新 `notes/` 证据链 | 占比数据可复现；与 Phase-0 gap ledger 交叉验证 | P0 / S / M1 |
-| **A1** GDN 全栈融合 | 按占比依次尝试：input projection 融合、gate/activation 融合、conv/state update 融合、norm+residual 融合、persistent workspace、消除临时 tensor；终态目标是把一个 GDN block 压成少数几个 kernel | 单层 ≥10% 提升才进 runtime；1000-step 状态演化正确；四槽 reset/复用正确；每次融合过完整质量回归 | P0 / L / M2 |
-| **A2** NVFP4 GEMM 自研与 autotune | 按占比排序替换：GDN/attention in_proj → MLP gate-up → down_proj → o_proj → MTP proj → lm_head；每 shape 建 autotune 表（prefill M / decode M=1..4 / verify M=4..16）；评估 fused QKV / fused gate-up 双布局。**与 B7-V2 合并：自研 GEMM 落地即同步移除对 vLLM NVFP4 linear 的最后依赖** | 只有端到端 ≥1% 的权重副本才保留；计入额外显存与加载时间 | P1 / L / M2→M3 |
+| **A1a** GDN 逐层 profiling | **✅ 已完成（2026-07-22，4K + 128K 双档）**：NVFP4 GEMM 71%@4K / 54%@128K，attention 3.5%→28.2%，GDN 恒定 ~4%——见 `notes/2026-07-22-a1a-gdn-profiling.md`。遗留：CUDA Graph 模式下占比对照 | 占比数据可复现 ✅ | ✅ 已关 |
+| **A1** GDN 全栈融合 | **🧊 暂缓（A1a 证据裁决）**：GDN 占比恒定 ~4%，融合上限过低，门票条款「占比不支持则转向 A2」生效；仅当 A2/A6 榨干后重评 | ——（重启时沿用原门禁：单层 ≥10%、1000-step 状态正确） | 暂缓 |
+| **A2** NVFP4 GEMM 自研与 autotune | **🔥 P0 当前最大杠杆**（A1a：71%@4K / 54%@128K；shape survey 已就绪 `benchmarks/a2_gemm_shape_survey.py`）。按占比排序替换：in_proj → MLP gate-up → down_proj → o_proj → MTP proj → lm_head；每 shape 建 autotune 表（prefill M / decode M=1..4 / verify M=4..16）；评估 fused QKV / fused gate-up 双布局。**与 B7-V2 合并：自研 GEMM 落地即移除对 vLLM NVFP4 linear 的最后依赖。前置：golden fixtures 落盘（P0 #1）** | 只有端到端 ≥1% 的权重副本才保留；fixtures parity；计入额外显存与加载时间 | P0 / L / M2 |
+| **A6** attention 长上下文二次优化（新增） | 128K 下 attention 占 28.2%（decode_v2_nativefp8 15.8% + prefill_fp8 11.2%），A2 之后的第二杠杆：split-K 参数再调优、prefill kernel 专项、与 A5 chunked prefill 的交互 profile | 单项 profiling 准入 + 端到端收益结算；fixtures parity | P1 / M / M2→M3 |
 | **A3** MTP 链路融合与 DFlash 评估 | 融合 draft logits / verify attention / acceptance / token compact-scatter；随后单独评估 DFlash（绝不与 MTP 重写同时进行） | 按 accepted tok/s 结算净收益；接受率不降 >1pp；关闭投机时 fallback 稳定 | P1 / M / M2 |
 | **A4** 剩余显存换速度 | 系统化 A/B：decode/prefill 双权重布局、更大前缀缓存、KV hot-window 连续布局、CUDA Graph 多 bucket、高频小矩阵特殊副本 | 每项独立 A/B（额外显存 / 额外写入 / TTFT / ITL / accepted tok/s 五项全记） | P2 / M / M3 |
-| **A5** 长 prefill 优化 | chunked prefill 与他槽 decode 交错调度（与 B4 联动），压 TTFT 尾部；128K+ 冷启动路径专项 | 长 prefill 期间其余槽 ITL 恶化 <10% | P1 / M / M2 |
+| **A5** 长 prefill 优化 | **✅ 已完成（`a8bd167`）**：增量 chunked prefill + 与 B4 解耦调度联动落地 | 长 prefill 期间其余槽 ITL 恶化 <10%（以 soak/基准持续验证） | ✅ 已关 |
 
 ## 5. Track B · 架构优化（含 B7 去 vLLM 化）
 
@@ -106,9 +130,9 @@ flowchart LR
 
 | 工作项 | 内容与关键动作 | 门禁（合入标准） | 优先级 / 工作量 / 里程碑 |
 |---|---|---|---|
-| **B1** 采样支持 | graph-safe 的 temperature / top-p / top-k 采样 kernel（持久 buffer 内完成，不破坏 CUDA Graph 重放）；greedy 保持为 temperature=0 特例 | 固定种子下可复现；greedy 路径 bit 级不变；图/eager parity 检查扩展覆盖采样 | P0 / M / M1 |
+| **B1** 采样支持 | **✅ 已完成（`b4e624d` + `b3b0847` GPU 验证）**：`runtime/sampling.py` + CUDA generator 修正，greedy 为 temperature=0 特例 | 固定种子可复现 ✅；greedy bit 级不变 ✅ | ✅ 已关 |
 | **B2** 动态 KV 分配 | 打破每槽静态 `blocks_per_slot` 配额，让 BlockPool 成为全局预算池：短请求少占、长请求多借，上下文与并发运行时弹性权衡；容量门控随之改为全局预算判定 | 压力下无 OOM；借还路径过前缀缓存全部不变量（INV*）测试；最坏情形回退到静态配额行为 | P1 / L / M3 |
-| **B4** prefill / decode 解耦调度 | 引擎主循环支持轮内插入 prefill chunk，长 prefill 不再独占整轮；与 A5 配套 | 调度公平性基准 + 现有 slot 生命周期测试全绿 | P1 / M / M2 |
+| **B4** prefill / decode 解耦调度 | **✅ 已完成（`a8bd167`，与 A5 同批）**：引擎主循环轮内插入 prefill chunk | slot 生命周期测试全绿 ✅（公平性以 soak 持续验证） | ✅ 已关 |
 | **B3** 请求暂停/恢复 | 会话级 pause/resume 保留 cache（session affinity 的推广），multi-agent 长会话切换不付重算成本 | 暂停槽被抢占后仍能经前缀缓存温启动；TTL 驱逐正确 | P2 / M / M3 |
 | **B5** runner 模块化重构 | 把 6506 行 `direct_model_runner.py` 按分页/前缀缓存、MTP、CUDA Graph、元数据构建四域拆分——在 E1 抽象层动刀之前完成，纯移动不改逻辑。**B7-V1 的 compat 收口自然产出本项的模块边界，二者同批执行** | 拆分前后全测试套件与基准输出 bit 级一致（parity 门禁） | P1 / M / M3（E1 前置） |
 | **B6** 多 GPU 可行性评估 | 仅评估不实施：TP 切分对固定槽位/CUDA Graph/GDN 状态模型的冲击面分析，产出 go/no-go 报告 | 报告含收益上限测算与工程成本估计 | 远期 / S / M4 |
@@ -210,7 +234,7 @@ B7 与 **B5（runner 模块化）、E1（模型抽象层）、A2（NVFP4 GEMM）
 
 | 阶段 | 内容 | 门禁（合入/晋级标准） | 里程碑 |
 |---|---|---|---|
-| **L0** 本地调研合同 | 基于已在本地下载的权重与 config：**精确 KV 账本**（head 数 / head_dim / GQA 比例 / 12 层全局 attention 的 per-token KV 字节）、**显存预算合同**（71 GB 权重 + FP8 KV 下 256K × N 槽位可行性、expert offload 是否需要的书面判定——仿 `hy3-sm120-research/04-memory-budget` 的合同格式）；pinned vLLM 0.25 加载冒烟（确认架构类支持与最低版本）；DFlash K=15 的 verify 形状（qo_len=16）与现有 CUDA Graph 设计的兼容性分析 | 账本文档发布进 `notes/`；冒烟通过或明确版本要求 | M1（S） |
+| **L0** 本地调研合同 | **账本已关（2026-07-22）**：[notes/2026-07-22-laguna-l0-memory-budget.md](../notes/2026-07-22-laguna-l0-memory-budget.md)——权重实测 66.96 GiB（14 分片齐）、12 全局层（每 4 层 1 层）+ 36 滑窗层实证、KV 增长 24 KiB/token（HY3 的 1/6.7）、**2×200K / 2×256K / 4×128K 均无需 expert offload**（4×256K 不可行，届时再议）。剩余：pinned vLLM 0.25 加载冒烟（需 GPU 窗口）；DFlash draft 体量与 K=15 verify 形状（qo_len=16）分析 | 账本 ✅；冒烟通过或明确版本要求后 L0 关账 | M1（S） |
 | **L1** pinned-vLLM 冒烟租户 | 经 B7 compat 界面以 `get_model` 加载 Laguna，eager 正确性（oracle = stock vLLM/SGLang 输出逐 token 比对）+ 基线吞吐入库；**不做任何自研 kernel** | 固定 prompt 集与 oracle 一致；基线数字可复现 | M2（M） |
 | **L2** LagunaBackend 接入 | 经 E1 抽象层落地：模型描述（12 全局层 paged FP8 KV + 36 SWA 层环形 KV + MoE expert dispatch）、复用 BlockPool 与固定槽位调度；质量链全跑（oracle 逐层比对 → HumanEval+/自建回归 A/B → 官方分对标：SWE-bench 子集 / Terminal-Bench 抽样） | 新增模型不改 runner 核心；Qwen 路径 bit 级不变；质量链全绿 | M3（L） |
 | **L3** 性能专项 | A2 NVFP4 autotune 表扩到 Laguna shapes（含 256 专家的 grouped/masked expert GEMM）；DFlash 投机集成（复用 draft/verify 循环骨架，K 从 15 起调参）；SWA kernel 评估（sm120-flash-attention 的窗口变体，按 profiling 占比决定是否自研）；**expert offload 仅在 L0 账本证明需要时启动**（复用 hy3 设计与 trace 方法论重新采集证据） | 每项按既有收益门禁结算（A2 端到端 ≥1% / kernel 项 profiling 准入）；投机按 accepted tok/s 净收益 | M4（L） |
