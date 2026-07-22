@@ -524,59 +524,46 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                         ],
                     }
                     yield f"data: {_json.dumps(chunk)}\n\n"
+                # C4: stream tool call deltas incrementally
+                for td in proc.drain_tool_deltas():
+                    if td["type"] == "name":
+                        tc_chunk = {
+                            "id": cmpl_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_name,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"tool_calls": [{
+                                    "index": td["index"],
+                                    "id": td["id"],
+                                    "type": "function",
+                                    "function": {"name": td["name"]},
+                                }]},
+                                "finish_reason": None,
+                            }],
+                        }
+                        yield f"data: {_json.dumps(tc_chunk)}\n\n"
+                    elif td["type"] == "arguments_delta":
+                        tc_chunk = {
+                            "id": cmpl_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_name,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"tool_calls": [{
+                                    "index": td["index"],
+                                    "function": {"arguments": td["delta"]},
+                                }]},
+                                "finish_reason": None,
+                            }],
+                        }
+                        yield f"data: {_json.dumps(tc_chunk)}\n\n"
             finish = final_result["finish_reason"] if final_result else "stop"
             visible_text, tool_calls = proc.finalize()
             if tool_calls:
                 finish = "tool_calls"
-                from server.formats.tools import format_tool_calls_openai
-
-                for i, tc in enumerate(format_tool_calls_openai(tool_calls)):
-                    # Chunk 1: id + type + function name (matches vLLM incremental format)
-                    name_chunk = {
-                        "id": cmpl_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model_name,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {
-                                    "tool_calls": [
-                                        {
-                                            "index": i,
-                                            "id": tc["id"],
-                                            "type": "function",
-                                            "function": {"name": tc["function"]["name"]},
-                                        }
-                                    ]
-                                },
-                                "finish_reason": None,
-                            }
-                        ],
-                    }
-                    yield f"data: {_json.dumps(name_chunk)}\n\n"
-                    # Chunk 2: arguments (full string in one piece)
-                    args_chunk = {
-                        "id": cmpl_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model_name,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {
-                                    "tool_calls": [
-                                        {
-                                            "index": i,
-                                            "function": {"arguments": tc["function"]["arguments"]},
-                                        }
-                                    ]
-                                },
-                                "finish_reason": None,
-                            }
-                        ],
-                    }
-                    yield f"data: {_json.dumps(args_chunk)}\n\n"
             done = {
                 "id": cmpl_id,
                 "object": "chat.completion.chunk",

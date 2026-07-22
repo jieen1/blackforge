@@ -176,6 +176,83 @@ class StreamProcessor:
             return [delta]
         return []
 
+    def drain_tool_deltas(self) -> list[dict]:
+        """Return incremental tool call deltas since last call.
+
+        Returns a list of delta events:
+          - {"type": "name", "index": i, "name": "func_name", "id": "call_xxx"}
+          - {"type": "arguments_delta", "index": i, "delta": "...partial json..."}
+
+        Enables streaming tool_call arguments as they are generated,
+        rather than freezing until the complete tool call is parsed.
+        """
+        if not self._tool_call_started:
+            return []
+
+        raw = self._get_raw()
+        visible = strip_thinking(raw)
+        deltas = []
+
+        # Find tool_call blocks (complete or partial)
+        tc_open = "<tool_call>"
+        func_open = "<function="
+        func_close = "</function>"
+
+        search_start = 0
+        tc_idx = 0
+        while True:
+            tc_pos = visible.find(tc_open, search_start)
+            if tc_pos < 0:
+                break
+            after_open = tc_pos + len(tc_open)
+            func_pos = visible.find(func_open, after_open)
+            if func_pos < 0:
+                break
+            # Extract function name
+            name_end = visible.find(">", func_pos + len(func_open))
+            if name_end < 0:
+                break
+            func_name = visible[func_pos + len(func_open):name_end].strip()
+
+            # Emit name delta if not yet emitted for this index
+            if not hasattr(self, "_tool_names_emitted"):
+                self._tool_names_emitted = set()
+            if tc_idx not in self._tool_names_emitted:
+                self._tool_names_emitted.add(tc_idx)
+                deltas.append({
+                    "type": "name",
+                    "index": tc_idx,
+                    "name": func_name,
+                    "id": f"call_{func_name}_{tc_idx}",
+                })
+
+            # Extract arguments (may be partial)
+            args_start = name_end + 1
+            args_end = visible.find(func_close, args_start)
+            if args_end < 0:
+                # Partial arguments (still streaming)
+                args_so_far = visible[args_start:]
+            else:
+                args_so_far = visible[args_start:args_end]
+
+            # Emit arguments delta
+            if not hasattr(self, "_tool_args_emitted_len"):
+                self._tool_args_emitted_len = {}
+            prev_len = self._tool_args_emitted_len.get(tc_idx, 0)
+            if len(args_so_far) > prev_len:
+                delta_text = args_so_far[prev_len:]
+                self._tool_args_emitted_len[tc_idx] = len(args_so_far)
+                deltas.append({
+                    "type": "arguments_delta",
+                    "index": tc_idx,
+                    "delta": delta_text,
+                })
+
+            search_start = args_end + len(func_close) if args_end >= 0 else len(visible)
+            tc_idx += 1
+
+        return deltas
+
     def finalize(self) -> tuple[str, list[dict]]:
         """Called after stream ends. Returns (visible_text, tool_calls)."""
         raw = self._tok.decode(self._all_ids, skip_special_tokens=True)
