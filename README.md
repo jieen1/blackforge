@@ -40,6 +40,10 @@ head_dim=256, FP8 KV cache, paged layout).
   conversations, block-level reference counting and eviction
 - **OpenAI + Anthropic compatible API** — `/v1/chat/completions`,
   `/v1/completions`, `/v1/messages`, `/v1/models`, Prometheus `/metrics`
+- **Sampling support** — temperature / top-p / top-k with per-request seed
+  for reproducibility; greedy (T=0) remains bit-identical to the MTP pipeline
+- **Production hardening** — client disconnect detection, request cancellation,
+  configurable timeout, engine watchdog for stale slot reclamation
 - **Quality validated** — MMLU-Pro 84.5% vs official 86.2 (within noise),
   HumanEval+ parity with stock vLLM, 100% tool/agent/long-context regression
   (see [Quality Validation](#quality-validation))
@@ -323,15 +327,18 @@ CPU-only; tests that need `torch` self-skip via `pytest.importorskip`.
 
 - [ ] More model support (Qwen3 series, other hybrid architectures)
 - [x] Streaming response support (OpenAI + Anthropic SSE)
-- [ ] Temperature / top-p sampling
+- [x] Temperature / top-p / top-k sampling (graph-safe, greedy bit-identical at T=0)
+- [x] Client disconnect detection + request cancellation + timeout
+- [x] Engine watchdog (stale slot reclamation)
 - [ ] Dynamic KV cache allocation (flexible context vs concurrency)
+- [ ] Structured output (JSON mode)
 - [ ] Multi-GPU support
 
 ## Limitations
 
 - **Single model**: currently Qwen3.6-27B-NVFP4 only
 - **Single GPU**: no tensor/pipeline parallelism
-- **Greedy decoding only**: sampling fields are accepted for client compatibility, but decoding is greedy (temperature / top-p not yet applied)
+- **Sampling without MTP**: temperature > 0 uses autoregressive decode (no speculative verification); greedy (T=0) uses full MTP K=3 pipeline
 - **SM120 only**: requires compute capability 12.0
 
 ## License
