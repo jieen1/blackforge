@@ -295,6 +295,7 @@ def build_vllm_config(
 
 
 from runtime.mtp_accept import determine_accept_reject, determine_accept_reject_batch
+from runtime.model_spec import ModelSpec
 from server.metrics import (
     record_mtp_acceptance,
     record_prefix_cache_hit,
@@ -496,6 +497,16 @@ class DirectModelRunner:
                 f"{len(self.attn_layer_names)} attn / {len(self.gdn_layer_names)} gdn"
             )
 
+        # E1 Phase 1: explicit model spec (frozen architecture parameters)
+        self.spec = ModelSpec.from_runner_init(
+            model_id=vllm_config.model_config.model,
+            architecture=getattr(vllm_config.model_config, "architecture", "Qwen3_5ForConditionalGeneration"),
+            attn_layer_names=self.attn_layer_names,
+            gdn_layer_names=self.gdn_layer_names,
+            kv_dtype=self._kv_cache_dtype if hasattr(self, "_kv_cache_dtype") else "fp8_e4m3",
+            block_size=self.block_size,
+        )
+
         # Real MTP draft model (2026-07-17, Phase 2 / sol's "Option A"),
         # loaded ONLY if the caller configured speculative decoding via
         # build_vllm_config(speculative_config=...). Uses vLLM's own real
@@ -530,6 +541,18 @@ class DirectModelRunner:
                 if hasattr(sfc[name], "get_state_shape"):
                     raise RuntimeError(f"unexpected GDN layer in MTP draft model: {name}")
             self.num_speculative_tokens = vllm_config.speculative_config.num_speculative_tokens
+            # E1: update spec with MTP info
+            self.spec = ModelSpec.from_runner_init(
+                model_id=self.spec.model_id,
+                architecture=self.spec.architecture,
+                attn_layer_names=self.attn_layer_names,
+                gdn_layer_names=self.gdn_layer_names,
+                mtp_model_id=vllm_config.speculative_config.model if hasattr(vllm_config.speculative_config, "model") else "mtp",
+                mtp_attn_layer_names=self.mtp_attn_layer_names,
+                num_speculative_tokens=self.num_speculative_tokens,
+                kv_dtype=self.spec.kv_dtype,
+                block_size=self.block_size,
+            )
 
         self._allocate_and_bind_kv_caches()
         self._allocate_gdn_snapshot_buffers()
