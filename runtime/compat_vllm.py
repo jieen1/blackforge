@@ -21,17 +21,13 @@ must preserve bit-level parity on the greedy fixed-prompt suite.
 from __future__ import annotations
 
 import socket
-from dataclasses import dataclass
-from typing import Any
-
-import torch
 
 __all__ = [
     "FLA_CHUNK_SIZE",
     "AttentionBackendEnum",
     "EngineArgs",
-    "GDNAttentionMetadata",
-    "SM120GQAMetadata",
+    "GDNAttentionMetadata",  # re-exported from vLLM (isinstance-sensitive)
+    "SM120GQAMetadata",  # re-exported from vLLM (isinstance-sensitive)
     "VllmConfig",
     "bind_kv_cache",
     "compute_causal_conv1d_metadata",
@@ -50,69 +46,21 @@ __all__ = [
 ]
 
 # ---------------------------------------------------------------------------
-# Self-written: SM120GQAMetadata (thin — pure dataclass)
+# Re-exported: SM120GQAMetadata (thin — vLLM dataclass, isinstance-sensitive)
+#
+# Cannot self-write: vLLM's SM120GQAImpl.forward() does isinstance() checks
+# against this class. Self-writing breaks the check. Will be replaced when
+# we own the model graph (V2/E1).
 # ---------------------------------------------------------------------------
 
-
-@dataclass
-class SM120GQAMetadata:
-    """Attention metadata for the SM120 GQA decode/prefill kernel.
-
-    Field-for-field compatible with vLLM's
-    ``vllm.v1.attention.backends.sm120_gqa.SM120GQAMetadata``.
-    """
-
-    num_actual_tokens: int
-    num_reqs: int
-    qo_indptr: torch.Tensor
-    kv_page_indptr: torch.Tensor
-    kv_page_indices: torch.Tensor
-    kv_last_page_len: torch.Tensor
-    page_size: int
-    is_pure_decode: bool
-    kv_split_size: int
-    max_num_splits: int
-    decode_qo_len: int
-
-
 # ---------------------------------------------------------------------------
-# Self-written: GDNAttentionMetadata (thin — pure dataclass)
+# Re-exported: GDNAttentionMetadata (thin — vLLM dataclass, isinstance-sensitive)
+#
+# Cannot self-write: vLLM's qwen_gdn_attention_core does isinstance() checks.
+# Will be replaced when we own the model graph (V2/E1).
 # ---------------------------------------------------------------------------
-
-
-@dataclass
-class GDNAttentionMetadata:
-    """GDN (Gated DeltaNet) attention metadata.
-
-    Field-for-field compatible with vLLM's
-    ``vllm.v1.attention.backends.gdn_attn.GDNAttentionMetadata``.
-    """
-
-    num_prefills: int
-    num_prefill_tokens: int
-    num_decodes: int
-    num_decode_tokens: int
-    num_spec_decodes: int
-    num_spec_decode_tokens: int
-    num_actual_tokens: int
-    has_initial_state: torch.Tensor | None = None
-    spec_query_start_loc: torch.Tensor | None = None
-    non_spec_query_start_loc: torch.Tensor | None = None
-    spec_state_indices_tensor: torch.Tensor | None = None
-    non_spec_state_indices_tensor: torch.Tensor | None = None
-    spec_sequence_masks: torch.Tensor | None = None
-    spec_token_indx: torch.Tensor | None = None
-    non_spec_token_indx: torch.Tensor | None = None
-    num_accepted_tokens: torch.Tensor | None = None
-    chunk_indices: torch.Tensor | None = None
-    chunk_offsets: torch.Tensor | None = None
-    prefill_query_start_loc: torch.Tensor | None = None
-    prefill_state_indices: torch.Tensor | None = None
-    prefill_has_initial_state: torch.Tensor | None = None
-    nums_dict: dict | None = None
-    batch_ptr: torch.Tensor | None = None
-    token_chunk_offset_ptr: torch.Tensor | None = None
-
+from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata  # noqa: E402
+from vllm.v1.attention.backends.sm120_gqa import SM120GQAMetadata  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Self-written: constants (thin)
@@ -141,100 +89,11 @@ def get_distributed_init_method(ip: str, port: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Self-written: compute_causal_conv1d_metadata (thin — pure computation)
+# Re-exported: compute_causal_conv1d_metadata (vLLM internal, kernel-coupled)
+#
+# Cannot self-write: vLLM's causal_conv1d kernel expects specific dict keys
+# (batch_ptr, token_chunk_offset_ptr) inside nums_dict. Re-exported from vLLM.
 # ---------------------------------------------------------------------------
-
-_PAD_SLOT_ID = -1
-
-
-def compute_causal_conv1d_metadata(
-    query_start_loc_p_cpu: torch.Tensor, *, device: torch.device
-) -> tuple[dict[int, dict[str, Any]], torch.Tensor, torch.Tensor]:
-    """Pre-compute causal_conv1d chunk metadata from CPU query_start_loc.
-
-    Re-implementation of vLLM's
-    ``vllm.v1.attention.backends.utils.compute_causal_conv1d_metadata``.
-    """
-    import numpy as np
-
-    assert query_start_loc_p_cpu.device.type == "cpu"
-    seqlens = query_start_loc_p_cpu.diff()
-    nums_dict: dict[int, dict[str, Any]] = {}
-    batch_ptr = None
-    token_chunk_offset_ptr = None
-    for BLOCK_M in [8]:
-        nums = -(-seqlens // BLOCK_M)
-        nums_dict[BLOCK_M] = {}
-        nums_dict[BLOCK_M]["nums"] = nums
-        nums_dict[BLOCK_M]["tot"] = nums.sum().item()
-        mlist = torch.from_numpy(
-            np.repeat(np.arange(len(nums)), nums.numpy())
-        ).pin_memory()
-        nums_dict[BLOCK_M]["mlist"] = mlist
-        mlist_len = len(mlist)
-        nums_dict[BLOCK_M]["mlist_len"] = mlist_len
-        MAX_NUM_PROGRAMS = max(1024, mlist_len) * 2
-        offsetlist: list[int] = []
-        for idx, num in enumerate(nums):
-            offsetlist.extend(range(int(num)))
-        offsetlist_t = torch.tensor(
-            offsetlist, dtype=torch.int32, pin_memory=True
-        )
-        nums_dict[BLOCK_M]["offsetlist"] = offsetlist_t
-
-        if batch_ptr is None:
-            batch_ptr = torch.full(
-                (MAX_NUM_PROGRAMS,),
-                _PAD_SLOT_ID,
-                dtype=torch.int32,
-                device=device,
-            )
-            token_chunk_offset_ptr = torch.full(
-                (MAX_NUM_PROGRAMS,),
-                _PAD_SLOT_ID,
-                dtype=torch.int32,
-                device=device,
-            )
-        batch_ptr[:mlist_len] = mlist.to(device)
-        token_chunk_offset_ptr[:mlist_len] = offsetlist_t.to(device)
-
-    assert batch_ptr is not None and token_chunk_offset_ptr is not None
-    return nums_dict, batch_ptr, token_chunk_offset_ptr
-
-
-# ---------------------------------------------------------------------------
-# Self-written: FLA chunk index helpers (thin)
-# ---------------------------------------------------------------------------
-
-
-def prepare_chunk_indices(
-    cu_seqlens: torch.Tensor, chunk_size: int
-) -> torch.Tensor:
-    """Build per-chunk (batch_idx, chunk_idx) pairs for FLA kernels."""
-    import triton
-
-    lens = cu_seqlens[1:] - cu_seqlens[:-1]
-    num_chunks = triton.cdiv(lens, chunk_size)
-    indices = torch.cat(
-        [torch.arange(n) for n in num_chunks.tolist()]
-    )
-    return torch.stack(
-        [indices.eq(0).cumsum(0) - 1, indices], 1
-    ).to(cu_seqlens)
-
-
-def prepare_chunk_offsets(
-    cu_seqlens: torch.Tensor, chunk_size: int
-) -> torch.Tensor:
-    """Build cumulative chunk-count offsets for FLA kernels."""
-    import triton
-
-    lens = cu_seqlens[1:] - cu_seqlens[:-1]
-    num_chunks = triton.cdiv(lens, chunk_size)
-    return torch.cat(
-        [cu_seqlens.new_tensor([0]), num_chunks]
-    ).cumsum(-1)
-
 
 # ---------------------------------------------------------------------------
 # Re-exported: medium/thick dependencies (vLLM public API)
@@ -244,14 +103,24 @@ def prepare_chunk_offsets(
 # All vLLM imports in the production path are consolidated here — this
 # is the B7-V1 "single point" contract.
 # ---------------------------------------------------------------------------
-
 from vllm.config import VllmConfig, set_current_vllm_config  # noqa: E402
 from vllm.engine.arg_utils import EngineArgs  # noqa: E402
 from vllm.forward_context import set_forward_context  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# Re-exported: FLA chunk index helpers (vLLM internal, kernel-coupled)
+# ---------------------------------------------------------------------------
+from vllm.model_executor.layers.fla.ops.index import (  # noqa: E402
+    prepare_chunk_indices,
+    prepare_chunk_offsets,
+)
 from vllm.model_executor.model_loader import get_model  # noqa: E402
 from vllm.v1.attention.backends.registry import (  # noqa: E402
     AttentionBackendEnum,  # noqa: E402
     register_backend,  # noqa: E402
+)
+from vllm.v1.attention.backends.utils import (  # noqa: E402
+    compute_causal_conv1d_metadata,
 )
 from vllm.v1.worker.gpu_worker import (  # noqa: E402
     init_worker_distributed_environment,  # noqa: E402
