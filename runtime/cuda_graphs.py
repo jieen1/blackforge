@@ -9,7 +9,7 @@ from dataclasses import dataclass
 
 import torch
 
-from runtime.block_pool import _physical_slot, _ssm_spec_row
+from runtime.block_pool import RESERVED_PHYSICAL_SLOTS, _physical_slot, _ssm_spec_row
 from runtime.compat_vllm import (
     GDNAttentionMetadata,
     SM120GQAMetadata,
