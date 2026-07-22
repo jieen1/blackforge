@@ -27,8 +27,10 @@ import sys
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
+
+from runtime.sampling import SamplingParams
 
 os.environ.setdefault("USE_LIBUV", "0")
 os.environ.setdefault("SM120_GQA_USE_V2_DECODE_KERNEL", "1")
@@ -79,6 +81,7 @@ class GenerationRequest:
     future: Any
     session_id: str | None = None
     stream_channel: StreamChannel | None = None
+    sampling_params: SamplingParams = field(default_factory=SamplingParams)
 
 
 class StreamChannel:
@@ -90,12 +93,13 @@ class StreamChannel:
     and drains the deque.
     """
 
-    __slots__ = ("_buf", "_event", "_closed")
+    __slots__ = ("_buf", "_event", "_closed", "request_id")
 
     def __init__(self) -> None:
         self._buf: collections.deque = collections.deque()
         self._event: asyncio.Event | None = None
         self._closed = False
+        self.request_id: str | None = None
 
     def put(self, item: Any, loop: asyncio.AbstractEventLoop) -> None:
         """Engine thread: append item and wake up the asyncio consumer."""
@@ -147,6 +151,7 @@ class ServerEngine:
         gpu_memory_utilization: float = 0.85,
         idle_sleep_s: float = 0.005,
         production: bool = True,
+        watchdog_max_stale_rounds: int = 200,
     ) -> None:
         if production:
             min_slots = capacity + (capacity if enable_cudagraph else 0)
@@ -168,6 +173,7 @@ class ServerEngine:
         self.blocks_per_slot = blocks_per_slot
         self.capacity_tokens_per_slot = block_size * blocks_per_slot
         self.idle_sleep_s = idle_sleep_s
+        self.watchdog_max_stale_rounds = watchdog_max_stale_rounds
         self._kv_cache_dtype = kv_cache_dtype
         self._enable_cudagraph = enable_cudagraph
         self.enable_prefix_cache = enable_prefix_cache
@@ -195,6 +201,7 @@ class ServerEngine:
         self._engine_thread: threading.Thread | None = None
         self._asyncio_loop: asyncio.AbstractEventLoop | None = None
         self._stop = False
+        self._cancel_set: set[str] = set()
 
         # -- slot management (only mutated from engine thread after start) --
         self.free_slots: list[int] = list(range(capacity))
@@ -230,6 +237,11 @@ class ServerEngine:
             "session_retentions": 0,
             "session_expirations": 0,
             "session_warm_fallbacks": 0,
+            "cancellations": 0,
+            "watchdog_triggers": 0,
+            "watchdog_events": [],
+            "mtp_acceptance_histogram": [0] * 5,
+            "sampled_decode_rounds": 0,
         }
 
         self.runner = None
@@ -329,7 +341,11 @@ class ServerEngine:
         return prompt_len + max_tokens + self.K <= self.capacity_tokens_per_slot
 
     async def submit(
-        self, prompt_ids: list[int], max_tokens: int, session_id: str | None = None
+        self,
+        prompt_ids: list[int],
+        max_tokens: int,
+        session_id: str | None = None,
+        sampling_params: SamplingParams | None = None,
     ) -> dict:
         """Submit a generation request. Resolves when generation completes."""
         loop = asyncio.get_running_loop()
@@ -340,6 +356,7 @@ class ServerEngine:
             max_tokens=max_tokens,
             future=fut,
             session_id=session_id,
+            sampling_params=sampling_params or SamplingParams(),
         )
         self._req_deque.append(req)
         try:
@@ -349,20 +366,30 @@ class ServerEngine:
         return await fut
 
     async def submit_stream(
-        self, prompt_ids: list[int], max_tokens: int, session_id: str | None = None
+        self,
+        prompt_ids: list[int],
+        max_tokens: int,
+        session_id: str | None = None,
+        sampling_params: SamplingParams | None = None,
+        cancel_ref: list | None = None,
     ):
         """Submit a streaming generation request. Yields token-id lists as
         each MTP round commits them. Final yield is the result dict."""
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[dict] = loop.create_future()
         channel = StreamChannel()
+        request_id = str(uuid.uuid4())
+        channel.request_id = request_id
+        if cancel_ref is not None:
+            cancel_ref[0] = request_id
         req = GenerationRequest(
-            request_id=str(uuid.uuid4()),
+            request_id=request_id,
             prompt_ids=list(prompt_ids),
             max_tokens=max_tokens,
             future=fut,
             session_id=session_id,
             stream_channel=channel,
+            sampling_params=sampling_params or SamplingParams(),
         )
         self._req_deque.append(req)
         try:
@@ -375,7 +402,17 @@ class ServerEngine:
                 break
             if item:
                 yield item
-        yield await fut
+
+    def cancel(self, request_id: str) -> None:
+        """Request cancellation from any thread (asyncio-safe).
+
+        The engine thread will reclaim the slot on its next round.
+        """
+        self._cancel_set.add(request_id)
+        try:
+            os.write(self._req_pipe_w, b"\x00")
+        except (BlockingIOError, OSError):
+            pass
 
     # -- thread-safe asyncio callbacks (engine thread → asyncio) -----------
     def _resolve_future(self, fut: asyncio.Future, result: Any) -> None:
@@ -492,7 +529,7 @@ class ServerEngine:
     def _activate_slot(
         self, slot: int, req: GenerationRequest, anchor: int, drafts: list[int]
     ) -> None:
-        if not self.production:
+        if not self.production and req.sampling_params.is_greedy:
             self._admission_bootstrap_check(slot, req, anchor)
 
         if anchor == self.eos_token_id:
@@ -513,6 +550,9 @@ class ServerEngine:
             "anchor": anchor,
             "drafts": drafts,
             "committed_tokens": committed_tokens,
+            "sampled": not req.sampling_params.is_greedy,
+            "last_token": anchor,
+            "last_progress_round": self.stats["rounds"],
         }
 
     def _finish_request(
@@ -590,6 +630,40 @@ class ServerEngine:
         # -- drain request deque + pipe (non-blocking) --
         self._drain_requests()
         _drain_pipe(self._req_pipe_r)
+
+        # -- process cancellations (asyncio thread → engine thread) --
+        if self._cancel_set and self.active:
+            cancelled_slots = []
+            for s, st in list(self.active.items()):
+                if st["req"].request_id in self._cancel_set:
+                    cancelled_slots.append(s)
+            for s in cancelled_slots:
+                st = self.active.pop(s)
+                req = st["req"]
+                self._cancel_set.discard(req.request_id)
+                self.stats["cancellations"] += 1
+                logger.info(
+                    "cancelled request %s on slot %d (%d tokens committed)",
+                    req.request_id,
+                    s,
+                    len(st["committed_tokens"]),
+                )
+                if req.stream_channel is not None:
+                    self._stream_close(req.stream_channel)
+                self._fail_future(
+                    req.future, asyncio.CancelledError("request cancelled by client")
+                )
+                try:
+                    self.runner.reset_slot(s)
+                except Exception:
+                    logger.exception("cancel reset_slot(%d) failed", s)
+                self.free_slots.append(s)
+            # Also remove from waiting queue
+            if self._cancel_set:
+                self.waiting = [
+                    r for r in self.waiting if r.request_id not in self._cancel_set
+                ]
+                self._cancel_set.clear()
 
         # -- P4b: expire retained warm slots --
         self._expire_retained_slots()
@@ -699,49 +773,140 @@ class ServerEngine:
             time.sleep(0.01)
             return
 
-        # -- MTP verify/commit round (hot path, zero wait) --
+        # -- decode round (hot path, zero wait) --
         active_slots = list(self.active.keys())
-        decisions = self.runner.mtp_verify_and_commit_batch(
-            active_slots,
-            {s: self.active[s]["anchor"] for s in active_slots},
-            {s: self.active[s]["drafts"] for s in active_slots},
-        )
+        greedy_slots = [s for s in active_slots if not self.active[s].get("sampled")]
+        sampled_slots = [s for s in active_slots if self.active[s].get("sampled")]
 
         self.stats["rounds"] += 1
         self.stats["round_batch_sizes"].append(len(active_slots))
 
         newly_finished: list[int] = []
-        for s in active_slots:
-            st = self.active[s]
-            req: GenerationRequest = st["req"]
-            decision = decisions[s]
-            new_tokens = decision["committed"]
 
-            finish_reason: str | None = None
-            kept: list[int] = []
-            for t in new_tokens:
-                if len(st["committed_tokens"]) + len(kept) >= req.max_tokens:
+        # -- sampled decode (no MTP, simple autoregressive) --
+        if sampled_slots:
+            self.stats["sampled_decode_rounds"] += 1
+            slot_ids = sampled_slots
+            token_ids = [self.active[s]["last_token"] for s in slot_ids]
+            kv_lengths = [self.runner.slot_kv_len[s] for s in slot_ids]
+            params_list = [self.active[s]["req"].sampling_params for s in slot_ids]
+            next_tokens = self.runner.decode_batch_sampled(
+                slot_ids, token_ids, kv_lengths, params_list
+            )
+            for s, tok in zip(slot_ids, next_tokens):
+                st = self.active[s]
+                req: GenerationRequest = st["req"]
+                if len(st["committed_tokens"]) >= req.max_tokens:
+                    self._finish_request(s, req, st["committed_tokens"], "length")
+                    newly_finished.append(s)
+                    continue
+                if tok == self.eos_token_id:
+                    self._finish_request(s, req, st["committed_tokens"], "stop")
+                    newly_finished.append(s)
+                    continue
+                st["committed_tokens"].append(tok)
+                st["last_token"] = tok
+                st["last_progress_round"] = self.stats["rounds"]
+                if req.stream_channel is not None:
+                    self._stream_put(req.stream_channel, [tok])
+                if len(st["committed_tokens"]) >= req.max_tokens:
+                    self._finish_request(s, req, st["committed_tokens"], "length")
+                    newly_finished.append(s)
+
+        # -- MTP verify/commit round (greedy path, unchanged) --
+        if greedy_slots:
+            decisions = self.runner.mtp_verify_and_commit_batch(
+                greedy_slots,
+                {s: self.active[s]["anchor"] for s in greedy_slots},
+                {s: self.active[s]["drafts"] for s in greedy_slots},
+            )
+
+            for s in greedy_slots:
+                st = self.active[s]
+                req = st["req"]
+                decision = decisions[s]
+                new_tokens = decision["committed"]
+                na = decision.get("num_accepted", 0)
+                if 0 <= na < len(self.stats["mtp_acceptance_histogram"]):
+                    self.stats["mtp_acceptance_histogram"][na] += 1
+
+                finish_reason: str | None = None
+                kept: list[int] = []
+                for t in new_tokens:
+                    if len(st["committed_tokens"]) + len(kept) >= req.max_tokens:
+                        finish_reason = "length"
+                        break
+                    if t == self.eos_token_id:
+                        finish_reason = "stop"
+                        break
+                    kept.append(t)
+                st["committed_tokens"].extend(kept)
+                if kept:
+                    st["last_progress_round"] = self.stats["rounds"]
+                if kept and req.stream_channel is not None:
+                    self._stream_put(req.stream_channel, kept)
+                if finish_reason is None and len(st["committed_tokens"]) >= req.max_tokens:
                     finish_reason = "length"
-                    break
-                if t == self.eos_token_id:
-                    finish_reason = "stop"
-                    break
-                kept.append(t)
-            st["committed_tokens"].extend(kept)
-            if kept and req.stream_channel is not None:
-                self._stream_put(req.stream_channel, kept)
-            if finish_reason is None and len(st["committed_tokens"]) >= req.max_tokens:
-                finish_reason = "length"
 
-            if finish_reason is None:
-                st["anchor"], st["drafts"] = decision["next_anchor"], decision["next_draft_tokens"]
-                continue
+                if finish_reason is None:
+                    st["anchor"] = decision["next_anchor"]
+                    st["drafts"] = decision["next_draft_tokens"]
+                    continue
 
-            self._finish_request(s, req, st["committed_tokens"], finish_reason)
-            newly_finished.append(s)
+                self._finish_request(s, req, st["committed_tokens"], finish_reason)
+                newly_finished.append(s)
 
         for s in newly_finished:
             del self.active[s]
+
+        # -- watchdog: force-reclaim slots that made no progress --
+        if self.watchdog_max_stale_rounds > 0 and self.active:
+            current_round = self.stats["rounds"]
+            stale_slots = [
+                s
+                for s, st in self.active.items()
+                if current_round - st.get("last_progress_round", 0)
+                > self.watchdog_max_stale_rounds
+            ]
+            for s in stale_slots:
+                st = self.active.pop(s)
+                req = st["req"]
+                kv_len = self.runner.slot_kv_len[s] if self.runner else -1
+                committed = len(st["committed_tokens"])
+                event = {
+                    "slot": s,
+                    "round": current_round,
+                    "stale_rounds": current_round - st.get("last_progress_round", 0),
+                    "kv_len": kv_len,
+                    "committed_tokens": committed,
+                    "request_id": req.request_id,
+                }
+                self.stats["watchdog_triggers"] += 1
+                self.stats["watchdog_events"].append(event)
+                if len(self.stats["watchdog_events"]) > 50:
+                    self.stats["watchdog_events"].pop(0)
+                logger.error(
+                    "WATCHDOG: slot %d wedged (no progress for %d rounds, "
+                    "kv_len=%d, committed=%d) — force-reclaiming",
+                    s,
+                    event["stale_rounds"],
+                    kv_len,
+                    committed,
+                )
+                self._fail_future(
+                    req.future,
+                    RuntimeError(
+                        f"slot {s} watchdog: no progress for "
+                        f"{event['stale_rounds']} rounds"
+                    ),
+                )
+                if req.stream_channel is not None:
+                    self._stream_close(req.stream_channel)
+                try:
+                    self.runner.reset_slot(s)
+                except Exception:
+                    logger.exception("watchdog reset_slot(%d) failed", s)
+                self.free_slots.append(s)
 
         # Yield GIL to asyncio event loop so HTTP requests (health, SSE)
         # can be processed between GPU rounds. Without this, the engine

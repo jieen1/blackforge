@@ -50,6 +50,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
+from runtime.sampling import SamplingParams
 from server import metrics
 from server.engine import ServerEngine
 from server.formats import anthropic as anthropic_format
@@ -322,6 +323,8 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: int | None = None
     temperature: float | None = None
     top_p: float | None = None
+    top_k: int | None = None
+    seed: int | None = None
     n: int | None = None
     stream: bool | None = False
     tools: list[dict] | None = None
@@ -338,6 +341,8 @@ class CompletionRequest(BaseModel):
     max_tokens: int | None = None
     temperature: float | None = None
     top_p: float | None = None
+    top_k: int | None = None
+    seed: int | None = None
     n: int | None = None
     stream: bool | None = False
     # P4b session affinity (opt-in) -- see ChatCompletionRequest.session_id.
@@ -350,15 +355,38 @@ def _invalid_request(message: str) -> HTTPException:
     )
 
 
-def _validate_sampling_params(
-    temperature: float | None, top_p: float | None, n: int | None, stream: bool | None
-) -> None:
-    # Accept temperature/top_p/stream for client compatibility.
-    # Internally always greedy decode (MTP verify requires greedy match).
+def _build_sampling_params(
+    temperature: float | None = None,
+    top_p: float | None = None,
+    top_k: int | None = None,
+    seed: int | None = None,
+    n: int | None = None,
+) -> SamplingParams:
+    """Validate and build SamplingParams from API request fields.
+
+    ``temperature == 0`` (or ``None``) selects greedy decode with MTP
+    speculative verification.  ``temperature > 0`` enables true sampling
+    (autoregressive, no MTP).
+    """
     if n is not None and n != 1:
         raise _invalid_request(
             f"n={n!r} is not supported: only a single completion (n=1) per request."
         )
+    temp = temperature if temperature is not None else 0.0
+    if temp < 0:
+        raise _invalid_request(f"temperature must be >= 0, got {temp}")
+    resolved_top_p = top_p if top_p is not None else 1.0
+    if not (0.0 < resolved_top_p <= 1.0):
+        raise _invalid_request(f"top_p must be in (0, 1], got {resolved_top_p}")
+    resolved_top_k = top_k if top_k is not None else 0
+    if resolved_top_k < 0:
+        raise _invalid_request(f"top_k must be >= 0, got {resolved_top_k}")
+    return SamplingParams(
+        temperature=temp,
+        top_p=resolved_top_p,
+        top_k=resolved_top_k,
+        seed=seed,
+    )
 
 
 def _validate_and_resolve_max_tokens(max_tokens: int | None) -> int:
@@ -417,9 +445,12 @@ async def debug_stats():
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(req: ChatCompletionRequest):
+async def chat_completions(req: ChatCompletionRequest, request: Request):
     assert engine is not None
-    _validate_sampling_params(req.temperature, req.top_p, req.n, req.stream)
+    sampling_params = _build_sampling_params(
+        temperature=req.temperature, top_p=req.top_p, top_k=req.top_k,
+        seed=req.seed, n=req.n,
+    )
     max_tokens = _validate_and_resolve_max_tokens(req.max_tokens)
     t0 = time.perf_counter()
 
@@ -467,9 +498,16 @@ async def chat_completions(req: ChatCompletionRequest):
                 ],
             }
             yield f"data: {_json.dumps(first_chunk)}\n\n"
+            _cancel_ref: list[str | None] = [None]
             async for item in engine.submit_stream(
-                prompt_ids, max_tokens, session_id=req.session_id
+                prompt_ids, max_tokens, session_id=req.session_id,
+                sampling_params=sampling_params,
+                cancel_ref=_cancel_ref,
             ):
+                if await request.is_disconnected():
+                    if _cancel_ref[0]:
+                        engine.cancel(_cancel_ref[0])
+                    return
                 if isinstance(item, dict):
                     final_result = item
                     break
@@ -576,7 +614,9 @@ async def chat_completions(req: ChatCompletionRequest):
         return StreamingResponse(_sse(), media_type="text/event-stream")
 
     # Non-streaming path
-    result = await engine.submit(prompt_ids, max_tokens, session_id=req.session_id)
+    result = await engine.submit(
+        prompt_ids, max_tokens, session_id=req.session_id, sampling_params=sampling_params,
+    )
     raw_text = await _tokenize_decode(engine, result["committed_token_ids"])
     _THINK_OPEN = chr(60) + "think" + chr(62)
     _THINK_CLOSE = chr(60) + "/think" + chr(62)
@@ -634,16 +674,21 @@ async def chat_completions(req: ChatCompletionRequest):
 
 
 @app.post("/v1/completions")
-async def completions(req: CompletionRequest):
+async def completions(req: CompletionRequest, request: Request):
     assert engine is not None
-    _validate_sampling_params(req.temperature, req.top_p, req.n, req.stream)
+    sampling_params = _build_sampling_params(
+        temperature=req.temperature, top_p=req.top_p, top_k=req.top_k,
+        seed=req.seed, n=req.n,
+    )
     max_tokens = _validate_and_resolve_max_tokens(req.max_tokens)
     t0 = time.perf_counter()
     prompt_ids = await _tokenize_encode(engine, req.prompt)
     await _debug_log_input("OPENAI /v1/completions", req.model_dump(), req.prompt, prompt_ids)
     _validate_capacity(prompt_ids, max_tokens, "completions")
 
-    result = await engine.submit(prompt_ids, max_tokens, session_id=req.session_id)
+    result = await engine.submit(
+        prompt_ids, max_tokens, session_id=req.session_id, sampling_params=sampling_params,
+    )
     _raw_comp = await _tokenize_decode(engine, result["committed_token_ids"])
     _raw_comp_full = (
         _raw_comp
@@ -923,6 +968,12 @@ async def anthropic_messages(request: Request):
     max_tokens = body.get("max_tokens", DEFAULT_MAX_TOKENS)
     model_name = body.get("model", "qwen3.6")
     stream = body.get("stream", False)
+    sampling_params = _build_sampling_params(
+        temperature=body.get("temperature"),
+        top_p=body.get("top_p"),
+        top_k=body.get("top_k"),
+        seed=body.get("seed"),
+    )
 
     # Parse through the Anthropic format layer (handles array content, tool_use, tool_result)
     chat_messages = anthropic_format.parse_messages(body)
@@ -983,7 +1034,15 @@ async def anthropic_messages(request: Request):
             block_index = 0
             text_open = False
 
-            async for item in engine.submit_stream(prompt_ids, effective_max):
+            _cancel_ref: list[str | None] = [None]
+            async for item in engine.submit_stream(
+                prompt_ids, effective_max, sampling_params=sampling_params,
+                cancel_ref=_cancel_ref,
+            ):
+                if await request.is_disconnected():
+                    if _cancel_ref[0]:
+                        engine.cancel(_cancel_ref[0])
+                    return
                 if isinstance(item, dict):
                     final_result = item
                     break
@@ -1095,7 +1154,9 @@ async def anthropic_messages(request: Request):
         return StreamingResponse(_anthropic_sse(), media_type="text/event-stream")
 
     # Non-streaming path
-    result = await engine.submit(prompt_ids, effective_max)
+    result = await engine.submit(
+        prompt_ids, effective_max, sampling_params=sampling_params,
+    )
     _raw_anth = await _tokenize_decode(engine, result["committed_token_ids"])
     _raw_anth_full = (
         _raw_anth

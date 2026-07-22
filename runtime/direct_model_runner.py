@@ -25,22 +25,27 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
-from vllm.config import VllmConfig, set_current_vllm_config
-from vllm.engine.arg_utils import EngineArgs
-from vllm.forward_context import set_forward_context
-from vllm.model_executor.layers.fla.ops.index import (
+
+from runtime.compat_vllm import (
+    FLA_CHUNK_SIZE,
+    AttentionBackendEnum,
+    EngineArgs,
+    GDNAttentionMetadata,
+    SM120GQAMetadata,
+    VllmConfig,
+    bind_kv_cache,
+    compute_causal_conv1d_metadata,
+    get_distributed_init_method,
+    get_model,
+    get_open_port,
+    init_worker_distributed_environment,
     prepare_chunk_indices,
     prepare_chunk_offsets,
+    register_backend,
+    set_current_vllm_config,
+    set_forward_context,
 )
-from vllm.model_executor.layers.fla.ops.utils import FLA_CHUNK_SIZE
-from vllm.model_executor.model_loader import get_model
-from vllm.utils.network_utils import get_distributed_init_method, get_open_port
-from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
-from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
-from vllm.v1.attention.backends.sm120_gqa import SM120GQAMetadata
-from vllm.v1.attention.backends.utils import compute_causal_conv1d_metadata
-from vllm.v1.worker.gpu_worker import init_worker_distributed_environment
-from vllm.v1.worker.utils import bind_kv_cache
+from runtime.sampling import SamplingParams, make_generator, sample_from_logits
 
 NUM_SLOTS = 4
 _SM120_BACKEND_PATH = "vllm.v1.attention.backends.sm120_gqa.SM120GQABackend"
@@ -1633,7 +1638,7 @@ class DirectModelRunner:
         self.mtp_attn_layer_names: list[str] = []
         self.num_speculative_tokens: int | None = None
         if vllm_config.speculative_config is not None:
-            from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
+            from runtime.compat_vllm import load_eagle_model
 
             names_before = set(sfc.keys())
             with set_current_vllm_config(vllm_config):
@@ -2384,11 +2389,38 @@ class DirectModelRunner:
         logits = self._forward(slot, prompt_token_ids, start_pos=0, is_decode=False)
         return int(logits[-1].argmax(dim=-1).item())
 
+    def prefill_sampled(
+        self, slot: int, prompt_token_ids: list[int], params: SamplingParams
+    ) -> int:
+        """Run the prompt through the model; returns the sampled next token id.
+
+        For ``temperature == 0`` this is bit-identical to ``prefill()``.
+        """
+        if self.slot_kv_len[slot] != 0:
+            raise RuntimeError(f"slot {slot} is not fresh (kv_len={self.slot_kv_len[slot]})")
+        logits = self._forward(slot, prompt_token_ids, start_pos=0, is_decode=False)
+        last_logits = logits[-1].unsqueeze(0)
+        gen = make_generator(params.seed)
+        return int(sample_from_logits(last_logits, params, generator=gen).item())
+
     def decode(self, slot: int, token_id: int) -> int:
         """Consume one token, return the greedy next token id."""
         start_pos = self.slot_kv_len[slot]
         logits = self._forward(slot, [token_id], start_pos=start_pos, is_decode=True)
         return int(logits[-1].argmax(dim=-1).item())
+
+    def decode_sampled(
+        self, slot: int, token_id: int, params: SamplingParams
+    ) -> int:
+        """Consume one token, return the sampled next token id.
+
+        For ``temperature == 0`` this is bit-identical to ``decode()``.
+        """
+        start_pos = self.slot_kv_len[slot]
+        logits = self._forward(slot, [token_id], start_pos=start_pos, is_decode=True)
+        last_logits = logits[-1].unsqueeze(0)
+        gen = make_generator(params.seed)
+        return int(sample_from_logits(last_logits, params, generator=gen).item())
 
     def _slot_mapping_batch(
         self, slots: list[int], kv_lengths: list[int], qo_len: int | list[int] = 1
@@ -2715,6 +2747,29 @@ class DirectModelRunner:
         slot, in the same order as ``slot_ids``."""
         logits = self._forward_batch(slot_ids, token_ids, kv_lengths)
         return [int(logits[i].argmax(dim=-1).item()) for i in range(len(slot_ids))]
+
+    def decode_batch_sampled(
+        self,
+        slot_ids: list[int],
+        token_ids: list[int],
+        kv_lengths: list[int],
+        params_list: list[SamplingParams],
+    ) -> list[int]:
+        """Decode one token per slot with per-request sampling params.
+
+        Falls back to greedy argmax for any slot whose params have
+        ``temperature == 0``, preserving bit-identical behavior.
+        """
+        logits = self._forward_batch(slot_ids, token_ids, kv_lengths)
+        results: list[int] = []
+        for i, params in enumerate(params_list):
+            if params.is_greedy:
+                results.append(int(logits[i].argmax(dim=-1).item()))
+            else:
+                row = logits[i].unsqueeze(0)
+                gen = make_generator(params.seed)
+                results.append(int(sample_from_logits(row, params, generator=gen).item()))
+        return results
 
     def verify_batch(
         self,

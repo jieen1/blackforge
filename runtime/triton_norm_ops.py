@@ -17,8 +17,9 @@ Usage – call once after create_engine_config()::
 from __future__ import annotations
 
 import torch
+import triton
+import triton.language as tl
 from torch import Tensor
-from vllm.triton_utils import tl, triton
 
 # ---------------------------------------------------------------------------
 # Triton kernels
@@ -187,7 +188,8 @@ def install_triton_norm_ops() -> None:
         return
     _installed = True
 
-    from vllm import ir
+    from runtime.compat_vllm import get_vllm_ir
+    ir = get_vllm_ir()
 
     def _no_var(x, weight, epsilon, variance_size=None):
         return variance_size is None

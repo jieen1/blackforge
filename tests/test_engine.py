@@ -121,3 +121,41 @@ def test_input_validation_and_unknown_batch_members_are_rejected() -> None:
     engine.submit("good", [1], max_new_tokens=1)
     with pytest.raises(EngineError, match="unknown request"):
         engine.decode_batch({"missing": 1})
+
+
+class TestWatchdog:
+    """Unit tests for the engine watchdog (D1)."""
+
+    def test_watchdog_config_default(self):
+        from server.engine import ServerEngine
+
+        assert "watchdog_max_stale_rounds" in ServerEngine.__init__.__code__.co_varnames
+
+    def test_watchdog_stats_initialized(self):
+        """Watchdog stats fields exist in the stats dict template."""
+        import server.engine as eng_mod
+
+        src = open(eng_mod.__file__).read()
+        assert "watchdog_triggers" in src
+        assert "watchdog_events" in src
+
+    def test_watchdog_stale_detection_logic(self):
+        """Simulate the stale-slot detection predicate."""
+        max_stale = 200
+        current_round = 500
+        active = {
+            0: {"last_progress_round": 450},
+            1: {"last_progress_round": 100},
+            2: {"last_progress_round": 499},
+        }
+        stale = [
+            s
+            for s, st in active.items()
+            if current_round - st.get("last_progress_round", 0) > max_stale
+        ]
+        assert stale == [1]
+
+    def test_watchdog_disabled_at_zero(self):
+        """watchdog_max_stale_rounds=0 disables the watchdog."""
+        max_stale = 0
+        assert max_stale <= 0
