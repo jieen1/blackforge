@@ -41,7 +41,7 @@
 4. ⏭ **D4 首次 24h soak** —— 用户批准暂缓（"先不做"）
 5. ✅ **L0 收尾 + L1 冒烟** —— DFlash 校验关账 + vLLM 冒烟通过 + 基准数据落盘 + eager 正确性 4/4
 6. ✅ A6 attention 长上下文（调查完成，实现需 kernel adaptive split，deferred M3）· ~~A3 MTP 融合~~ 关闭 · ~~L1~~ ✅
-7. 🔥 B5 模块化 + E1 抽象层 · ~~D2/D3 观测细化~~ ✅ · ~~C3 结构化输出~~ ✅ · ~~C4 流式工具调用~~ ✅ · ~~C6 prompt caching~~ ✅
+7. 🔥 B5 模块化 55%（runner 4597→2660 行）· ~~E1 Phase 1+2~~ ✅ · ~~C2 logprobs~~ ✅ · ~~D2/D3~~ ✅ · ~~C3/C4/C6~~ ✅
 8. ⏸ B2 动态 KV · A4 显存换速度 · C2/C4/C6 · D6 自动回退 · E2 Qwen3 · L2/L3（按原里程碑走）
 9. 🧊 暂缓：**A1 GDN 融合**（占比仅 ~4%，A2/A6 榨干后再评）；远期：B6 多 GPU · V3 零依赖门禁
 
