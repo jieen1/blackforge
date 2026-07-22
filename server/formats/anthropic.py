@@ -36,13 +36,46 @@ def _strip_billing_blocks(blocks: list[dict]) -> list[dict]:
     ]
 
 
+# Anthropic server-side tool types that we cannot execute locally.
+# These are passed in the tools array but must be skipped when converting
+# to the chat template (the model cannot call them).
+_SERVER_TOOL_TYPES = frozenset(
+    {
+        "web_search_20250305",
+        "web_search_20250306",
+        "code_execution_20250115",
+        "computer_20250124",
+        "text_editor_20250124",
+        "bash_20250124",
+    }
+)
+
+# Content block types in assistant messages that carry no actionable content
+# for the chat template (thinking is internal, server_tool_use is opaque).
+_ASSISTANT_SKIP_TYPES = frozenset(
+    {"thinking", "redacted_thinking", "server_tool_use", "server_tool_result"}
+)
+
+# Content block types in user messages that we extract text from.
+_USER_TEXT_EXTRACT_TYPES = frozenset(
+    {"web_search_tool_result", "search_result", "code_execution_tool_result"}
+)
+
+# Content block types in user messages that are silently ignored.
+_USER_IGNORE_TYPES = frozenset(
+    {"image", "document", "mcp_tool_use", "mcp_tool_result", "container_upload"}
+)
+
+
 def parse_messages(body: dict) -> list[dict]:
     """Convert Anthropic Messages API request body to chat-template messages.
 
-    Handles:
+    Handles all content block types defined by the Anthropic Messages API:
     - system: string | list of text blocks (with cache_control etc.)
     - messages[].content: string | list of content blocks
-    - tool_use and tool_result blocks in messages
+    - text, thinking, redacted_thinking, tool_use, tool_result
+    - server_tool_use, web_search_tool_result, search_result
+    - image, document, mcp_tool_use, mcp_tool_result (gracefully ignored)
     - Multi-turn conversations with user/assistant roles
     """
     chat_messages: list[dict] = []
@@ -79,6 +112,8 @@ def parse_messages(body: dict) -> list[dict]:
                             },
                         }
                     )
+                elif btype in _ASSISTANT_SKIP_TYPES:
+                    pass  # thinking, redacted_thinking, server_tool_use: skip
             entry: dict[str, Any] = {"role": "assistant", "content": "\n".join(text_parts)}
             if tool_calls:
                 entry["tool_calls"] = tool_calls
@@ -102,6 +137,20 @@ def parse_messages(body: dict) -> list[dict]:
                             "tool_call_id": block.get("tool_use_id", ""),
                         }
                     )
+                elif btype in _USER_TEXT_EXTRACT_TYPES:
+                    # web_search_tool_result, search_result, etc.
+                    # Extract any text content so the model sees search results.
+                    result_content = block.get("content", "")
+                    if isinstance(result_content, list):
+                        result_content = extract_text(result_content)
+                    elif isinstance(result_content, str) and result_content:
+                        pass
+                    else:
+                        result_content = ""
+                    if result_content:
+                        text_parts.append(str(result_content))
+                elif btype in _USER_IGNORE_TYPES:
+                    pass  # image, document, mcp blocks: not supported, skip
             # tool results go first (they respond to the previous assistant turn)
             for tr in tool_results:
                 chat_messages.append(tr)

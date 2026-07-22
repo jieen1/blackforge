@@ -115,17 +115,35 @@ def format_tool_calls_anthropic(tool_calls: list[dict], start_id: int = 0) -> li
     return result
 
 
+# Anthropic server-side tool types that cannot be executed by a local model.
+# These are skipped during tool conversion (the model cannot call them).
+_SERVER_TOOL_TYPE_PREFIXES = (
+    "web_search_",
+    "code_execution_",
+    "computer_",
+    "text_editor_",
+    "bash_",
+)
+
+
 def convert_tools_to_chat_template(tools: list[dict] | None) -> list[dict] | None:
     """Convert OpenAI/Anthropic tool definitions to the format expected
     by the Qwen3.6 chat template (list of function dicts).
 
     The chat template expects tools as a list of dicts, each with
     type=function and a function sub-dict with name/description/parameters.
+
+    Anthropic server-side tools (web_search_20250305, code_execution_*, etc.)
+    are skipped because they cannot be executed by a local model.
     """
     if not tools:
         return None
     converted = []
     for tool in tools:
+        # Skip Anthropic server-side tools (web_search, code_execution, etc.)
+        tool_type = tool.get("type", "")
+        if any(tool_type.startswith(p) for p in _SERVER_TOOL_TYPE_PREFIXES):
+            continue
         if "function" in tool:
             converted.append(tool)
         elif "name" in tool:
@@ -141,7 +159,7 @@ def convert_tools_to_chat_template(tools: list[dict] | None) -> list[dict] | Non
             )
         else:
             converted.append(tool)
-    return converted
+    return converted or None
 
 
 # -- Streaming tool-call detection ------------------------------------------
