@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from runtime.sampling import SamplingParams
+from server.tracing import tracer
 
 os.environ.setdefault("USE_LIBUV", "0")
 os.environ.setdefault("SM120_GQA_USE_V2_DECODE_KERNEL", "1")
@@ -561,10 +562,12 @@ class ServerEngine:
             "last_progress_round": self.stats["rounds"],
             "start_time": time.perf_counter(),
         }
+        tracer.request_admitted(req.request_id, slot, len(req.prompt_ids))
 
     def _finish_request(
         self, slot: int, req: GenerationRequest, committed_tokens: list[int], finish_reason: str
     ) -> None:
+        tracer.request_finished(req.request_id, finish_reason)
         result = {
             "committed_token_ids": committed_tokens,
             "finish_reason": finish_reason,
@@ -859,11 +862,13 @@ class ServerEngine:
 
         # -- MTP verify/commit round (greedy path, unchanged) --
         if greedy_slots:
+            _round_t0 = time.perf_counter()
             decisions = self.runner.mtp_verify_and_commit_batch(
                 greedy_slots,
                 {s: self.active[s]["anchor"] for s in greedy_slots},
                 {s: self.active[s]["drafts"] for s in greedy_slots},
             )
+            _round_ms = (time.perf_counter() - _round_t0) * 1000
 
             for s in greedy_slots:
                 st = self.active[s]
@@ -895,6 +900,7 @@ class ServerEngine:
                 if finish_reason is None:
                     st["anchor"] = decision["next_anchor"]
                     st["drafts"] = decision["next_draft_tokens"]
+                    tracer.decode_round(req.request_id, self.stats["rounds"], len(kept), _round_ms)
                     continue
 
                 self._finish_request(s, req, st["committed_tokens"], finish_reason)

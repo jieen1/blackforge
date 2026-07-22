@@ -35,6 +35,7 @@ from pydantic import BaseModel
 
 from runtime.sampling import SamplingParams
 from server import metrics
+from server.tracing import tracer
 from server.engine import ServerEngine
 from server.formats import anthropic as anthropic_format
 from server.formats import convert_tools_to_chat_template, strip_thinking
@@ -888,9 +889,31 @@ async def metrics_endpoint():
     # D2: runtime-internal metrics (MTP acceptance, prefix cache depth, per-slot KV)
     lines.append(metrics.render_d2_metrics(ServerEngine.MODEL))
 
+    # D3: request-level tracing stats
+    lines.append(tracer.render_prometheus(ServerEngine.MODEL))
+
     from fastapi.responses import PlainTextResponse
 
     return PlainTextResponse("\n".join(lines) + "\n", media_type="text/plain; charset=utf-8")
+
+
+@app.get("/debug/traces")
+async def debug_traces(request_id: str | None = None, slow: bool = False, limit: int = 20):
+    """D3: Request-level tracing debug endpoint.
+
+    Query params:
+      - request_id: get trace for a specific request
+      - slow=true: get recent slow requests
+      - limit: max number of traces to return (default 20)
+    """
+    if request_id:
+        trace = tracer.get_trace(request_id)
+        if trace is None:
+            return {"error": "trace not found", "request_id": request_id}
+        return trace
+    if slow:
+        return {"slow_requests": tracer.get_slow_requests(limit)}
+    return {"recent": tracer.get_recent(limit), "stats": tracer.get_stats()}
 
 
 @app.api_route("/v1", methods=["GET", "POST"])
