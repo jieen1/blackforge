@@ -17,7 +17,6 @@ multi-request batching -- this round's scope does not need).
 
 from __future__ import annotations
 
-from collections import OrderedDict
 
 import torch
 
@@ -1581,7 +1580,9 @@ class DirectModelRunner:
         *,
         allow_cross_slot: bool = False,
     ) -> None:
-        return self.gdn_state.restore_gdn_state(slot, snapshot, *, allow_cross_slot)
+        return self.gdn_state.restore_gdn_state(
+            slot, snapshot, allow_cross_slot=allow_cross_slot,
+        )
 
     def _mtp_forward(
         self,
