@@ -1,0 +1,101 @@
+{
+  "_comment": "BlackForge speed baseline — frozen 2026-07-22 after full re-verification. Run benchmarks/baseline_compare.py after changes to detect regression.",
+  "date": "2026-07-22",
+  "gpu": "RTX PRO 6000 Blackwell (SM120, CC 12.0, 96 GB, 132 SMs)",
+  "model": "unsloth/Qwen3.6-27B-NVFP4",
+  "runtime_config": {
+    "mtp_k": 3,
+    "kv_dtype": "fp8_e4m3",
+    "cudagraph": true,
+    "prefix_cache": true
+  },
+
+  "attention_kernel_microbench": {
+    "_script": "benchmarks/kernel_microbench_split.py",
+    "_params": "--kv-len 131072 --batch 4 --qo-len 4 --split 4096 --max-splits 64",
+    "sm120_ms": 1.739,
+    "flashinfer_ms": 2.941,
+    "speedup_vs_flashinfer": 1.69,
+    "eff_kv_bw_gb_s": 618,
+    "correctness_cos": 0.9994,
+    "_note_141k": {
+      "_params": "--kv-len 141312 --batch 4 --qo-len 4 --split 4096 --max-splits 64",
+      "sm120_ms": 1.280,
+      "flashinfer_ms": 2.141,
+      "speedup_vs_flashinfer": 1.67,
+      "eff_kv_bw_gb_s": 904
+    }
+  },
+
+  "e2e_warm_throughput": {
+    "_script": "benchmarks/prefix_cache_warm_throughput_check.py",
+    "ctx64k_c4": {
+      "_params": "--fixture ctx64k --concurrency 4",
+      "warm_accepted_tok_s": 243.2,
+      "cold_accepted_tok_s": 217.0,
+      "acceptance_rate": 0.509,
+      "ttft_speedup_cold_over_warm": 1.03,
+      "mem_peak_smi_mib": 65215
+    },
+    "ctx128k_c4": {
+      "_params": "--fixture ctx128k --concurrency 4 --chunk-size 8192",
+      "warm_accepted_tok_s": 212.2,
+      "cold_accepted_tok_s": 212.3,
+      "acceptance_rate": 0.530,
+      "ttft_speedup_cold_over_warm": 1.99,
+      "mem_peak_smi_mib": 97043
+    },
+    "_native_vllm_comparison": {
+      "native_cold_tok_s_64k_c4": 10.8,
+      "native_cold_tok_s_128k_c4": 3.27,
+      "ours_warm_vs_native_cold_64k": "22.5x",
+      "ours_warm_vs_native_cold_128k": "64.9x"
+    }
+  },
+
+  "decode_step_profiling_4k_c4": {
+    "_script": "benchmarks/decode_step_profile.py",
+    "_params": "--fixture w1s --concurrency 4",
+    "accepted_tokens_per_sec": 379.9,
+    "acceptance_rate": 0.529,
+    "steps_per_sec": 28.22,
+    "per_step_cuda_ms": 31.2,
+    "kernel_pct": {
+      "nvfp4_gemm": 77.6,
+      "attention_sm120": 3.8,
+      "gdn": 4.4,
+      "other_quant_act_memcpy": 14.2
+    },
+    "_note": "4K short context: GEMM dominates. 128K shifts to ~54% GEMM / 28% attention (see notes/2026-07-22-a1a-gdn-profiling.md)"
+  },
+
+  "decode_step_profiling_128k_c1": {
+    "_source": "notes/2026-07-22-a1a-gdn-profiling.md",
+    "_script": "benchmarks/a1a_gdn_profile.py",
+    "kernel_pct": {
+      "nvfp4_gemm": 53.7,
+      "attention_sm120": 28.2,
+      "gemm_bf16_gemv": 7.7,
+      "gdn": 3.9,
+      "other": 6.5
+    }
+  },
+
+  "quality_baseline": {
+    "mmlu_pro": {
+      "_script": "benchmarks/official/mmlu_pro_eval.py",
+      "_params": "--limit 420 --concurrency 8 --max-tokens 32768",
+      "official_qwen36_27b": 86.2,
+      "our_runtime": 84.54,
+      "n": 414,
+      "methodology": "5-shot CoT, category-matched, greedy, thinking mode ON",
+      "result_file": "evalplus_results/official/mmlu_pro_think_c4.json"
+    },
+    "quality_regression": {
+      "_script": "benchmarks/quality_regression.py",
+      "_compare": "benchmarks/quality_compare.py",
+      "dims": ["code (HumanEval+)", "tool (BFCL-lite 24 schemas)", "agent (multi-turn loop)", "longctx (needle-in-haystack 8K-128K)"],
+      "result_dir": "evalplus_results/quality/"
+    }
+  }
+}
