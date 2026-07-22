@@ -152,6 +152,7 @@ class ServerEngine:
         idle_sleep_s: float = 0.005,
         production: bool = True,
         watchdog_max_stale_rounds: int = 200,
+        request_timeout_s: float = 600.0,
     ) -> None:
         if production:
             min_slots = capacity + (capacity if enable_cudagraph else 0)
@@ -174,6 +175,7 @@ class ServerEngine:
         self.capacity_tokens_per_slot = block_size * blocks_per_slot
         self.idle_sleep_s = idle_sleep_s
         self.watchdog_max_stale_rounds = watchdog_max_stale_rounds
+        self.request_timeout_s = request_timeout_s
         self._kv_cache_dtype = kv_cache_dtype
         self._enable_cudagraph = enable_cudagraph
         self.enable_prefix_cache = enable_prefix_cache
@@ -238,6 +240,7 @@ class ServerEngine:
             "session_expirations": 0,
             "session_warm_fallbacks": 0,
             "cancellations": 0,
+            "timeouts": 0,
             "watchdog_triggers": 0,
             "watchdog_events": [],
             "mtp_acceptance_histogram": [0] * 5,
@@ -553,6 +556,7 @@ class ServerEngine:
             "sampled": not req.sampling_params.is_greedy,
             "last_token": anchor,
             "last_progress_round": self.stats["rounds"],
+            "start_time": time.perf_counter(),
         }
 
     def _finish_request(
@@ -858,6 +862,43 @@ class ServerEngine:
 
         for s in newly_finished:
             del self.active[s]
+
+        # -- request timeout: reclaim slots exceeding max duration --
+        if self.request_timeout_s > 0 and self.active:
+            now = time.perf_counter()
+            timed_out = [
+                s
+                for s, st in self.active.items()
+                if now - st.get("start_time", now) > self.request_timeout_s
+            ]
+            for s in timed_out:
+                st = self.active.pop(s)
+                req = st["req"]
+                elapsed = now - st.get("start_time", now)
+                self.stats["timeouts"] += 1
+                logger.warning(
+                    "TIMEOUT: slot %d request %s exceeded %.0fs limit (%.0fs elapsed, "
+                    "%d tokens committed)",
+                    s,
+                    req.request_id,
+                    self.request_timeout_s,
+                    elapsed,
+                    len(st["committed_tokens"]),
+                )
+                if req.stream_channel is not None:
+                    self._stream_close(req.stream_channel)
+                self._fail_future(
+                    req.future,
+                    TimeoutError(
+                        f"request timed out after {elapsed:.0f}s "
+                        f"(limit {self.request_timeout_s:.0f}s)"
+                    ),
+                )
+                try:
+                    self.runner.reset_slot(s)
+                except Exception:
+                    logger.exception("timeout reset_slot(%d) failed", s)
+                self.free_slots.append(s)
 
         # -- watchdog: force-reclaim slots that made no progress --
         if self.watchdog_max_stale_rounds > 0 and self.active:
