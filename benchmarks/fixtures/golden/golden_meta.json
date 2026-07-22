@@ -1,0 +1,22 @@
+{
+  "date": "2026-07-22T22:10:29.202306",
+  "script": "benchmarks/record_golden_fixtures.py",
+  "params": {
+    "num_prompts": 4,
+    "decode_steps": 50,
+    "concurrency": 1,
+    "prompt_len": 4096,
+    "fixture_source": "benchmarks/fixtures/w1s_prompts.json",
+    "cudagraph": false,
+    "prefix_cache": false,
+    "greedy": true
+  },
+  "environment": {
+    "gpu": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+    "torch_version": "2.13.0a0+gitcf30153",
+    "cuda_version": "13.3"
+  },
+  "fixture_checksum": "46af97bd16dfef63",
+  "gdn_layers": 48,
+  "gdn_norms_per_step": 96
+}
