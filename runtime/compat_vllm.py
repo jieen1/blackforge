@@ -28,6 +28,7 @@ __all__ = [
     "GDNAttentionMetadata",  # re-exported from vLLM (isinstance-sensitive)
     "SM120GQAMetadata",  # re-exported from vLLM (isinstance-sensitive)
     "VllmConfig",
+    "AttentionBackendEnum",
     "bind_kv_cache",
     "compute_causal_conv1d_metadata",
     "get_distributed_init_method",
@@ -40,6 +41,7 @@ __all__ = [
     "prepare_chunk_indices",
     "prepare_chunk_offsets",
     "set_current_vllm_config",
+    "register_backend",
     "set_forward_context",
 ]
 
@@ -117,7 +119,10 @@ from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config  # no
 from vllm.engine.arg_utils import EngineArgs  # noqa: E402
 from vllm.forward_context import ForwardContext  # noqa: E402
 from vllm.model_executor.model_loader import get_model  # noqa: E402
-# register_backend / AttentionBackendEnum: removed (dead code, no call sites)
+from vllm.v1.attention.backends.registry import (  # noqa: E402
+    AttentionBackendEnum,  # noqa: E402
+    register_backend,  # noqa: E402
+)
 
 # B7-V1: compute_causal_conv1d_metadata 已自写（见文件末尾）
 from vllm.v1.worker.gpu_worker import (  # noqa: E402
