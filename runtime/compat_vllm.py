@@ -103,9 +103,7 @@ def get_distributed_init_method(ip: str, port: int) -> str:
 # All vLLM imports in the production path are consolidated here — this
 # is the B7-V1 "single point" contract.
 # ---------------------------------------------------------------------------
-from vllm.config import VllmConfig, set_current_vllm_config  # noqa: E402
-from vllm.engine.arg_utils import EngineArgs  # noqa: E402
-from vllm.forward_context import set_forward_context  # noqa: E402
+import vllm.forward_context as _vllm_fc  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Re-exported: FLA chunk index helpers (vLLM internal, kernel-coupled)
@@ -117,16 +115,21 @@ from fla.ops.utils.index import (  # noqa: E402
     prepare_chunk_indices,
     prepare_chunk_offsets,
 )
+from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config  # noqa: E402
+from vllm.engine.arg_utils import EngineArgs  # noqa: E402
+from vllm.forward_context import ForwardContext  # noqa: E402
 from vllm.model_executor.model_loader import get_model  # noqa: E402
 from vllm.v1.attention.backends.registry import (  # noqa: E402
     AttentionBackendEnum,  # noqa: E402
     register_backend,  # noqa: E402
 )
+
 # B7-V1: compute_causal_conv1d_metadata 已自写（见文件末尾）
 from vllm.v1.worker.gpu_worker import (  # noqa: E402
     init_worker_distributed_environment,  # noqa: E402
 )
-from vllm.v1.worker.utils import bind_kv_cache  # noqa: E402
+
+# bind_kv_cache: self-written (see below)
 
 
 def load_eagle_model(*args, **kwargs):
@@ -155,6 +158,119 @@ def get_gemma_rms_norm():
     from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 
     return GemmaRMSNorm
+
+
+# ---------------------------------------------------------------------------
+# Self-written: bind_kv_cache (B7-V1 薄依赖自写)
+#
+# 原 vLLM 实现: vllm/v1/worker/utils.py:479
+# 纯字典绑定 + extract_layer_index（字符串解析），零 vLLM 依赖。
+# ---------------------------------------------------------------------------
+
+
+def _extract_layer_index(layer_name: str, num_attn_module: int = 1) -> int:
+    """Extract the integer layer index from a dotted module name.
+
+    Self-written replacement for vLLM's
+    ``vllm.model_executor.models.utils.extract_layer_index``.
+    """
+    subnames = layer_name.split(".")
+    int_vals: list[int] = []
+    for subname in subnames:
+        try:
+            int_vals.append(int(subname))
+        except ValueError:
+            continue
+    if num_attn_module == 1 or "attn" not in layer_name:
+        assert len(int_vals) == 1, (
+            f"layer name {layer_name} should only contain one integer"
+        )
+        return int_vals[0]
+    else:
+        assert len(int_vals) <= 2, (
+            f"layer name {layer_name} should contain most two integers"
+        )
+        return (
+            int_vals[0] * num_attn_module + int_vals[1]
+            if len(int_vals) == 2
+            else int_vals[0]
+        )
+
+
+def bind_kv_cache(
+    kv_caches: "dict[str, torch.Tensor]",
+    forward_context: "dict[str, object]",
+    runner_kv_caches: "list[torch.Tensor]",
+    num_attn_module: int = 1,
+) -> None:
+    """Bind allocated KV caches to ModelRunner list and forward context.
+
+    Self-written replacement for vLLM's ``vllm.v1.worker.utils.bind_kv_cache``.
+    Pure dict binding + layer-index sorting, zero vLLM dependency.
+    """
+    from collections import defaultdict
+
+    assert len(runner_kv_caches) == 0
+
+    index2name: dict[int, list[str]] = defaultdict(list)
+    for layer_name in kv_caches:
+        index2name[_extract_layer_index(layer_name, num_attn_module)].append(layer_name)
+
+    for layer_index in sorted(index2name.keys()):
+        for layer_name in index2name[layer_index]:
+            runner_kv_caches.append(kv_caches[layer_name])
+
+    for layer_name, kv_cache in kv_caches.items():
+        forward_context[layer_name].kv_cache = kv_cache
+
+
+# ---------------------------------------------------------------------------
+# Self-written: set_forward_context (B7-V1 薄依赖自写)
+#
+# 原 vLLM 实现: vllm/forward_context.py:260
+# 简化版：跳过 DP/batch-tracking/cudagraph/platform 逻辑（单 GPU 无需）。
+# 仍需 ForwardContext dataclass（model layers 通过 get_forward_context() 读取）。
+# ---------------------------------------------------------------------------
+
+from contextlib import contextmanager  # noqa: E402
+
+
+@contextmanager
+def set_forward_context(
+    attn_metadata,
+    vllm_config: "VllmConfig",
+    *,
+    slot_mapping=None,
+    **_ignored_kwargs,
+):
+    """Simplified forward context manager for single-GPU BlackForge.
+
+    Self-written replacement for vLLM's ``set_forward_context``.
+    Skips DP coordination, batch-size tracking, cudagraph mode dispatch,
+    and platform hooks — none apply to our single-GPU, non-MoE setup.
+
+    Still sets ``vllm.forward_context._forward_context`` because model
+    layers (loaded via vLLM's ``get_model()``) call ``get_forward_context()``.
+    """
+    forward_context = ForwardContext(
+        no_compile_layers=vllm_config.compilation_config.static_forward_context,
+        all_moe_layers=None,
+        attn_metadata=attn_metadata,
+        slot_mapping=slot_mapping or {},
+        dp_metadata=None,
+        cudagraph_runtime_mode=CUDAGraphMode.NONE,
+        batch_descriptor=None,
+        ubatch_slices=None,
+        skip_compiled=False,
+        additional_kwargs={},
+        is_padding=None,
+    )
+    prev = _vllm_fc._forward_context
+    _vllm_fc._forward_context = forward_context
+    try:
+        yield
+    finally:
+        _vllm_fc._forward_context = prev
 
 
 # ---------------------------------------------------------------------------
