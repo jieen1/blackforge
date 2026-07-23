@@ -1,0 +1,25 @@
+{
+  "model": "poolside/Laguna-S-2.1-NVFP4",
+  "date": "2026-07-23T16:03:42",
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+  "decode_tokens": 128,
+  "reps": 5,
+  "determinism": {
+    "determinism": true,
+    "tokens_run1": 50,
+    "tokens_run2": 50,
+    "text": " Paris. \n\nIn a discussion about the capital of France, various users have contributed different perspectives. One user, "
+  },
+  "our_graph_compile": {
+    "tok_s": 82.9,
+    "itl_ms": 12.06,
+    "reps": 5
+  },
+  "vllm_graph_compile": {
+    "tok_s": 94.5,
+    "itl_ms": 10.58,
+    "reps": 5
+  },
+  "speedup_vs_vllm": 0.877,
+  "target_met": false
+}

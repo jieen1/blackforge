@@ -63,6 +63,9 @@ class LagunaCudaGraphDecode:
         self._fi_indices_gpu = torch.zeros(max_pages, dtype=torch.int32, device=self.device)
         self._fi_last_page_len_cpu = torch.zeros(batch_size, dtype=torch.int32, pin_memory=True)
         self._fi_last_page_len_gpu = torch.zeros(batch_size, dtype=torch.int32, device=self.device)
+        # Staging buffer: write here first, then copy to pinned → GPU.
+        # Prevents race if .item() sync is removed in future optimization.
+        self._fi_last_page_len_staging = torch.zeros(batch_size, dtype=torch.int32)
 
         # ── CommonAttentionMetadata pre-allocated fields ──
         self._qsl_gpu = torch.arange(batch_size + 1, dtype=torch.int32, device=self.device)
@@ -75,18 +78,30 @@ class LagunaCudaGraphDecode:
         # ── FlashInfer cudagraph decode wrappers (one per layer group) ──
         self._decode_wrappers: dict[tuple, Any] = {}
         self._fi_metadata: dict[tuple, Any] = {}
+        self._workspaces: list[torch.Tensor] = []
+
+        # ── Per-slot page-crossing tracker ──
+        self._prev_n_blocks: list[int] = [0] * batch_size
 
     def _init_wrappers(self) -> None:
-        """Create FlashInfer cudagraph-enabled decode wrappers per layer group."""
-        from flashinfer.decode import BatchDecodeWithPagedKVCacheWrapper
+        """Create FlashInfer cudagraph-enabled decode wrappers per layer group.
 
+        Each wrapper gets its OWN workspace buffer (not shared with the eager
+        builder) to prevent prefill from polluting decode's scheduling area.
+        """
+        from flashinfer.decode import BatchDecodeWithPagedKVCacheWrapper
 
         backend = self.backend
         bs = self.batch_size
 
         for group_key, builder in backend._metadata_builders.items():
+            workspace = torch.empty(
+                builder._get_workspace_buffer().numel(),
+                dtype=torch.uint8,
+                device=self.device,
+            )
             wrapper = BatchDecodeWithPagedKVCacheWrapper(
-                builder._get_workspace_buffer(),
+                workspace,
                 "NHD",  # kv_layout
                 use_cuda_graph=True,
                 paged_kv_indptr_buffer=self._fi_indptr_gpu[:bs + 1],
@@ -95,6 +110,7 @@ class LagunaCudaGraphDecode:
                 use_tensor_cores=True,
             )
             self._decode_wrappers[group_key] = wrapper
+            self._workspaces.append(workspace)
 
     def _fill_buffers(
         self,
@@ -159,6 +175,7 @@ class LagunaCudaGraphDecode:
             # Determine kv_cache_dtype
             kv_dtype = torch.float8_e4m3fn if "fp8" in backend._cache_dtype_str else torch.bfloat16
 
+            builder_sm_scale = backend._metadata_builders[group_key].sm_scale
             fast_plan_decode(
                 wrapper,
                 indptr_cpu=self._fi_indptr_cpu[:bs + 1],
@@ -173,18 +190,18 @@ class LagunaCudaGraphDecode:
                 logits_soft_cap=None,
                 q_data_type=torch.bfloat16,
                 kv_data_type=kv_dtype,
-                sm_scale=1.0 / (head_dim ** 0.5),
+                sm_scale=builder_sm_scale,
                 non_blocking=True,
                 fixed_split_size=2048,
                 disable_split_kv=False,
             )
-            # FlashInfer plan() rounds sm_scale; force exact match for assertion.
-            wrapper._sm_scale = backend._metadata_builders[group_key].sm_scale
+            wrapper._sm_scale = builder_sm_scale
 
     def _build_metadata_and_forward(self) -> torch.Tensor:
         """Build FlashInferMetadata from pre-allocated buffers and run forward."""
         from runtime.compat_vllm import (
-                        set_forward_context,
+            set_current_vllm_config,
+            set_forward_context,
         )
 
         backend = self.backend
@@ -216,12 +233,13 @@ class LagunaCudaGraphDecode:
                 attn_metadata_dict[name] = metadata
                 slot_mapping_dict[name] = self._slot_mapping[:bs]
 
-        with set_forward_context(
-            attn_metadata_dict, backend.vllm_config, slot_mapping=slot_mapping_dict
-        ):
-            hidden_states = backend.model.forward(
-                self._input_ids[:bs], self._positions[:bs]
-            )
+        with set_current_vllm_config(backend.vllm_config):
+            with set_forward_context(
+                attn_metadata_dict, backend.vllm_config, slot_mapping=slot_mapping_dict
+            ):
+                hidden_states = backend.model.forward(
+                    self._input_ids[:bs], self._positions[:bs]
+                )
 
         return backend.model.compute_logits(hidden_states)
 
@@ -266,6 +284,7 @@ class LagunaCudaGraphDecode:
 
         self._graph = graph
         self._captured = True
+
         logger.info("Laguna CUDA Graph captured: batch_size=%d", bs)
 
     def replay(
@@ -274,25 +293,70 @@ class LagunaCudaGraphDecode:
         token_ids: list[int],
         kv_lengths: list[int],
     ) -> list[int]:
-        """Replay the captured graph with real data."""
+        """Replay the captured graph with real data.
+
+        FlashInfer contract: plan→run must be paired every step.
+        fast_plan_decode is cheap (small H2D copies), never skip it.
+        """
         if not self._captured:
             raise RuntimeError("Graph not captured. Call capture() first.")
 
         bs = len(slot_ids)
-        assert bs <= self.batch_size
+        ps = self.block_size
+        bps = self.blocks_per_slot
 
-        # Update buffers + run fast_decode_plan (small H2D only)
-        self._fill_buffers(slot_ids, token_ids, kv_lengths)
+        for i in range(bs):
+            kvl = kv_lengths[i]
+            new_kv = kvl + 1
+
+            self._input_ids[i] = token_ids[i]
+            self._positions[i] = kvl
+
+            phys = slot_ids[i] + 1  # inlined _physical_slot
+            base = phys * bps
+            self._slot_mapping[i] = base * ps + kvl
+
+            lpl = new_kv % ps
+            self._fi_last_page_len_staging[i] = lpl if lpl != 0 else ps
+
+            n_blocks = (new_kv + ps - 1) // ps
+            if n_blocks != self._prev_n_blocks[i]:
+                self._prev_n_blocks[i] = n_blocks
+                self._block_table[i, :n_blocks] = torch.arange(
+                    base, base + n_blocks, dtype=torch.int32, device=self.device
+                )
+                self._fi_indptr_cpu[0] = 0
+                for j in range(bs):
+                    nb = self._prev_n_blocks[j]
+                    self._fi_indptr_cpu[j + 1] = self._fi_indptr_cpu[j] + nb
+                    p2 = slot_ids[j] + 1
+                    b2 = p2 * bps
+                    start = int(self._fi_indptr_cpu[j].item())
+                    self._fi_indices_gpu[start:start + nb] = torch.arange(
+                        b2, b2 + nb, dtype=torch.int32, device=self.device
+                    )
+
+        self._fi_last_page_len_cpu[:bs].copy_(self._fi_last_page_len_staging[:bs])
+        # fast_decode_plan (cudagraph mode) does NOT copy CPU→GPU; caller must.
+        # These GPU buffers are the wrapper's fixed-address plan inputs.
+        self._fi_indptr_gpu[:bs + 1].copy_(self._fi_indptr_cpu[:bs + 1], non_blocking=True)
+        self._fi_last_page_len_gpu[:bs].copy_(self._fi_last_page_len_cpu[:bs], non_blocking=True)
         self._run_plan(slot_ids, kv_lengths)
-
-        # Replay captured graph
         self._graph.replay()
 
-        # Extract results
-        next_tokens = []
-        for i in range(bs):
-            next_tokens.append(int(self._logits[i].argmax(dim=-1).item()))
-        return next_tokens
+        if bs == 1:
+            return [int(self._logits[0].argmax(dim=-1).item())]
+        return [int(self._logits[i].argmax(dim=-1).item()) for i in range(bs)]
+
+    def reset(self) -> None:
+        """Reset per-slot tracking state for a fresh generation.
+
+        Zeros workspace buffers to prevent capture-warmup residue from
+        affecting the first replay (run1 vs run2 divergence).
+        """
+        self._prev_n_blocks = [0] * self.batch_size
+        for ws in self._workspaces:
+            ws.zero_()
 
     @property
     def is_captured(self) -> bool:

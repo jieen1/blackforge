@@ -452,6 +452,11 @@ class LagunaBackend:
     def reset_slot(self, slot: int) -> None:
         self.slot_kv_len[slot] = 0
         self.slot_committed_tokens[slot] = []
+        phys = _physical_slot(slot)
+        start = phys * self.blocks_per_slot
+        end = start + self.blocks_per_slot
+        for cache in self.kv_caches.values():
+            cache[start:end].zero_()
 
     def generate(
         self,
