@@ -102,54 +102,44 @@ class LagunaCudaGraphDecode:
         token_ids: list[int],
         kv_lengths: list[int],
     ) -> None:
-        """Update pre-allocated buffers for replay."""
+        """Update pre-allocated buffers for replay (vectorized)."""
         from runtime.backends.laguna import _physical_slot
 
         bs = len(slot_ids)
-        page_size = self.block_size
+        ps = self.block_size
 
-        for i in range(bs):
-            self._input_ids[i] = token_ids[i]
-            self._positions[i] = kv_lengths[i]
-            new_kv_len = kv_lengths[i] + 1
-            self._seq_lens_gpu[i] = new_kv_len
+        # Vectorized: input_ids, positions, seq_lens
+        self._input_ids[:bs] = torch.tensor(token_ids, dtype=torch.long, device=self.device)
+        kv_t = torch.tensor(kv_lengths, dtype=torch.long, device=self.device)
+        self._positions[:bs] = kv_t
+        new_kv = kv_t.int() + 1
+        self._seq_lens_gpu[:bs] = new_kv
 
-            phys = _physical_slot(slot_ids[i])
-            base = phys * self.blocks_per_slot
-            n_blocks = (new_kv_len + page_size - 1) // page_size
-
-            # Block table (contiguous)
-            self._block_table[i, :n_blocks] = torch.arange(
-                base, base + n_blocks, dtype=torch.int32, device=self.device
-            )
-
-            # Slot mapping
-            pos = kv_lengths[i]
-            self._slot_mapping[i] = (base + pos // page_size) * page_size + pos % page_size
-
-            # FlashInfer: last_page_len
-            lpl = new_kv_len % page_size
-            self._fi_last_page_len_cpu[i] = lpl if lpl != 0 else page_size
-
-        # FlashInfer: indptr (cumulative num_blocks)
+        # Per-slot: block_table, slot_mapping, last_page_len, indices
+        n_blocks_t = (new_kv + ps - 1) // ps
         self._fi_indptr_cpu[0] = 0
         for i in range(bs):
-            new_kv_len = kv_lengths[i] + 1
-            n_blocks = (new_kv_len + page_size - 1) // page_size
-            self._fi_indptr_cpu[i + 1] = self._fi_indptr_cpu[i] + n_blocks
-
-        # FlashInfer: indices (contiguous block IDs, pre-filled at slot alloc)
-        # For contiguous blocks: indices[i] = base + block_offset
-        for i in range(bs):
             phys = _physical_slot(slot_ids[i])
             base = phys * self.blocks_per_slot
-            start = int(self._fi_indptr_cpu[i].item())
-            n_blocks = int(self._fi_indptr_cpu[i + 1].item()) - start
-            self._fi_indices_gpu[start:start + n_blocks] = torch.arange(
-                base, base + n_blocks, dtype=torch.int32, device=self.device
+            nb = int(n_blocks_t[i].item())
+
+            self._block_table[i, :nb] = torch.arange(
+                base, base + nb, dtype=torch.int32, device=self.device
             )
 
-        # H2D copies for indptr and last_page_len (small, fast)
+            pos = kv_lengths[i]
+            self._slot_mapping[i] = (base + pos // ps) * ps + pos % ps
+
+            lpl = int(new_kv[i].item()) % ps
+            self._fi_last_page_len_cpu[i] = lpl if lpl != 0 else ps
+
+            self._fi_indptr_cpu[i + 1] = self._fi_indptr_cpu[i] + nb
+
+            start = int(self._fi_indptr_cpu[i].item())
+            self._fi_indices_gpu[start:start + nb] = torch.arange(
+                base, base + nb, dtype=torch.int32, device=self.device
+            )
+
         self._fi_indptr_gpu[:bs + 1].copy_(self._fi_indptr_cpu[:bs + 1], non_blocking=True)
         self._fi_last_page_len_gpu[:bs].copy_(self._fi_last_page_len_cpu[:bs], non_blocking=True)
 
