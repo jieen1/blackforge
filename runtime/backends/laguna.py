@@ -41,6 +41,19 @@ RESERVED_PHYSICAL_SLOTS = 1
 # qo_max=1 → 33, qo_max=16 → 34 (审查阻断①)
 SWA_QO_MAX = 16
 
+# Upper bound on num_tokens for any CUDA-graph-captured forward step:
+# decode (batch_size<=4, MultiBatchGraphManager) and DFlash verify/draft
+# (fixed NUM_QUERY_PER_REQ=16, dflash_constants.py) both stay <= 16.
+# LagunaMoEB12x instances built for these hot paths must be constructed
+# with use_cuda_graph=True and max_num_tokens>=this bound -- FlashInfer's
+# B12xMoEWrapper.run() raises RuntimeError if invoked during CUDA graph
+# capture with use_cuda_graph=False (dynamic per-call torch.empty alloc
+# is not graph-capturable). Prefill (chunked at 2048 tokens, never
+# graph-captured) keeps using a separate use_cuda_graph=False instance --
+# sizing the graph-safe workspace to 2048 instead of 16 would multiply its
+# fixed VRAM footprint ~128x across all 47 MoE layers for no benefit.
+MOE_GRAPH_SAFE_MAX_TOKENS = 16
+
 
 def _ring_blocks_for_window(window: int, block_size: int, qo_max: int = SWA_QO_MAX) -> int:
     return -(-( window - 1 + qo_max) // block_size) + 1  # cdiv + 1
@@ -314,6 +327,24 @@ class LagunaBackend:
         1. gate → sigmoid topk routing (vLLM's fused_topk_bias)
         2. B12x expert compute (single fused kernel, CUDA Graph captured)
         3. shared expert + combine
+
+        Each layer gets TWO LagunaMoEB12x instances, dispatched by num_tokens
+        at call time:
+        - graph-safe (use_cuda_graph=True, max_num_tokens=MOE_GRAPH_SAFE_MAX_TOKENS):
+          for decode/DFlash-verify calls that run inside an outer
+          torch.cuda.graph() capture (LagunaCudaGraphDecode / DFlashVerifyCudaGraph
+          / DFlashDraftCudaGraph all call backend.model.forward() directly inside
+          `with torch.cuda.graph(...)`). FlashInfer's B12xMoEWrapper.run() raises
+          RuntimeError if called during graph capture unless it was constructed
+          with use_cuda_graph=True (see flashinfer/fused_moe/cute_dsl/b12x_moe.py,
+          the _is_cuda_graph_capturing() guard) -- this is the previously-observed
+          "CUDA graph不兼容" failure. The graph-safe wrapper also uses pre-allocated
+          fixed buffers instead of a fresh torch.empty() per call, which is the
+          fix for the paired "性能不及预期" finding too (eager B12xMoEWrapper
+          dynamic-alloc mode is measurably slower, see notes/2026-07-23-laguna-
+          moe-b12x-direct-kernel.md).
+        - eager (use_cuda_graph=False): for prefill, whose chunk size (2048) is
+          never graph-captured and far exceeds MOE_GRAPH_SAFE_MAX_TOKENS.
         """
         from runtime.backends.laguna_moe_kernel import LagunaMoEB12x
         from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
@@ -346,15 +377,7 @@ class LagunaBackend:
             e_bias = getattr(experts_obj, "e_score_correction_bias", None)
             apply_on_input = getattr(hf_config, "moe_apply_router_weight_on_input", False)
 
-            b12x = LagunaMoEB12x(
-                num_experts=num_experts,
-                top_k=top_k,
-                hidden_size=hidden_size,
-                intermediate_size=intermediate_size,
-                device=self.device,
-                use_cuda_graph=False,
-            )
-            b12x.load_weights(
+            weight_kwargs = dict(
                 w13_weight=routed.w13_weight,
                 w13_weight_scale=routed.w13_weight_scale,
                 w13_weight_scale_2=routed.w13_weight_scale_2,
@@ -362,9 +385,35 @@ class LagunaBackend:
                 w2_weight_scale=routed.w2_weight_scale,
                 w2_weight_scale_2=routed.w2_weight_scale_2,
             )
-            self._moe_b12x_kernels.append(b12x)
 
-            def _make_patched_forward(moe_mod, b12x_kernel, _shared, _scaling, _renorm, _softcap, _e_bias, _top_k, _apply_on_input):
+            b12x_graph = LagunaMoEB12x(
+                num_experts=num_experts,
+                top_k=top_k,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                device=self.device,
+                use_cuda_graph=True,
+                max_num_tokens=MOE_GRAPH_SAFE_MAX_TOKENS,
+            )
+            b12x_graph.load_weights(**weight_kwargs)
+
+            b12x_eager = LagunaMoEB12x(
+                num_experts=num_experts,
+                top_k=top_k,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                device=self.device,
+                use_cuda_graph=False,
+            )
+            b12x_eager.load_weights(**weight_kwargs)
+
+            self._moe_b12x_kernels.append(b12x_graph)
+            self._moe_b12x_kernels.append(b12x_eager)
+
+            def _make_patched_forward(
+                moe_mod, _b12x_graph, _b12x_eager, _shared, _scaling,
+                _renorm, _softcap, _e_bias, _top_k, _apply_on_input,
+            ):
                 def _patched_forward(hidden_states: torch.Tensor) -> torch.Tensor:
                     orig_shape = hidden_states.shape
                     hs = hidden_states.view(-1, hidden_states.shape[-1])
@@ -376,6 +425,9 @@ class LagunaBackend:
                         hs, router_logits, "sigmoid", _e_bias,
                         _top_k, _renorm, routed_scaling_factor=_scaling if not _apply_on_input else 1.0,
                     )
+                    b12x_kernel = (
+                        _b12x_graph if hs.shape[0] <= MOE_GRAPH_SAFE_MAX_TOKENS else _b12x_eager
+                    )
                     routed_out = b12x_kernel.forward(hs, topk_ids, topk_weights)
                     if _apply_on_input:
                         routed_out = routed_out * _scaling
@@ -386,7 +438,7 @@ class LagunaBackend:
                 return _patched_forward
 
             moe_module.forward = _make_patched_forward(
-                moe_module, b12x, shared_expert, routed_scaling,
+                moe_module, b12x_graph, b12x_eager, shared_expert, routed_scaling,
                 renormalize, softcap, e_bias, top_k, apply_on_input,
             )
             patched += 1

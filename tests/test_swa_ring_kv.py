@@ -3,71 +3,89 @@
 No GPU or model weights required.
 """
 import math
+import sys
+import types
 
-import pytest
+# Stub out runtime.compat_vllm to avoid vllm import, and import the pure
+# functions this file needs -- done in setup_module()/teardown_module(),
+# NOT at module top level. pytest COLLECTS (imports) every test file before
+# RUNNING any of them, so top-level stubbing code would install these stubs
+# during collection, long before this file's own teardown gets a chance to
+# run -- any other test file whose tests happen to EXECUTE first (e.g.
+# alphabetically-earlier file names) would see the leaked, deliberately-
+# incomplete stub instead of the real runtime.compat_vllm. setup_module()/
+# teardown_module() instead bracket the stub's lifetime tightly around just
+# this file's own test execution window.
+_MODULES_BEFORE: frozenset[str] = frozenset()
 
-# Import ring helpers (pure functions, no GPU dependency)
-import sys, types
 
-# Stub out runtime.compat_vllm to avoid vllm import
-_compat = types.ModuleType("runtime.compat_vllm")
-for attr in [
-    "VllmConfig", "bind_kv_cache", "get_distributed_init_method",
-    "get_model", "get_open_port", "init_worker_distributed_environment",
-    "set_current_vllm_config", "set_forward_context",
-    "get_flashinfer_metadata_builder", "get_common_attn_metadata_cls",
-    "init_flashinfer_workspace",
-]:
-    setattr(_compat, attr, None)
-sys.modules.setdefault("runtime.compat_vllm", _compat)
-
-# Stub other runtime modules that import vllm
-for mod_name in [
-    "runtime.block_pool", "runtime.logprobs", "runtime.model_spec",
-    "runtime.sampling", "runtime.nvfp4_custom_gemm",
-    "runtime.nvfp4_cutlass_direct_patch",
-]:
+def _install_stub(mod_name, module):
     if mod_name not in sys.modules:
-        m = types.ModuleType(mod_name)
-        if mod_name == "runtime.block_pool":
-            m.ChunkedPrefillState = type("ChunkedPrefillState", (), {})
-        if mod_name == "runtime.model_spec":
-            m.ModelSpec = type("ModelSpec", (), {"from_runner_init": staticmethod(lambda **kw: None)})
-        if mod_name == "runtime.sampling":
-            m.SamplingParams = type("SamplingParams", (), {})
-            m.make_generator = lambda seed: None
-            m.sample_from_logits = lambda *a, **kw: None
-        if mod_name == "runtime.logprobs":
-            m.compute_logprobs = lambda *a, **kw: []
-        if mod_name == "runtime.nvfp4_custom_gemm":
-            m.patch_nvfp4_custom_gemm = lambda: None
-        if mod_name == "runtime.nvfp4_cutlass_direct_patch":
-            m.patch_nvfp4_prefer_cutlass_direct = lambda: None
-        sys.modules[mod_name] = m
+        sys.modules[mod_name] = module
 
-from runtime.backends.laguna import (
-    _ring_blocks_for_window,
-    _physical_slot,
-    RESERVED_PHYSICAL_SLOTS,
-    SWA_QO_MAX,
-)
+
+def setup_module() -> None:
+    """Only runtime.compat_vllm itself needs a stub -- it's the sole module
+    in laguna.py's import chain that actually touches vllm at module level.
+    runtime.block_pool/logprobs/model_spec/sampling/nvfp4_* are all
+    self-written and vllm-free; importing them for real (rather than faking
+    them with e.g. an argument-less placeholder class for ChunkedPrefillState)
+    is both simpler and avoids tests silently exercising a fake that doesn't
+    match the real class's construction contract.
+
+    Each test below does its own `from runtime.backends.laguna import ...`
+    (rather than this function injecting names into module globals) so
+    ruff's static F821 check can see where every name comes from."""
+    global _MODULES_BEFORE
+    _MODULES_BEFORE = frozenset(sys.modules)
+
+    _compat = types.ModuleType("runtime.compat_vllm")
+    for attr in [
+        "VllmConfig", "bind_kv_cache", "get_distributed_init_method",
+        "get_model", "get_open_port", "init_worker_distributed_environment",
+        "set_current_vllm_config", "set_forward_context",
+        "get_flashinfer_metadata_builder", "get_common_attn_metadata_cls",
+        "init_flashinfer_workspace",
+    ]:
+        setattr(_compat, attr, None)
+    _install_stub("runtime.compat_vllm", _compat)
+
+
+def teardown_module() -> None:
+    """Undo everything installed/imported in setup_module() (stubs AND
+    anything that transitively imported against them, e.g.
+    runtime.backends.laguna) so later test files (in the same pytest
+    process) see the real runtime.compat_vllm etc. instead of this file's
+    deliberately-incomplete stand-ins, or a laguna.py module object built
+    from them."""
+    for mod_name in list(sys.modules):
+        if mod_name not in _MODULES_BEFORE and mod_name.startswith("runtime."):
+            sys.modules.pop(mod_name, None)
 
 
 class TestRingBlocksFormula:
     """Verify ring_blocks = cdiv(window - 1 + qo_max, block_size) + 1."""
 
     def test_qo1_window512_bs16(self):
+        from runtime.backends.laguna import _ring_blocks_for_window
+
         assert _ring_blocks_for_window(512, 16, qo_max=1) == 33
 
     def test_qo16_window512_bs16(self):
+        from runtime.backends.laguna import _ring_blocks_for_window
+
         # 审查阻断①: DFlash verify qo=16
         assert _ring_blocks_for_window(512, 16, qo_max=16) == 34
 
     def test_default_qo_max_is_16(self):
+        from runtime.backends.laguna import SWA_QO_MAX, _ring_blocks_for_window
+
         assert SWA_QO_MAX == 16
         assert _ring_blocks_for_window(512, 16) == 34
 
     def test_ring_slots_cover_max_span(self):
+        from runtime.backends.laguna import _ring_blocks_for_window
+
         window, bs, qo_max = 512, 16, 16
         rb = _ring_blocks_for_window(window, bs, qo_max)
         ring_slots = rb * bs
@@ -75,6 +93,8 @@ class TestRingBlocksFormula:
         assert ring_slots >= max_span
 
     def test_various_windows(self):
+        from runtime.backends.laguna import _ring_blocks_for_window
+
         for window in [128, 256, 512, 1024, 2048]:
             for qo in [1, 16]:
                 rb = _ring_blocks_for_window(window, 16, qo)
@@ -185,5 +205,7 @@ class TestSlabCopyLogic:
 
 class TestPhysicalSlot:
     def test_offset(self):
+        from runtime.backends.laguna import RESERVED_PHYSICAL_SLOTS, _physical_slot
+
         assert _physical_slot(0) == RESERVED_PHYSICAL_SLOTS
         assert _physical_slot(3) == 3 + RESERVED_PHYSICAL_SLOTS
