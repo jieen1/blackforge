@@ -1,0 +1,19 @@
+{
+  "date": "2026-07-23T19:44:08",
+  "model": "poolside/Laguna-S-2.1-NVFP4",
+  "draft": "poolside/Laguna-S-2.1-DFlash-NVFP4",
+  "k": 15,
+  "label": "kernel_scan_longctx",
+  "dflash": true,
+  "cuda_graph": true,
+  "configs": [
+    {
+      "moe_backend": "flashinfer_cutlass",
+      "error": "Engine core initialization failed. See root cause above. Failed core proc(s): {}"
+    },
+    {
+      "moe_backend": "flashinfer_trtllm",
+      "error": "Engine core initialization failed. See root cause above. Failed core proc(s): {}"
+    }
+  ]
+}

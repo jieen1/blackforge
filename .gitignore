@@ -59,3 +59,9 @@ notes/2026-07-2*-session*.md
 *.safetensors
 *.bin
 *.gguf
+
+# Local agent / tooling state
+.claude/
+
+# vLLM FlashInfer autotune cache (local, reproducible)
+.autotune_cache/

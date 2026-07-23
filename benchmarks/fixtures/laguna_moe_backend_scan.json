@@ -1,0 +1,38 @@
+{
+  "date": "2026-07-23T19:06:48",
+  "backends": {
+    "flashinfer_cutlass": {
+      "backend": "flashinfer_cutlass",
+      "load_s": 57.3,
+      "combos": {
+        "b1": {
+          "wall_ms": 58.53,
+          "gemm_ms": 9.372,
+          "gemm_family": {
+            "nvjet": 4.988,
+            "cutlass": 4.328,
+            "other_gemm": 0.056
+          }
+        },
+        "b4": {
+          "wall_ms": 65.836,
+          "gemm_ms": 9.677,
+          "gemm_family": {
+            "nvjet": 4.808,
+            "cutlass": 4.813,
+            "other_gemm": 0.056
+          }
+        }
+      }
+    },
+    "marlin": {
+      "error": "CUDA error: out of memory"
+    },
+    "flashinfer_trtllm": {
+      "error": "CUDA error: out of memory"
+    },
+    "vllm_cutlass": {
+      "error": "CUDA error: out of memory"
+    }
+  }
+}

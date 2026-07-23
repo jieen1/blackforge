@@ -1,0 +1,37 @@
+{
+  "date": "2026-07-23T20:09:01",
+  "model": "poolside/Laguna-S-2.1-NVFP4",
+  "draft": "poolside/Laguna-S-2.1-DFlash-NVFP4",
+  "k": 15,
+  "label": "dflash_on",
+  "dflash": true,
+  "cuda_graph": true,
+  "configs": [
+    {
+      "moe_backend": "flashinfer_cutlass",
+      "dflash": true,
+      "cuda_graph": true,
+      "load_s": 411.7,
+      "ctx": {
+        "ctx65536": {
+          "seqs1": {
+            "wall_s": 0.697,
+            "total_out_tokens": 256,
+            "accepted_tok_s": 367.3,
+            "itl_ms_per_seq": 2.72,
+            "num_seqs": 1
+          }
+        },
+        "ctx131072": {
+          "seqs1": {
+            "wall_s": 0.823,
+            "total_out_tokens": 256,
+            "accepted_tok_s": 311.0,
+            "itl_ms_per_seq": 3.22,
+            "num_seqs": 1
+          }
+        }
+      }
+    }
+  ]
+}
