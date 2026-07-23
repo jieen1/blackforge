@@ -36,6 +36,15 @@ logger = logging.getLogger("qwen_sm120_runtime.laguna_backend")
 
 RESERVED_PHYSICAL_SLOTS = 1
 
+# Ring KV for SWA layers: parameterized for DFlash verify qo_max=16
+# Formula: cdiv(window - 1 + qo_max, block_size) + 1
+# qo_max=1 → 33, qo_max=16 → 34 (审查阻断①)
+SWA_QO_MAX = 16
+
+
+def _ring_blocks_for_window(window: int, block_size: int, qo_max: int = SWA_QO_MAX) -> int:
+    return -(-( window - 1 + qo_max) // block_size) + 1  # cdiv + 1
+
 
 def _physical_slot(slot: int) -> int:
     return slot + RESERVED_PHYSICAL_SLOTS
@@ -153,22 +162,70 @@ class LagunaBackend:
                 )
                 self._metadata_builders[group_key] = builder
 
-        # Allocate KV caches
+        # ── Classify layers: full attention vs SWA ──
         cache_dtype_str = vllm_config.cache_config.cache_dtype
         self._cache_dtype_str = cache_dtype_str
-        num_blocks = (num_slots + RESERVED_PHYSICAL_SLOTS) * blocks_per_slot
+        self._full_layer_names: list[str] = []
+        self._swa_layer_names: list[str] = []
+        self._swa_window: int = 0
+        for name in self.attn_layer_names:
+            layer = sfc[name]
+            spec = layer.get_kv_cache_spec(vllm_config)
+            spec_cls = type(spec).__name__
+            if spec_cls == "SlidingWindowSpec":
+                self._swa_layer_names.append(name)
+                self._swa_window = spec.sliding_window
+            else:
+                self._full_layer_names.append(name)
+
+        self._ring_blocks_per_slot = (
+            _ring_blocks_for_window(self._swa_window, block_size)
+            if self._swa_window > 0
+            else 0
+        )
+        self._ring_slots_per_slot = self._ring_blocks_per_slot * block_size
+        logger.info(
+            "Laguna: %d full layers, %d SWA layers (window=%d, ring_blocks=%d/slot)",
+            len(self._full_layer_names),
+            len(self._swa_layer_names),
+            self._swa_window,
+            self._ring_blocks_per_slot,
+        )
+
+        # ── Allocate KV caches: per-group ──
+        num_phys = num_slots + RESERVED_PHYSICAL_SLOTS
+        full_num_blocks = num_phys * blocks_per_slot
+        ring_num_blocks = num_phys * self._ring_blocks_per_slot
         self.kv_caches: dict[str, torch.Tensor] = {}
         for name in self.attn_layer_names:
             layer = sfc[name]
             backend_cls = layer.get_attn_backend()
+            is_swa = name in self._swa_layer_names
+            n_blocks = ring_num_blocks if is_swa else full_num_blocks
             shape = backend_cls.get_kv_cache_shape(
-                num_blocks, block_size, layer.num_kv_heads, layer.head_size, cache_dtype_str
+                n_blocks, block_size, layer.num_kv_heads, layer.head_size, cache_dtype_str
             )
             self.kv_caches[name] = torch.zeros(
                 shape, dtype=layer.kv_cache_torch_dtype, device=self.device
             )
         runner_kv_caches: list[torch.Tensor] = []
         bind_kv_cache(self.kv_caches, sfc, runner_kv_caches)
+
+        # ── Persistent prefill scratch for SWA layers (审查非阻断③) ──
+        # Allocated once, reused across slots. Not zeroed (causal mask
+        # guarantees no read-before-write within the window).
+        self._swa_scratch: dict[str, torch.Tensor] = {}
+        if self._swa_layer_names:
+            for name in self._swa_layer_names:
+                layer = sfc[name]
+                backend_cls = layer.get_attn_backend()
+                shape = backend_cls.get_kv_cache_shape(
+                    blocks_per_slot, block_size, layer.num_kv_heads,
+                    layer.head_size, cache_dtype_str,
+                )
+                self._swa_scratch[name] = torch.empty(
+                    shape, dtype=layer.kv_cache_torch_dtype, device=self.device
+                )
 
         # Per-slot state
         self.slot_kv_len: list[int] = [0] * num_slots
@@ -194,6 +251,18 @@ class LagunaBackend:
         # query_start_loc: [0, 1, 2, ..., batch_size] for decode (qo_len=1)
         self._decode_qsl_gpu = torch.arange(max_batch + 1, dtype=torch.int32, device=self.device)
         self._decode_qsl_cpu = torch.arange(max_batch + 1, dtype=torch.int32, pin_memory=True)
+
+        # SWA ring decode buffers (separate from full-attention buffers)
+        if self._ring_blocks_per_slot > 0:
+            self._swa_decode_block_table = torch.zeros(
+                max_batch, self._ring_blocks_per_slot, dtype=torch.int32, device=self.device
+            )
+            self._swa_decode_slot_mapping = torch.zeros(
+                max_batch, dtype=torch.long, device=self.device
+            )
+            self._swa_decode_seq_lens = torch.zeros(
+                max_batch, dtype=torch.int32, device=self.device
+            )
 
         # Expose for engine compatibility
         self.num_speculative_tokens = 0
@@ -229,27 +298,61 @@ class LagunaBackend:
         token_ids: list[int],
         kv_lengths: list[int],
     ) -> None:
-        """Fill pre-allocated buffers for decode (avoids per-step tensor allocation)."""
+        """Fill pre-allocated buffers for decode (avoids per-step tensor allocation).
+
+        Full-attention layers: standard contiguous block_table.
+        SWA layers: ring block_table (block-aligned window) + ring slot_mapping.
+        """
         batch_size = len(slot_ids)
+        bs = self.block_size
         for i in range(batch_size):
             self._decode_input_ids[i] = token_ids[i]
             self._decode_positions[i] = kv_lengths[i]
             self._decode_seq_lens[i] = kv_lengths[i] + 1
 
             phys = _physical_slot(slot_ids[i])
-            base = phys * self.blocks_per_slot
+            pos = kv_lengths[i]
             new_kv_len = kv_lengths[i] + 1
-            n_blocks = (new_kv_len + self.block_size - 1) // self.block_size
+
+            # ── Full-attention block_table / slot_mapping ──
+            full_base = phys * self.blocks_per_slot
+            n_blocks = (new_kv_len + bs - 1) // bs
             self._decode_block_table[i, :n_blocks] = torch.arange(
-                base, base + n_blocks, dtype=torch.int32, device=self.device
+                full_base, full_base + n_blocks, dtype=torch.int32, device=self.device
             )
             if n_blocks < self.blocks_per_slot:
                 self._decode_block_table[i, n_blocks:] = 0
+            self._decode_slot_mapping[i] = (
+                (full_base + pos // bs) * bs + pos % bs
+            )
 
-            pos = kv_lengths[i]
-            bid = base + pos // self.block_size
-            off = pos % self.block_size
-            self._decode_slot_mapping[i] = bid * self.block_size + off
+            # ── SWA ring block_table / slot_mapping ──
+            if self._ring_blocks_per_slot > 0:
+                ring_base = phys * self._ring_blocks_per_slot
+                ring_slots = self._ring_slots_per_slot
+                window = self._swa_window
+
+                # Block-aligned window start
+                window_start = max(0, pos - window + 1)
+                aligned_start = (window_start // bs) * bs
+                aligned_len = pos + 1 - aligned_start
+                n_ring = (aligned_len + bs - 1) // bs
+
+                for j in range(n_ring):
+                    actual_pos = aligned_start + j * bs
+                    ring_block = (actual_pos % ring_slots) // bs
+                    self._swa_decode_block_table[i, j] = ring_base + ring_block
+                if n_ring < self._ring_blocks_per_slot:
+                    self._swa_decode_block_table[i, n_ring:] = 0
+
+                self._swa_decode_seq_lens[i] = aligned_len
+
+                # Ring slot_mapping for the new decode token
+                ring_block = (pos % ring_slots) // bs
+                ring_off = pos % bs
+                self._swa_decode_slot_mapping[i] = (
+                    (ring_base + ring_block) * bs + ring_off
+                )
 
     def _build_common_attn_metadata(
         self,
@@ -258,18 +361,15 @@ class LagunaBackend:
         qo_lens: list[int],
         is_decode: bool,
     ):
-        """Build CommonAttentionMetadata for vLLM's FlashInferMetadataBuilder."""
+        """Build CommonAttentionMetadata for full-attention layers."""
         from runtime.compat_vllm import get_common_attn_metadata_cls
         CommonAttentionMetadata = get_common_attn_metadata_cls()
 
         num_reqs = len(slot_ids)
         num_actual_tokens = sum(qo_lens)
         page_size = self.block_size
-
-        # New KV lengths (after this forward)
         new_kv_lens = [kv_len + qo for kv_len, qo in zip(kv_lengths, qo_lens)]
 
-        # query_start_loc (use pre-allocated for decode)
         if is_decode and max(qo_lens) == 1:
             query_start_loc = self._decode_qsl_gpu[:num_reqs + 1]
             query_start_loc_cpu = self._decode_qsl_cpu[:num_reqs + 1]
@@ -279,18 +379,14 @@ class LagunaBackend:
             query_start_loc = torch.from_numpy(qo_indptr).to(self.device)
             query_start_loc_cpu = torch.from_numpy(qo_indptr)
 
-        # Use pre-allocated buffers for decode, allocate for prefill
         if is_decode and max(qo_lens) == 1:
             seq_lens = self._decode_seq_lens[:num_reqs]
             max_blocks = max((kvl + page_size - 1) // page_size for kvl in new_kv_lens)
             block_table = self._decode_block_table[:num_reqs, :max_blocks]
             slot_mapping = self._decode_slot_mapping[:num_reqs]
         else:
-            # seq_lens (new KV lengths)
             seq_lens_np = np.array(new_kv_lens, dtype=np.int32)
             seq_lens = torch.from_numpy(seq_lens_np).to(self.device)
-
-            # block_table_tensor: [num_reqs, max_blocks_per_req]
             max_blocks = max((kvl + page_size - 1) // page_size for kvl in new_kv_lens)
             block_table = torch.zeros(num_reqs, max_blocks, dtype=torch.int32, device=self.device)
             for i, (slot, n_blocks) in enumerate(
@@ -300,8 +396,6 @@ class LagunaBackend:
                 base = phys * self.blocks_per_slot
                 for j in range(n_blocks):
                     block_table[i, j] = base + j
-
-            # slot_mapping
             mappings = []
             for slot, kv_len, qo in zip(slot_ids, kv_lengths, qo_lens):
                 phys = _physical_slot(slot)
@@ -320,6 +414,74 @@ class LagunaBackend:
             num_actual_tokens=num_actual_tokens,
             max_query_len=max(qo_lens),
             max_seq_len=max(new_kv_lens),
+            block_table_tensor=block_table,
+            slot_mapping=slot_mapping,
+            causal=True,
+        )
+
+    def _build_swa_attn_metadata(
+        self,
+        slot_ids: list[int],
+        kv_lengths: list[int],
+        qo_lens: list[int],
+        is_decode: bool,
+    ):
+        """Build CommonAttentionMetadata for SWA layers (ring block_table)."""
+        from runtime.compat_vllm import get_common_attn_metadata_cls
+        CommonAttentionMetadata = get_common_attn_metadata_cls()
+
+        num_reqs = len(slot_ids)
+        num_actual_tokens = sum(qo_lens)
+        bs = self.block_size
+        ring_slots = self._ring_slots_per_slot
+
+        if is_decode and max(qo_lens) == 1:
+            query_start_loc = self._decode_qsl_gpu[:num_reqs + 1]
+            query_start_loc_cpu = self._decode_qsl_cpu[:num_reqs + 1]
+            seq_lens = self._swa_decode_seq_lens[:num_reqs]
+            max_blocks = max(
+                int(self._swa_decode_seq_lens[i].item()) for i in range(num_reqs)
+            )
+            max_blocks = (max_blocks + bs - 1) // bs
+            block_table = self._swa_decode_block_table[:num_reqs, :max_blocks]
+            slot_mapping = self._swa_decode_slot_mapping[:num_reqs]
+            max_seq = int(seq_lens.max().item())
+        else:
+            # Prefill: use full block_table (scratch KV is full-size)
+            qo_indptr = np.zeros(num_reqs + 1, dtype=np.int32)
+            np.cumsum(qo_lens, dtype=np.int32, out=qo_indptr[1:])
+            query_start_loc = torch.from_numpy(qo_indptr).to(self.device)
+            query_start_loc_cpu = torch.from_numpy(qo_indptr)
+
+            new_kv_lens = [kv_len + qo for kv_len, qo in zip(kv_lengths, qo_lens)]
+            seq_lens_np = np.array(new_kv_lens, dtype=np.int32)
+            seq_lens = torch.from_numpy(seq_lens_np).to(self.device)
+            max_blocks = max((kvl + bs - 1) // bs for kvl in new_kv_lens)
+            block_table = torch.zeros(num_reqs, max_blocks, dtype=torch.int32, device=self.device)
+            for i, (slot, n_blocks) in enumerate(
+                zip(slot_ids, [(kvl + bs - 1) // bs for kvl in new_kv_lens])
+            ):
+                # Prefill scratch uses contiguous blocks [0, blocks_per_slot)
+                for j in range(n_blocks):
+                    block_table[i, j] = j
+            mappings = []
+            for slot, kv_len, qo in zip(slot_ids, kv_lengths, qo_lens):
+                for j in range(qo):
+                    pos = kv_len + j
+                    bid = pos // bs
+                    off = pos % bs
+                    mappings.append(bid * bs + off)
+            slot_mapping = torch.tensor(mappings, dtype=torch.long, device=self.device)
+            max_seq = max(new_kv_lens)
+
+        return CommonAttentionMetadata(
+            query_start_loc=query_start_loc,
+            query_start_loc_cpu=query_start_loc_cpu,
+            seq_lens=seq_lens,
+            num_reqs=num_reqs,
+            num_actual_tokens=num_actual_tokens,
+            max_query_len=max(qo_lens),
+            max_seq_len=max_seq,
             block_table_tensor=block_table,
             slot_mapping=slot_mapping,
             causal=True,
@@ -346,18 +508,28 @@ class LagunaBackend:
         )
 
         # Build per-group FlashInferMetadata using vLLM's builder
+        # SWA groups use ring metadata; full groups use standard metadata
         attn_metadata_dict: dict[str, Any] = {}
         slot_mapping_dict: dict[str, torch.Tensor] = {}
 
+        swa_meta = None
+        if self._ring_blocks_per_slot > 0 and self._swa_layer_names:
+            swa_meta = self._build_swa_attn_metadata(
+                slot_ids, kv_lengths, qo_lens, is_decode
+            )
+
         for group_key, builder in self._metadata_builders.items():
+            wl = group_key[0]
+            is_swa_group = wl >= 0
+            meta = swa_meta if (is_swa_group and swa_meta is not None) else common_meta
             with set_current_vllm_config(self.vllm_config):
                 metadata = builder.build(
                     common_prefix_len=0,
-                    common_attn_metadata=common_meta,
+                    common_attn_metadata=meta,
                 )
             for name in self._layer_groups[group_key]:
                 attn_metadata_dict[name] = metadata
-                slot_mapping_dict[name] = common_meta.slot_mapping
+                slot_mapping_dict[name] = meta.slot_mapping
 
         # Build input tensors (use pre-allocated buffers for decode)
         if is_decode and qo_len == 1:
@@ -385,15 +557,76 @@ class LagunaBackend:
         logits = self.model.compute_logits(hidden_states)
         return logits
 
+    def _prefill_with_swa_scratch(
+        self, slot: int, prompt_ids: list[int]
+    ) -> torch.Tensor:
+        """Run prefill with SWA layers rebound to scratch, then copy to ring."""
+        sfc = self.static_forward_context
+        bs = self.block_size
+
+        # Rebind SWA layers to scratch KV
+        if self._swa_scratch:
+            for name in self._swa_layer_names:
+                sfc[name].kv_cache = self._swa_scratch[name]
+
+        logits = self._forward(
+            [slot], prompt_ids, [0], qo_len=len(prompt_ids), is_decode=False
+        )
+
+        # Copy last window from scratch to ring — slab copy (审查非阻断④)
+        # At most 3 contiguous slabs due to ring wrap-around.
+        if self._swa_scratch:
+            prompt_len = len(prompt_ids)
+            window = self._swa_window
+            ring_slots = self._ring_slots_per_slot
+            phys = _physical_slot(slot)
+            ring_base = phys * self._ring_blocks_per_slot
+            window_start = max(0, prompt_len - window)
+            n_copy = prompt_len - window_start
+
+            # Build slab list: [(src_start_pos, dst_ring_slot, count), ...]
+            slabs: list[tuple[int, int, int]] = []
+            pos = window_start
+            while pos < prompt_len:
+                ring_slot = pos % ring_slots
+                # How many consecutive positions fit before ring wraps?
+                until_wrap = ring_slots - ring_slot
+                # How many fit in the current scratch block?
+                src_off = pos % bs
+                until_block_end = bs - src_off
+                count = min(until_wrap, until_block_end, prompt_len - pos)
+                slabs.append((pos, ring_slot, count))
+                pos += count
+
+            for name in self._swa_layer_names:
+                scratch = self._swa_scratch[name]
+                ring = self.kv_caches[name]
+                for src_pos, dst_ring_slot, count in slabs:
+                    sb = src_pos // bs
+                    so = src_pos % bs
+                    db = dst_ring_slot // bs + ring_base
+                    do = dst_ring_slot % bs
+                    # scratch[sb, :, so:so+count] → ring[db, :, do:do+count]
+                    ring[db, :, do:do + count] = scratch[sb, :, so:so + count]
+
+            # Rebind SWA layers back to ring KV
+            for name in self._swa_layer_names:
+                sfc[name].kv_cache = self.kv_caches[name]
+
+        return logits
+
     def prefill(self, slot: int, prompt_ids: list[int]) -> int:
         """Prefill prompt and return the greedy first token."""
         if self.slot_kv_len[slot] != 0:
             raise RuntimeError(
                 f"slot {slot} is not fresh (kv_len={self.slot_kv_len[slot]})"
             )
-        logits = self._forward(
-            [slot], prompt_ids, [0], qo_len=len(prompt_ids), is_decode=False
-        )
+        if self._swa_scratch:
+            logits = self._prefill_with_swa_scratch(slot, prompt_ids)
+        else:
+            logits = self._forward(
+                [slot], prompt_ids, [0], qo_len=len(prompt_ids), is_decode=False
+            )
         first_token = int(logits[-1].argmax(dim=-1).item())
         self.slot_kv_len[slot] = len(prompt_ids)
         self.slot_committed_tokens[slot] = list(prompt_ids) + [first_token]
@@ -406,9 +639,12 @@ class LagunaBackend:
             raise RuntimeError(
                 f"slot {slot} is not fresh (kv_len={self.slot_kv_len[slot]})"
             )
-        logits = self._forward(
-            [slot], prompt_ids, [0], qo_len=len(prompt_ids), is_decode=False
-        )
+        if self._swa_scratch:
+            logits = self._prefill_with_swa_scratch(slot, prompt_ids)
+        else:
+            logits = self._forward(
+                [slot], prompt_ids, [0], qo_len=len(prompt_ids), is_decode=False
+            )
         last_logits = logits[-1].unsqueeze(0)
         gen = make_generator(params.seed)
         first_token = int(
@@ -495,10 +731,17 @@ class LagunaBackend:
         self.slot_kv_len[slot] = 0
         self.slot_committed_tokens[slot] = []
         phys = _physical_slot(slot)
-        start = phys * self.blocks_per_slot
-        end = start + self.blocks_per_slot
-        for cache in self.kv_caches.values():
-            cache[start:end].zero_()
+        # Full-attention layers: clear blocks_per_slot blocks
+        full_start = phys * self.blocks_per_slot
+        full_end = full_start + self.blocks_per_slot
+        for name in self._full_layer_names:
+            self.kv_caches[name][full_start:full_end].zero_()
+        # SWA layers: clear only ring_blocks_per_slot blocks
+        if self._ring_blocks_per_slot > 0:
+            ring_start = phys * self._ring_blocks_per_slot
+            ring_end = ring_start + self._ring_blocks_per_slot
+            for name in self._swa_layer_names:
+                self.kv_caches[name][ring_start:ring_end].zero_()
 
     def reconcile_prefix_hit(self, token_ids: list[int]) -> int:
         """E1 stub: Laguna has no persistent content-addressed prefix cache

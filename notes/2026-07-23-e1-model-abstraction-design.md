@@ -122,3 +122,12 @@ B5 模块化（已提取 4 域：block_pool / metadata_builders / cuda_graphs / 
 ---
 
 *设计于 2026-07-23；基于 4574 行 runner 的实际耦合分析。*
+
+## 缓存物种（前向兼容占位，审查非阻断⑥）
+
+| 缓存物种 | 后端 | 状态 | 接口 |
+|---|---|---|---|
+| Full paged KV | LagunaBackend (12 full layers) | 已实现 | `kv_caches[name][block_table]` |
+| SWA ring KV | LagunaBackend (36 SWA layers) | 已实现 | `kv_caches[name][ring_block_table]`, window=512, ring_blocks=34 |
+| 前缀缓存（content-addressed） | — | TODO | 需「窗口快照」原语：SWA 层只保留窗口内 KV，前缀命中需额外快照机制（与 Qwen GDN checkpoint R1 同构） |
+| Session affinity KV 保留 | — | TODO | 依赖前缀缓存 |

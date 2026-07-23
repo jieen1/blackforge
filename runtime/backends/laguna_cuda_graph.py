@@ -54,18 +54,33 @@ class LagunaCudaGraphDecode:
         self._positions = torch.zeros(batch_size, dtype=torch.long, device=self.device)
         self._slot_mapping = torch.zeros(batch_size, dtype=torch.long, device=self.device)
 
-        # ── FlashInfer cudagraph buffers per layer group ──
-        # indptr: [batch_size + 1], indices: [batch_size * blocks_per_slot],
-        # last_page_len: [batch_size]
+        # ── FlashInfer cudagraph buffers (full-attention groups) ──
         max_pages = batch_size * self.blocks_per_slot
         self._fi_indptr_cpu = torch.zeros(batch_size + 1, dtype=torch.int32, pin_memory=True)
         self._fi_indptr_gpu = torch.zeros(batch_size + 1, dtype=torch.int32, device=self.device)
         self._fi_indices_gpu = torch.zeros(max_pages, dtype=torch.int32, device=self.device)
         self._fi_last_page_len_cpu = torch.zeros(batch_size, dtype=torch.int32, pin_memory=True)
         self._fi_last_page_len_gpu = torch.zeros(batch_size, dtype=torch.int32, device=self.device)
-        # Staging buffer: write here first, then copy to pinned → GPU.
-        # Prevents race if .item() sync is removed in future optimization.
         self._fi_last_page_len_staging = torch.zeros(batch_size, dtype=torch.int32)
+
+        # ── SWA ring buffers (separate from full-attention) ──
+        rbps = backend._ring_blocks_per_slot
+        self._ring_blocks_per_slot = rbps
+        self._ring_slots_per_slot = rbps * self.block_size
+        self._swa_window = backend._swa_window
+        if rbps > 0:
+            swa_max_pages = batch_size * rbps
+            self._swa_fi_indptr_cpu = torch.zeros(batch_size + 1, dtype=torch.int32, pin_memory=True)
+            self._swa_fi_indptr_gpu = torch.zeros(batch_size + 1, dtype=torch.int32, device=self.device)
+            self._swa_fi_indices_gpu = torch.zeros(swa_max_pages, dtype=torch.int32, device=self.device)
+            self._swa_fi_last_page_len_cpu = torch.zeros(batch_size, dtype=torch.int32, pin_memory=True)
+            self._swa_fi_last_page_len_gpu = torch.zeros(batch_size, dtype=torch.int32, device=self.device)
+            self._swa_fi_last_page_len_staging = torch.zeros(batch_size, dtype=torch.int32)
+            self._swa_slot_mapping = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+            self._swa_block_table = torch.zeros(
+                batch_size, rbps, dtype=torch.int32, device=self.device
+            )
+            self._swa_prev_n_blocks: list[int] = [0] * batch_size
 
         # ── CommonAttentionMetadata pre-allocated fields ──
         self._qsl_gpu = torch.arange(batch_size + 1, dtype=torch.int32, device=self.device)
@@ -88,6 +103,7 @@ class LagunaCudaGraphDecode:
 
         Each wrapper gets its OWN workspace buffer (not shared with the eager
         builder) to prevent prefill from polluting decode's scheduling area.
+        SWA groups get separate indptr/indices/last_page_len buffers (ring KV).
         """
         from flashinfer.decode import BatchDecodeWithPagedKVCacheWrapper
 
@@ -100,13 +116,23 @@ class LagunaCudaGraphDecode:
                 dtype=torch.uint8,
                 device=self.device,
             )
+            wl = group_key[0]
+            is_swa = wl >= 0 and self._ring_blocks_per_slot > 0
+            if is_swa:
+                indptr_buf = self._swa_fi_indptr_gpu[:bs + 1]
+                indices_buf = self._swa_fi_indices_gpu
+                lpl_buf = self._swa_fi_last_page_len_gpu[:bs]
+            else:
+                indptr_buf = self._fi_indptr_gpu[:bs + 1]
+                indices_buf = self._fi_indices_gpu
+                lpl_buf = self._fi_last_page_len_gpu[:bs]
             wrapper = BatchDecodeWithPagedKVCacheWrapper(
                 workspace,
-                "NHD",  # kv_layout
+                "NHD",
                 use_cuda_graph=True,
-                paged_kv_indptr_buffer=self._fi_indptr_gpu[:bs + 1],
-                paged_kv_indices_buffer=self._fi_indices_gpu,
-                paged_kv_last_page_len_buffer=self._fi_last_page_len_gpu[:bs],
+                paged_kv_indptr_buffer=indptr_buf,
+                paged_kv_indices_buffer=indices_buf,
+                paged_kv_last_page_len_buffer=lpl_buf,
                 use_tensor_cores=True,
             )
             self._decode_wrappers[group_key] = wrapper
@@ -159,6 +185,43 @@ class LagunaCudaGraphDecode:
         self._fi_indptr_gpu[:bs + 1].copy_(self._fi_indptr_cpu[:bs + 1], non_blocking=True)
         self._fi_last_page_len_gpu[:bs].copy_(self._fi_last_page_len_cpu[:bs], non_blocking=True)
 
+        # ── SWA ring buffers ──
+        if self._ring_blocks_per_slot > 0:
+            rbps = self._ring_blocks_per_slot
+            ring_slots = self._ring_slots_per_slot
+            window = self._swa_window
+            self._swa_fi_indptr_cpu[0] = 0
+            for i in range(bs):
+                phys = _physical_slot(slot_ids[i])
+                ring_base = phys * rbps
+                pos = kv_lengths[i]
+                new_kv = pos + 1
+
+                window_start = max(0, pos - window + 1)
+                aligned_start = (window_start // ps) * ps
+                aligned_len = new_kv - aligned_start
+                n_ring = (aligned_len + ps - 1) // ps
+
+                for j in range(n_ring):
+                    actual = aligned_start + j * ps
+                    rb = (actual % ring_slots) // ps
+                    self._swa_block_table[i, j] = ring_base + rb
+
+                rb_dec = (pos % ring_slots) // ps
+                ro_dec = pos % ps
+                self._swa_slot_mapping[i] = (ring_base + rb_dec) * ps + ro_dec
+
+                lpl = aligned_len % ps
+                self._swa_fi_last_page_len_staging[i] = lpl if lpl != 0 else ps
+
+                self._swa_fi_indptr_cpu[i + 1] = self._swa_fi_indptr_cpu[i] + n_ring
+                start = int(self._swa_fi_indptr_cpu[i].item())
+                self._swa_fi_indices_gpu[start:start + n_ring] = self._swa_block_table[i, :n_ring]
+
+            self._swa_fi_last_page_len_cpu[:bs].copy_(self._swa_fi_last_page_len_staging[:bs])
+            self._swa_fi_indptr_gpu[:bs + 1].copy_(self._swa_fi_indptr_cpu[:bs + 1], non_blocking=True)
+            self._swa_fi_last_page_len_gpu[:bs].copy_(self._swa_fi_last_page_len_cpu[:bs], non_blocking=True)
+
     def _run_plan(self, slot_ids: list[int], kv_lengths: list[int]) -> None:
         """Run fast_decode_plan on all layer group wrappers."""
         from vllm.v1.attention.backends.flashinfer import fast_plan_decode
@@ -172,15 +235,25 @@ class LagunaCudaGraphDecode:
             head_dim = backend.head_dim
             page_size = self.block_size
 
-            # Determine kv_cache_dtype
             kv_dtype = torch.float8_e4m3fn if "fp8" in backend._cache_dtype_str else torch.bfloat16
+
+            # Per-group buffers: SWA uses ring buffers
+            is_swa = wl >= 0 and self._ring_blocks_per_slot > 0
+            if is_swa:
+                indptr_cpu = self._swa_fi_indptr_cpu[:bs + 1]
+                indices = self._swa_fi_indices_gpu
+                lpl_cpu = self._swa_fi_last_page_len_cpu[:bs]
+            else:
+                indptr_cpu = self._fi_indptr_cpu[:bs + 1]
+                indices = self._fi_indices_gpu
+                lpl_cpu = self._fi_last_page_len_cpu[:bs]
 
             builder_sm_scale = backend._metadata_builders[group_key].sm_scale
             fast_plan_decode(
                 wrapper,
-                indptr_cpu=self._fi_indptr_cpu[:bs + 1],
-                indices=self._fi_indices_gpu,
-                last_page_len_cpu=self._fi_last_page_len_cpu[:bs],
+                indptr_cpu=indptr_cpu,
+                indices=indices,
+                last_page_len_cpu=lpl_cpu,
                 num_qo_heads=nqh,
                 num_kv_heads=nkvh,
                 head_dim=head_dim,
@@ -214,9 +287,12 @@ class LagunaCudaGraphDecode:
         slot_mapping_dict: dict[str, torch.Tensor] = {}
 
         for group_key, wrapper in self._decode_wrappers.items():
+            wl = group_key[0]
+            is_swa = wl >= 0 and self._ring_blocks_per_slot > 0
+            sm = self._swa_slot_mapping[:bs] if is_swa else self._slot_mapping[:bs]
             metadata = FlashInferMetadata(
                 num_actual_tokens=bs,
-                slot_mapping=self._slot_mapping[:bs],
+                slot_mapping=sm,
                 q_data_type_prefill=torch.bfloat16,
                 q_data_type_decode=torch.bfloat16,
                 num_decodes=bs,
@@ -231,7 +307,7 @@ class LagunaCudaGraphDecode:
             )
             for name in backend._layer_groups[group_key]:
                 attn_metadata_dict[name] = metadata
-                slot_mapping_dict[name] = self._slot_mapping[:bs]
+                slot_mapping_dict[name] = sm
 
         with set_current_vllm_config(backend.vllm_config):
             with set_forward_context(
@@ -339,10 +415,56 @@ class LagunaCudaGraphDecode:
                     )
 
         self._fi_last_page_len_cpu[:bs].copy_(self._fi_last_page_len_staging[:bs])
-        # fast_decode_plan (cudagraph mode) does NOT copy CPU→GPU; caller must.
-        # These GPU buffers are the wrapper's fixed-address plan inputs.
         self._fi_indptr_gpu[:bs + 1].copy_(self._fi_indptr_cpu[:bs + 1], non_blocking=True)
         self._fi_last_page_len_gpu[:bs].copy_(self._fi_last_page_len_cpu[:bs], non_blocking=True)
+
+        # SWA ring update
+        if self._ring_blocks_per_slot > 0:
+            rbps = self._ring_blocks_per_slot
+            ring_slots = self._ring_slots_per_slot
+            window = self._swa_window
+            self._swa_fi_indptr_cpu[0] = 0
+            for i in range(bs):
+                phys = slot_ids[i] + 1
+                ring_base = phys * rbps
+                pos = kv_lengths[i]
+                new_kv = pos + 1
+                window_start = max(0, pos - window + 1)
+                aligned_start = (window_start // ps) * ps
+                aligned_len = new_kv - aligned_start
+                n_ring = (aligned_len + ps - 1) // ps
+
+                if n_ring != self._swa_prev_n_blocks[i]:
+                    self._swa_prev_n_blocks[i] = n_ring
+                    for j in range(n_ring):
+                        actual = aligned_start + j * ps
+                        rb = (actual % ring_slots) // ps
+                        self._swa_block_table[i, j] = ring_base + rb
+                    self._swa_fi_indptr_cpu[0] = 0
+                    for jj in range(bs):
+                        nb = self._swa_prev_n_blocks[jj]
+                        self._swa_fi_indptr_cpu[jj + 1] = self._swa_fi_indptr_cpu[jj] + nb
+                        p2 = slot_ids[jj] + 1
+                        rb2 = p2 * rbps
+                        ws2 = max(0, kv_lengths[jj] - window + 1)
+                        as2 = (ws2 // ps) * ps
+                        al2 = kv_lengths[jj] + 1 - as2
+                        nr2 = (al2 + ps - 1) // ps
+                        st = int(self._swa_fi_indptr_cpu[jj].item())
+                        for k in range(nr2):
+                            ap = as2 + k * ps
+                            self._swa_fi_indices_gpu[st + k] = rb2 + (ap % ring_slots) // ps
+
+                rb_dec = (pos % ring_slots) // ps
+                ro_dec = pos % ps
+                self._swa_slot_mapping[i] = (ring_base + rb_dec) * ps + ro_dec
+                lpl = aligned_len % ps
+                self._swa_fi_last_page_len_staging[i] = lpl if lpl != 0 else ps
+
+            self._swa_fi_last_page_len_cpu[:bs].copy_(self._swa_fi_last_page_len_staging[:bs])
+            self._swa_fi_indptr_gpu[:bs + 1].copy_(self._swa_fi_indptr_cpu[:bs + 1], non_blocking=True)
+            self._swa_fi_last_page_len_gpu[:bs].copy_(self._swa_fi_last_page_len_cpu[:bs], non_blocking=True)
+
         self._run_plan(slot_ids, kv_lengths)
         self._graph.replay()
 
@@ -383,13 +505,20 @@ class LagunaCudaGraphDecode:
         out_tokens_gpu[0] = first_token
         self._input_ids[0] = first_token
 
-        n_generated = max_tokens
         for step in range(max_tokens - 1):
             kvl = backend.slot_kv_len[slot]
             new_kv = kvl + 1
 
             self._positions[0] = kvl
             self._slot_mapping[0] = base * ps + kvl
+
+            # SWA ring slot_mapping
+            if self._ring_blocks_per_slot > 0:
+                ring_base = phys * self._ring_blocks_per_slot
+                ring_slots = self._ring_slots_per_slot
+                rb = (kvl % ring_slots) // ps
+                ro = kvl % ps
+                self._swa_slot_mapping[0] = (ring_base + rb) * ps + ro
 
             lpl = new_kv % ps
             self._fi_last_page_len_staging[0] = lpl if lpl != 0 else ps
@@ -405,6 +534,34 @@ class LagunaCudaGraphDecode:
                 self._fi_indices_gpu[:n_blocks] = torch.arange(
                     base, base + n_blocks, dtype=torch.int32, device=self.device
                 )
+
+            # SWA ring block_table update
+            if self._ring_blocks_per_slot > 0:
+                rbps = self._ring_blocks_per_slot
+                ring_slots = self._ring_slots_per_slot
+                window = self._swa_window
+                ring_base_g = phys * rbps
+                ws = max(0, kvl - window + 1)
+                as_ = (ws // ps) * ps
+                al = new_kv - as_
+                nr = (al + ps - 1) // ps
+                if nr != self._swa_prev_n_blocks[0]:
+                    self._swa_prev_n_blocks[0] = nr
+                    for j in range(nr):
+                        ap = as_ + j * ps
+                        self._swa_block_table[0, j] = ring_base_g + (ap % ring_slots) // ps
+                    self._swa_fi_indptr_cpu[0] = 0
+                    self._swa_fi_indptr_cpu[1] = nr
+                    self._swa_fi_indices_gpu[:nr] = self._swa_block_table[0, :nr]
+                lpl_swa = al % ps
+                self._swa_fi_last_page_len_staging[0] = lpl_swa if lpl_swa != 0 else ps
+
+            # SWA last_page_len + indptr must be copied EVERY step
+            # (last_page_len changes every step, not just on block boundary)
+            if self._ring_blocks_per_slot > 0:
+                self._swa_fi_last_page_len_cpu[0] = self._swa_fi_last_page_len_staging[0]
+                self._swa_fi_indptr_gpu[:2].copy_(self._swa_fi_indptr_cpu[:2], non_blocking=True)
+                self._swa_fi_last_page_len_gpu[:1].copy_(self._swa_fi_last_page_len_cpu[:1], non_blocking=True)
 
             self._fi_last_page_len_cpu[0] = self._fi_last_page_len_staging[0]
             self._fi_indptr_gpu[:2].copy_(self._fi_indptr_cpu[:2], non_blocking=True)
@@ -436,9 +593,74 @@ class LagunaCudaGraphDecode:
         affecting the first replay (run1 vs run2 divergence).
         """
         self._prev_n_blocks = [0] * self.batch_size
+        if self._ring_blocks_per_slot > 0:
+            self._swa_prev_n_blocks = [0] * self.batch_size
         for ws in self._workspaces:
             ws.zero_()
 
     @property
     def is_captured(self) -> bool:
         return self._captured
+
+
+class MultiBatchGraphManager:
+    """Manages CUDA Graphs for batch_size=1..max_bs, dispatches by actual batch.
+
+    Production形态是多 slot 并发。每个 batch_size 捕获一张独立 graph，
+    运行时按实际 batch 大小选择对应 graph replay。
+    """
+
+    def __init__(self, backend: LagunaBackend, max_batch_size: int = 4) -> None:
+        self.backend = backend
+        self.max_batch_size = max_batch_size
+        self._graphs: dict[int, LagunaCudaGraphDecode] = {}
+
+    def capture_all(self) -> None:
+        """Capture graphs for all batch sizes 1..max_batch_size."""
+        for bs in range(1, self.max_batch_size + 1):
+            logger.info("Capturing graph for batch_size=%d", bs)
+            cg = LagunaCudaGraphDecode(self.backend, batch_size=bs)
+            cg.capture()
+            self._graphs[bs] = cg
+
+    def get(self, batch_size: int) -> LagunaCudaGraphDecode:
+        """Get the graph for a specific batch size."""
+        if batch_size not in self._graphs:
+            raise RuntimeError(
+                f"No graph captured for batch_size={batch_size}. "
+                f"Available: {sorted(self._graphs.keys())}"
+            )
+        return self._graphs[batch_size]
+
+    def replay(
+        self,
+        slot_ids: list[int],
+        token_ids: list[int],
+        kv_lengths: list[int],
+    ) -> list[int]:
+        """Dispatch to the correct batch-size graph."""
+        bs = len(slot_ids)
+        return self.get(bs).replay(slot_ids, token_ids, kv_lengths)
+
+    def generate(
+        self,
+        slot: int,
+        first_token: int,
+        max_tokens: int,
+        eos_tokens: tuple[int, ...] = (2, 24),
+    ) -> list[int]:
+        """Single-slot generate using bs=1 graph."""
+        return self.get(1).generate(slot, first_token, max_tokens, eos_tokens)
+
+    def reset(self, batch_size: int | None = None) -> None:
+        """Reset specific or all graphs."""
+        if batch_size is not None:
+            if batch_size in self._graphs:
+                self._graphs[batch_size].reset()
+        else:
+            for cg in self._graphs.values():
+                cg.reset()
+
+    @property
+    def captured_sizes(self) -> list[int]:
+        return sorted(self._graphs.keys())

@@ -1,0 +1,24 @@
+{
+  "model": "poolside/Laguna-S-2.1-NVFP4",
+  "full_layers": 12,
+  "swa_layers": 36,
+  "ring_blocks_per_slot": 34,
+  "prompt_tokens": 100,
+  "decode_steps": 50,
+  "eager_tokens": [
+    268,
+    398,
+    268,
+    398,
+    268,
+    398,
+    268,
+    398,
+    268,
+    398
+  ],
+  "eager_determinism": true,
+  "load_time_s": 58.7,
+  "eager_time_s": 7.17,
+  "gpu_mem_gib": 70.06
+}
