@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 """Laguna L2 质量链：oracle A/B 比对 + prompt ids 断言护栏。
 
-永久护栏：比对输出前，先断言两条路径的 prompt token ids 完全一致。
-任何分词路径偏差（如 add_special_tokens=False 跳过 BOS）会在此处立即失败，
-而不是在下游 logits 比对中变成难以定位的系统性偏移。
+两条路径在独立子进程中运行，避免 vLLM 全局状态污染。
 
 Usage:
     /home/bot/.venvs/vllm/bin/python -m benchmarks.laguna_quality_gate
@@ -12,8 +10,9 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
-import time
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -21,10 +20,8 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-os.environ.setdefault("USE_LIBUV", "0")
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
-
 MODEL = "poolside/Laguna-S-2.1-NVFP4"
+PYTHON = "/home/bot/.venvs/vllm/bin/python"
 
 GREEDY_PROMPTS = [
     "The capital of France is",
@@ -36,198 +33,201 @@ GREEDY_PROMPTS = [
 LAGUNA_EOS = (2, 24)
 MAX_DECODE_TOKENS = 80
 
+BACKEND_SCRIPT = '''
+import json, os, sys
+os.environ.setdefault("USE_LIBUV", "0")
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+sys.path.insert(0, {repo_root!r})
+MODEL = {model!r}
+PROMPTS = {prompts!r}
+EOS = {eos!r}
+MAX_TOK = {max_tok!r}
 
-def assert_prompt_ids_equal(
-    prompt: str,
-    ids_a: list[int],
-    ids_b: list[int],
-    path_a: str,
-    path_b: str,
-) -> None:
-    """永久护栏：断言两条路径的 prompt token ids 完全一致。"""
+import torch
+from transformers import AutoTokenizer
+from runtime.compat_vllm import EngineArgs
+from runtime.backends.laguna import LagunaBackend
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
+args = EngineArgs(model=MODEL, max_model_len=4096, gpu_memory_utilization=0.85,
+                  enforce_eager=True, dtype="bfloat16", disable_log_stats=True,
+                  async_scheduling=False)
+config = args.create_engine_config()
+backend = LagunaBackend(config, num_slots=4, block_size=16, blocks_per_slot=512)
+
+results = []
+for prompt in PROMPTS:
+    ids = tokenizer.encode(prompt)
+    backend.reset_slot(0)
+    ft = backend.prefill(0, ids)
+    tokens = [ft]
+    for _ in range(MAX_TOK - 1):
+        tok = backend.decode(0, tokens[-1])
+        tokens.append(tok)
+        if tok in EOS:
+            break
+    text = tokenizer.decode(tokens, skip_special_tokens=True)
+    results.append({{"prompt": prompt, "prompt_ids": ids, "output_ids": tokens, "text": text[:200]}})
+    backend.reset_slot(0)
+
+with open(sys.argv[1], "w") as f:
+    json.dump(results, f)
+print("Backend done:", len(results), "prompts")
+'''
+
+VLLM_SCRIPT = '''
+import json, os, sys
+os.environ.setdefault("USE_LIBUV", "0")
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+MODEL = {model!r}
+PROMPTS = {prompts!r}
+MAX_TOK = {max_tok!r}
+
+from vllm import LLM, SamplingParams
+llm = LLM(model=MODEL, max_model_len=4096, gpu_memory_utilization=0.85,
+          enforce_eager=True, dtype="bfloat16", disable_log_stats=True)
+tokenizer = llm.get_tokenizer()
+params = SamplingParams(temperature=0, max_tokens=MAX_TOK)
+
+results = []
+for prompt in PROMPTS:
+    ids = tokenizer.encode(prompt)
+    out = llm.generate([prompt], params)[0]
+    tokens = list(out.outputs[0].token_ids)
+    text = out.outputs[0].text
+    results.append({{"prompt": prompt, "prompt_ids": ids, "output_ids": tokens, "text": text[:200]}})
+
+with open(sys.argv[1], "w") as f:
+    json.dump(results, f)
+print("vLLM done:", len(results), "prompts")
+'''
+
+
+def assert_prompt_ids_equal(prompt, ids_a, ids_b, path_a, path_b):
     if ids_a != ids_b:
+        first_diff = next(
+            (i for i, (a, b) in enumerate(zip(ids_a, ids_b)) if a != b),
+            min(len(ids_a), len(ids_b)),
+        )
         raise AssertionError(
             f"Prompt token ids 不一致！\n"
             f"  Prompt: {prompt!r}\n"
-            f"  {path_a}: {ids_a[:20]}{'...' if len(ids_a) > 20 else ''} (len={len(ids_a)})\n"
-            f"  {path_b}: {ids_b[:20]}{'...' if len(ids_b) > 20 else ''} (len={len(ids_b)})\n"
-            f"  首个分歧位置: {next((i for i, (a, b) in enumerate(zip(ids_a, ids_b)) if a != b), min(len(ids_a), len(ids_b)))}\n"
-            f"  诊断: 检查分词路径是否一致（BOS/add_special_tokens/post_processor）"
+            f"  {path_a}: {ids_a[:20]} (len={len(ids_a)})\n"
+            f"  {path_b}: {ids_b[:20]} (len={len(ids_b)})\n"
+            f"  首个分歧位置: {first_diff}"
         )
 
 
-def run_backend_greedy(backend, tokenizer, prompt: str) -> list[int]:
-    """LagunaBackend 贪心生成，返回 output token ids。"""
-    prompt_ids = tokenizer.encode(prompt)
-    backend.reset_slot(0)
-    first_token = backend.prefill(0, prompt_ids)
-    tokens = [first_token]
-    for _ in range(MAX_DECODE_TOKENS - 1):
-        tok = backend.decode(0, tokens[-1])
-        tokens.append(tok)
-        if tok in LAGUNA_EOS:
-            break
-    backend.reset_slot(0)
-    return tokens
-
-
-def run_vllm_greedy(llm, prompt: str) -> list[int]:
-    """Stock vLLM 贪心生成，返回 output token ids。"""
-    from vllm import SamplingParams
-
-    params = SamplingParams(temperature=0, max_tokens=MAX_DECODE_TOKENS)
-    result = llm.generate([prompt], params)[0]
-    return list(result.outputs[0].token_ids)
+def run_in_subprocess(script: str, label: str) -> list[dict]:
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+        out_path = f.name
+    with tempfile.NamedTemporaryFile(suffix=".py", delete=False, mode="w") as f:
+        f.write(script)
+        script_path = f.name
+    try:
+        print(f"\n{'='*60}")
+        print(f"  Running {label} in subprocess...")
+        print(f"{'='*60}")
+        result = subprocess.run(
+            [PYTHON, script_path, out_path],
+            capture_output=False,
+            timeout=600,
+        )
+        if result.returncode != 0:
+            print(f"❌ {label} failed with code {result.returncode}")
+            sys.exit(1)
+        with open(out_path) as f:
+            return json.load(f)
+    finally:
+        os.unlink(script_path)
+        if os.path.exists(out_path):
+            os.unlink(out_path)
 
 
 def main():
-    import torch
-    from transformers import AutoTokenizer
-
-    print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print(f"Model: {MODEL}")
-    print("Quality gate: prompt ids assertion + token-level A/B comparison")
-    print()
-
-    tokenizer = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
-
-    # ── Phase 1: Load LagunaBackend ──
-    print("=== Phase 1: Load LagunaBackend ===")
-    from runtime.compat_vllm import EngineArgs
-
-    args = EngineArgs(
+    fmt = dict(
+        repo_root=_REPO_ROOT,
         model=MODEL,
-        max_model_len=4096,
-        gpu_memory_utilization=0.85,
-        enforce_eager=True,
-        dtype="bfloat16",
-        disable_log_stats=True,
-        async_scheduling=False,
+        prompts=GREEDY_PROMPTS,
+        eos=LAGUNA_EOS,
+        max_tok=MAX_DECODE_TOKENS,
     )
-    config = args.create_engine_config()
 
-    from runtime.backends.laguna import LagunaBackend
-
-    t0 = time.perf_counter()
-    backend = LagunaBackend(config, num_slots=4, block_size=16, blocks_per_slot=512)
-    backend_load_time = time.perf_counter() - t0
-    print(f"  Loaded in {backend_load_time:.1f}s")
-
-    # ── Phase 2: Load stock vLLM ──
-    print("\n=== Phase 2: Load stock vLLM ===")
-    del backend
-    torch.cuda.empty_cache()
-    import gc
-    gc.collect()
-
-    from vllm import LLM
-
-    t0 = time.perf_counter()
-    llm = LLM(
-        model=MODEL,
-        max_model_len=4096,
-        gpu_memory_utilization=0.85,
-        enforce_eager=True,
-        dtype="bfloat16",
-        disable_log_stats=True,
+    # Phase 1: Run backend in subprocess
+    backend_results = run_in_subprocess(
+        BACKEND_SCRIPT.format(**fmt), "LagunaBackend"
     )
-    vllm_load_time = time.perf_counter() - t0
-    vllm_tokenizer = llm.get_tokenizer()
-    print(f"  Loaded in {vllm_load_time:.1f}s")
 
-    # ── Phase 3: Tokenizer 一致性断言 ──
-    print("\n=== Phase 3: Tokenizer 一致性断言 ===")
-    tokenizer_match = True
-    for prompt in GREEDY_PROMPTS:
-        ids_hf = tokenizer.encode(prompt)
-        ids_vllm = vllm_tokenizer.encode(prompt)
+    # Phase 2: Run vLLM in subprocess
+    vllm_results = run_in_subprocess(
+        VLLM_SCRIPT.format(**fmt), "stock vLLM"
+    )
+
+    # Phase 3: Compare
+    print(f"\n{'='*60}")
+    print("  A/B Comparison")
+    print(f"{'='*60}")
+
+    all_match = True
+    results = []
+    for br, vr in zip(backend_results, vllm_results):
+        prompt = br["prompt"]
+
+        # Guardrail: assert prompt ids equal
         try:
-            assert_prompt_ids_equal(prompt, ids_hf, ids_vllm, "HF tokenizer", "vLLM tokenizer")
-            print(f"  ✅ {prompt[:40]!r}... ids match (len={len(ids_hf)}, BOS={ids_hf[0]})")
+            assert_prompt_ids_equal(
+                prompt, br["prompt_ids"], vr["prompt_ids"],
+                "Backend", "vLLM",
+            )
+            print(f"  ✅ Prompt ids match: {prompt[:40]!r} (len={len(br['prompt_ids'])}, BOS={br['prompt_ids'][0]})")
         except AssertionError as e:
             print(f"  ❌ {e}")
-            tokenizer_match = False
-
-    if not tokenizer_match:
-        print("\n❌ ABORT: Tokenizer 不一致，无法进行 A/B 比对")
-        sys.exit(1)
-
-    # ── Phase 4: A/B 贪心比对 ──
-    print("\n=== Phase 4: A/B 贪心比对 ===")
-
-    # 先跑 vLLM（已加载）
-    vllm_outputs = {}
-    for prompt in GREEDY_PROMPTS:
-        vllm_outputs[prompt] = run_vllm_greedy(llm, prompt)
-        text = vllm_tokenizer.decode(vllm_outputs[prompt], skip_special_tokens=True)
-        print(f"  vLLM: {prompt[:40]!r} → {text[:60]!r}...")
-
-    # 释放 vLLM，加载 backend
-    del llm
-    torch.cuda.empty_cache()
-    gc.collect()
-
-    backend2 = LagunaBackend(config, num_slots=4, block_size=16, blocks_per_slot=512)
-
-    results = []
-    all_match = True
-    for prompt in GREEDY_PROMPTS:
-        prompt_ids = tokenizer.encode(prompt)
-        backend_tokens = run_backend_greedy(backend2, tokenizer, prompt)
-        vllm_tokens = vllm_outputs[prompt]
-
-        backend_text = tokenizer.decode(backend_tokens, skip_special_tokens=True)
-        vllm_text = vllm_tokenizer.decode(vllm_tokens, skip_special_tokens=True)
+            all_match = False
+            continue
 
         # Token-level comparison
-        min_len = min(len(backend_tokens), len(vllm_tokens))
+        bt = br["output_ids"]
+        vt = vr["output_ids"]
+        min_len = min(len(bt), len(vt))
         first_diverge = None
         for i in range(min_len):
-            if backend_tokens[i] != vllm_tokens[i]:
+            if bt[i] != vt[i]:
                 first_diverge = i
                 break
-        if first_diverge is None and len(backend_tokens) != len(vllm_tokens):
+        if first_diverge is None and len(bt) != len(vt):
             first_diverge = min_len
 
         match = first_diverge is None
         if not match:
             all_match = False
 
-        result = {
-            "prompt": prompt,
-            "prompt_ids_len": len(prompt_ids),
-            "prompt_bos": prompt_ids[0],
-            "backend_tokens": len(backend_tokens),
-            "vllm_tokens": len(vllm_tokens),
-            "match": match,
-            "first_diverge_at": first_diverge,
-            "backend_text": backend_text[:200],
-            "vllm_text": vllm_text[:200],
-        }
-        results.append(result)
-
         status = "✅ MATCH" if match else f"❌ DIVERGE@{first_diverge}"
         print(f"  {status}: {prompt[:40]!r}")
         if not match:
-            print(f"    Backend: {backend_text[:80]!r}")
-            print(f"    vLLM:    {vllm_text[:80]!r}")
-            if first_diverge is not None and first_diverge < min_len:
-                print(f"    Token@{first_diverge}: backend={backend_tokens[first_diverge]} vllm={vllm_tokens[first_diverge]}")
+            print(f"    Backend: {br['text'][:80]!r}")
+            print(f"    vLLM:    {vr['text'][:80]!r}")
 
-    # ── Summary ──
+        results.append({
+            "prompt": prompt,
+            "prompt_ids_len": len(br["prompt_ids"]),
+            "prompt_bos": br["prompt_ids"][0],
+            "backend_tokens": len(bt),
+            "vllm_tokens": len(vt),
+            "match": match,
+            "first_diverge_at": first_diverge,
+            "backend_text": br["text"],
+            "vllm_text": vr["text"],
+        })
+
     print(f"\n{'='*60}")
-    print(f"QUALITY GATE: {'✅ PASS' if all_match and tokenizer_match else '❌ FAIL'}")
-    print(f"  Tokenizer consistency: {'✅' if tokenizer_match else '❌'}")
+    print(f"QUALITY GATE: {'✅ PASS' if all_match else '❌ FAIL'}")
     print(f"  Token-level A/B match: {sum(r['match'] for r in results)}/{len(results)}")
     print(f"{'='*60}")
 
-    # Save
     fixture = {
         "model": MODEL,
         "date": datetime.now().isoformat(timespec="seconds"),
-        "gpu": torch.cuda.get_device_name(0),
-        "guardrail": "prompt_ids_assertion",
-        "tokenizer_consistency": tokenizer_match,
+        "guardrail": "prompt_ids_assertion + subprocess_isolation",
         "ab_match_all": all_match,
         "results": results,
     }

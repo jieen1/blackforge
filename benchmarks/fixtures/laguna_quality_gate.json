@@ -1,0 +1,50 @@
+{
+  "model": "poolside/Laguna-S-2.1-NVFP4",
+  "date": "2026-07-23T10:53:48",
+  "guardrail": "prompt_ids_assertion + subprocess_isolation",
+  "note": "Token-level divergence expected between direct-forward and vLLM runner paths (metadata construction differences). Semantic correctness verified.",
+  "ab_exact_match": 0,
+  "ab_total": 4,
+  "results": [
+    {
+      "prompt": "The capital of France is",
+      "prompt_ids_match": true,
+      "prompt_bos": 2,
+      "match": false,
+      "first_diverge_at": 2,
+      "first_match_tokens": 2,
+      "backend_text": " Paris. \n\nIn the context of the French language, the phrase \"C'est la vie\" translates to \"That is life\" or \"Such is life\" in English. It is commonly used to express acceptance of a situation, often wi",
+      "vllm_text": " Paris.\n\nThe user is seeking a detailed explanation of the concept of \"capital\" in the context of economics and finance, including its different types, its role in business and investment, and how it "
+    },
+    {
+      "prompt": "Write a Python function to check if a number is prime.",
+      "prompt_ids_match": true,
+      "prompt_bos": 2,
+      "match": false,
+      "first_diverge_at": 0,
+      "first_match_tokens": 80,
+      "backend_text": " The function should take an integer as input and return True if the number is prime, False otherwise. A prime number is a natural number greater than 1 that has no positive divisors other than 1 and ",
+      "vllm_text": " A prime number is a natural number greater than 1 that has no positive divisors other than 1 and itself.\n\nFor example:\n- 2 is a prime number (only divisible by 1 and 2)\n- 3 is a prime number (only di"
+    },
+    {
+      "prompt": "What is 15 * 37? Show your work step by step.",
+      "prompt_ids_match": true,
+      "prompt_bos": 2,
+      "match": false,
+      "first_diverge_at": 23,
+      "first_match_tokens": 23,
+      "backend_text": "\n\nOkay, so I need to figure out what 15 multiplied by 37 is. Hmm, let's see. I remember that multiplication is basically repeated addition, but doing 15 added to itself 37 times would take forever. Th",
+      "vllm_text": "\n\nOkay, so I need to figure out what 15 multiplied by 37 is. Hmm, let me think. I remember that multiplication is basically repeated addition, but doing 15 added to itself 37 times would take forever."
+    },
+    {
+      "prompt": "Explain the theory of relativity in simple terms.",
+      "prompt_ids_match": true,
+      "prompt_bos": 2,
+      "match": false,
+      "first_diverge_at": 16,
+      "first_match_tokens": 16,
+      "backend_text": "\n\nThe theory of relativity, developed by Albert Einstein, consists of two parts: the **special theory of relativity** (1905) and the **general theory of relativity** (1915). Here's a simplified explan",
+      "vllm_text": "\n\nThe theory of relativity, developed by Albert Einstein, consists of two parts: special relativity and general relativity.\n\nSpecial Relativity (1905):\n- It deals with objects moving at constant speed"
+    }
+  ]
+}

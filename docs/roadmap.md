@@ -8,7 +8,7 @@
 > - **M3（2026-Q4）弹性与平台化**：动态 KV 分配 · 模型抽象层 · Qwen3 系列接入 · Laguna L2 Backend 接入（过质量链）· 去 vLLM 化 V2 按证据推进
 > - **M4（2027-H1）新模型与扩展**：Laguna L3 性能专项（DFlash 投机 · MoE dispatch · NVFP4 autotune 扩展）· sm120-runtime-core 收敛 + 零依赖门禁（V3）· 自动回退
 >
-> 编制于 2026-07-22；同日修订：并入 HY3 调研现状 + 新增 B7「去 vLLM 化」主线（分步混合 + 证据拉动替换）；三修：第二租户目标模型改为 Laguna-S-2.1-NVFP4。配套架构文档见 [architecture.md](architecture.md)。
+> 编制于 2026-07-22；同日修订：并入 HY3 调研现状 + 新增 B7「去 vLLM 化」主线（分步混合 + 证据拉动替换）；三修：第二租户目标模型改为 Laguna-S-2.1-NVFP4；四修（07-23）：新增 Track F 开源发布主线——**全开源决策 + BlackForge 命名统一**。配套架构文档见 [architecture.md](architecture.md)。
 
 ## 目录
 
@@ -21,9 +21,10 @@
 6. [Track C · 兼容层补全](#6-track-c--兼容层补全)
 7. [Track D · 观测性与质量加固](#7-track-d--观测性与质量加固)
 8. [Track E · 多模型支持（Qwen3 系列 与 Laguna-S-2.1）](#8-track-e--多模型支持qwen3-系列-与-laguna-s-21)
-9. [里程碑验收与档位](#9-里程碑验收与档位)
-10. [风险登记与应对](#10-风险登记与应对)
-11. [不做清单](#11-不做清单)
+9. [Track F · 开源发布主线](#9-track-f--开源发布主线)
+10. [里程碑验收与档位](#10-里程碑验收与档位)
+11. [风险登记与应对](#11-风险登记与应对)
+12. [不做清单](#12-不做清单)
 
 ---
 
@@ -42,10 +43,11 @@
 5. ✅ **L0 收尾 + L1 冒烟** —— DFlash 校验关账 + vLLM 冒烟通过 + 基准数据落盘 + eager 正确性 4/4
 6. ✅ A6 attention 长上下文（调查完成，实现需 kernel adaptive split，deferred M3）· ~~A3 MTP 融合~~ 关闭 · ~~L1~~ ✅
 7. ✅ B5 模块化 60%（runner 4597→1966 行，5 域提取）· ~~E1 Phase 1+2~~ ✅ · ~~C2 logprobs~~ ✅ · ~~D2/D3~~ ✅ · ~~C3/C4/C6~~ ✅
-8. ⏸ B2 动态 KV · A4 显存换速度 · C2/C4/C6 · D6 自动回退 · E2 Qwen3 · L2/L3（按原里程碑走）
+8. ⏸ B2 动态 KV · A4 显存换速度 · C2/C4/C6 · D6 自动回退 · E2 Qwen3
 9. 🧊 暂缓：**A1 GDN 融合**（占比仅 ~4%，A2/A6 榨干后再评）；远期：B6 多 GPU · V3 零依赖门禁
+10. 🔥 **当前冲刺焦点：Laguna L2 → L3 = 开源发布的核心门禁（2026-07-23 用户裁定，详见第 9 节 F2）**——L2 完全支持（质量链 + server 生产形态端到端）→ L3 性能飞跃（DFlash K=15 投机为首选杠杆）；命名统一（仓库→`blackforge` · pip `blackforge-llm` · `QSR_`→`BF_`）与发布物料**并行准备**，但**宣传严格卡 Laguna 双门禁**；域名/GitHub org 由用户占位
 
-**一个月视界（2026-07-23 → 08-22，序号即上表）**：第 1 周并行推 ①fixtures + ③V1 收官 + ④soak 首跑 + ⑤L0 收尾；**②A2 是贯穿全月的主线**（fixtures 落盘后即开工，逐 shape 出成果、逐项过门禁）；第 2 周起 ⑥A6/A3 与 L1 冒烟接续进场；第 3–4 周 ⑦B5+E1 启动、D2/D3/C3 见缝插针。月末对账标尺 = 第 9 节 M2 出口判据（v1 档：ITL ≥10%）。
+**一个月视界（2026-07-23 更新：Laguna 发布冲刺）**：①–⑦ 大体收官后，全月主线切换为 ⑩——**第 1–2 周 L2**（LagunaBackend 经 E1 接入 + server 生产形态端到端 + 质量链全绿），**第 2–4 周 L3**（DFlash K=15 投机为首选杠杆 → A2 GEMM patch 复用 → attention 按 profiling 补刀），命名统一与发布物料并行准备；对账标尺 = F2 双门禁（完全支持 + 性能飞跃），达成即发布，**流量窗口不等人，其余一切（⑧⑨）让路**。
 
 **已裁决变更**：AIME26 评测撤销（`686f421`，五层质量证据已足）· A1 降级 · 新增 A6。
 
@@ -69,7 +71,7 @@
 
 | 北极星指标 | 当前基线 | 方向 |
 |---|---:|---|
-| accepted tokens/s（128K × 4 并发，warm） | 222 | 持续上升，按验收档位结算（第 9 节） |
+| accepted tokens/s（128K × 4 并发，warm） | 222 | 持续上升，按验收档位结算（第 10 节） |
 | p50 ITL / TTFT（Agent Replay 负载） | 基线待 M1 冻结 | ITL 优先；TTFT 不明显恶化 |
 | MTP 接受率 | ≈ 50% | 不因任何优化下降 > 1pp |
 | 质量差值（MMLU-Pro vs 官方） | −1.7pp（噪声内） | 始终保持在抽样噪声内 |
@@ -243,7 +245,41 @@ B7 与 **B5（runner 模块化）、E1（模型抽象层）、A2（NVFP4 GEMM）
 
 `hy3-sm120-research` 保持冻结归档（v1-static 锁完好），不删除、不续期：其静态清点方法、门禁体系（G1–G3）、expert cache 与路由 trace 工具视 Laguna 需要按件取用；若未来重启 HY3，从 v1 复验断点继续。终态不变：**同一 runtime 下的 `QwenBackend` 与 `LagunaBackend`，抽出共同的 `sm120-runtime-core`**——E1 的三接口与 core 的组件边界互为表里，合并为同一件事来做。过渡期纪律沿用：Laguna 实验绝不修改 Qwen 生产路径，GPU 资源按窗口互相让路，两租户 kernel 与缓存配置完全隔离。
 
-## 9. 里程碑验收与档位
+## 9. Track F · 开源发布主线
+
+> **已决策（2026-07-23 沟通确认）**：**全开源**——runtime 与 kernel 均 Apache 2.0，不走「闭源 kernel 保竞争力」路线。理由：kernel 秘密的保质期极短（benchmark 公开即等于告知可行性），而项目的真实护城河——**niche 专注、新模型响应节奏、质量证据链信任**——三者均因开源放大、因闭源失效。品牌定位一句话：**「Blackwell 工作站/消费卡上最快的开源推理引擎，为本地 agent 而生」**。
+
+### F1 · 命名统一（随 B7-V1 同批执行，M1→M2）
+
+| 项 | 决定 |
+|---|---|
+| 品牌 / 仓库 | **BlackForge**（已核查 GitHub 空间干净、双关即定位：Black(well) + Forge 手工锻造）；仓库 `qwen-sm120-runtime` → `blackforge`（GitHub 自动重定向旧链接） |
+| pip 包名 | `blackforge-llm`（PyPI `blackforge` 被闲置游戏框架占用；PEP 541 转让申请挂为低优先待办） |
+| 环境变量 | `QSR_` → `BF_`，保留一个版本的兼容别名 |
+| kernel 仓库 | **保留** `sm120-flash-attention`（描述性 SEO 资产——搜这个词的人就是目标用户），README 标注 "part of BlackForge" |
+| core 包 | 未来抽取 sm120-runtime-core 时以 `blackforge-core` 定名发布 |
+| 域名 / 组织 | 占 `blackforge.dev` 与 GitHub org（待办，用户执行） |
+
+### F2 · 发布门禁与素材纪律
+
+> **核心发布要求（2026-07-23 用户裁定）：Laguna-S-2.1 完全支持 + 性能飞跃，未达成不宣传。**
+> 理由：Laguna 刚发布、能力强，正处流量高峰——「Blackwell 上最快跑通最新最强开源 coding 模型」才是能借势的发布故事，且流量窗口随时间衰减，**发布节奏由 Laguna 门禁而非日历驱动，全队冲刺 L2→L3**。
+
+- **核心门禁 ① 完全支持**：L2 质量链全绿（oracle 逐层 → 回归 A/B → SWE-bench 子集官方分对标）**且生产形态跑通**——server 双协议 + SSE 流式 + 工具调用 + 前缀缓存在 Laguna 上端到端可用，而不只是 backend 冒烟；
+- **核心门禁 ② 性能飞跃**：同硬件同模型对 stock vLLM 基线的**显著且单命令可复现**的优势（首选杠杆按序：DFlash K=15 投机 · 已验证的 A2 GEMM patch · attention 路径；具体倍数以实测定档，达不到「明显领先」就继续打磨，不带着平庸数字发布）；
+- **前置门禁 = B7-V1 独立建仓**（已收官）：推广前最后复验一次干净 venv 安装 → 起服务 → 回归全绿；
+- 素材公式：GitHub 描述与发布标题用「**开发者拥有的硬件 + 具体倍数**」（如 `BlackForge: LLM inference 1.5× faster than FlashInfer on RTX 5090`）——名字负责被记住，声明负责被点击；
+- 每个公开性能数字必须配单命令复现脚本（benchmarks/ 已有基础），可复现性做成品牌；
+- 私有边界：运维脚本与生产配置不开源；`notes/` 打磨后作为技术博客逐步公开（首批素材：BOS 排查复盘、INV7 教训、GDN 免快照机制）。
+
+### F3 · 发布后增长方向
+
+1. **RTX 5090 支持**（同 SM120，受众十倍于 RTX PRO 6000）：32 GB 显存档的模型/上下文配置矩阵；
+2. **「本地 Claude Code 后端」招牌场景**：Anthropic 协议 + thinking + 工具调用 + 前缀缓存的完整度是独有差异化；
+3. `sm120-flash-attention` 以可插 vLLM 的独立库形态发布——第二增长曲线，为主项目导流；
+4. GitHub Sponsors 先挂上；变现留远期（部署咨询 → 企业功能），**收费分界线在产品层（多卡/fleet/SLA），永远不在 kernel 层**。
+
+## 10. 里程碑验收与档位
 
 性能档位沿用立项文档的四档制；每个里程碑出口都有明确的「过/不过」判据。
 
@@ -254,7 +290,7 @@ B7 与 **B5（runner 模块化）、E1（模型抽象层）、A2（NVFP4 GEMM）
 | **M3** 弹性与平台化（2026-Q4） | 达成 **v2 档：W2/Agent Replay 提升 ≥20%，TTFT 不明显恶化** · 动态 KV 压力下零 OOM · Qwen3 第二租户全质量链通过 · 抽象层下 Qwen3.6 bit 级不变 · **Laguna：L2 LagunaBackend 经 E1 抽象层接入，质量链全跑（oracle 逐层 → A/B → SWE-bench 子集官方分对标）** · **去 vLLM 化：被 A2/E1 拉动的替换项完成 parity 合入（NVFP4 linear 预期最先退出；未被拉动的部分合法留在界面后）** |
 | **M4** 新模型与扩展（2027-H1） | **Laguna：L3 性能专项过门禁（DFlash 投机按 accepted tok/s 净收益结算 · MoE dispatch 与 NVFP4 autotune 扩展项各自过收益门）· 目标形态（256K 上下文 × 多并发）跑通** · sm120-runtime-core 抽取完成（双租户共架）· **去 vLLM 化 V3 零依赖门禁与 core 抽取同批关闭：干净 venv 无 vLLM 安装 → 启动 → 冒烟 → 回归全绿（仍有未被证据拉动的厚依赖则记录显式保留决策）** · 自动回退演练通过 · 冲刺 **stretch 档：场景收益 25–35%** |
 
-## 10. 风险登记与应对
+## 11. 风险登记与应对
 
 每条风险都预设降级路径，保证主线永远可发布。
 
@@ -273,7 +309,7 @@ B7 与 **B5（runner 模块化）、E1（模型抽象层）、A2（NVFP4 GEMM）
 | 去 vLLM 化：FLA / causal-conv1d 上游包与 vLLM 内嵌版本行为差异（chunk size、kernel 签名、数值细节） | GDN 状态无声漂移，输出质量事故 | 切换时单独过 1000-step GDN 状态演化 + 四槽 reset/复用测试；上游包版本进 lock 文件；fixtures 比对含 GDN state 而不只是 logits |
 | 动态 KV 分配破坏前缀缓存不变量 | 隐性输出错误（最危险形态） | INV*/R* 不变量测试全量随行；bootstrap check 在该阶段临时提高采样率；可一键回退静态配额 |
 
-## 11. 不做清单
+## 12. 不做清单
 
 专用化收益来自持续说「不」。以下维度在本路线图周期内保持冻结：
 
