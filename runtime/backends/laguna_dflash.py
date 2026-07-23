@@ -286,11 +286,11 @@ class DFlashEngine:
             logger.warning("DFlash: main decode CUDA Graph failed: %s", e)
             self._cuda_graph = None
 
-        # Verify/Draft CUDA Graph (M=16) — disabled: FlashInfer prefill wrapper
-        # CUDA Graph mode produces incorrect attention with variable-length KV.
-        # TODO: fix by pre-computing causal masks or using decode-style wrappers.
+        # Verify/Draft CUDA Graph: lazy capture after first prefill
+        # (capture warmup writes to KV cache, must not corrupt fresh state)
         self._verify_cg = None
         self._draft_cg = None
+        self._cg_captured = False
 
     def _forward_main_with_aux(
         self,
@@ -805,6 +805,26 @@ class DFlashEngine:
             num_positions, position_offset,
         )
 
+    def _lazy_capture_cg(self) -> None:
+        """Capture verify/draft CUDA Graphs after KV cache is populated."""
+        try:
+            from runtime.backends.laguna_dflash_cudagraph import DFlashVerifyCudaGraph
+            vcg = DFlashVerifyCudaGraph(self.backend)
+            vcg.capture()
+            self._verify_cg = vcg
+            logger.info("DFlash: verify CUDA Graph captured (lazy)")
+        except Exception as e:
+            logger.warning("DFlash: verify CG failed: %s", e)
+        try:
+            from runtime.backends.laguna_dflash_cudagraph import DFlashDraftCudaGraph
+            dcg = DFlashDraftCudaGraph(self)
+            dcg.capture()
+            self._draft_cg = dcg
+            logger.info("DFlash: draft CUDA Graph captured (lazy)")
+        except Exception as e:
+            logger.warning("DFlash: draft CG failed: %s", e)
+        self._cg_captured = True
+
     def generate(
         self,
         prompt_ids: list[int],
@@ -866,6 +886,11 @@ class DFlashEngine:
 
         t_total = time.perf_counter()
         backend.reset_slot(slot)
+
+        # Lazy-capture verify/draft CGs after first generate completes
+        # (capture warmup writes to KV cache; must not corrupt active session)
+        if self._use_cuda_graph and not self._cg_captured:
+            self._lazy_capture_cg()
 
         tokens = tokens[:max_tokens]
 

@@ -276,20 +276,21 @@ class DFlashVerifyCudaGraph:
         logger.info("Capturing DFlash verify CUDA Graph (M=%d)...", self.num_tokens)
         self._init_wrappers()
 
-        # Warmup with dummy data
+        # Warmup with dummy data (use large kv_len for grid size headroom)
+        capture_kv = 2048
         self._input_ids[:self.num_tokens] = 1
-        self._fill_buffers(0, 32)
+        self._fill_buffers(0, capture_kv)
 
         side_stream = torch.cuda.Stream()
         with torch.cuda.stream(side_stream):
             for _ in range(3):
-                self._fill_buffers(0, 32)
+                self._fill_buffers(0, capture_kv)
                 self._run_plan()
                 self._build_metadata_and_forward()
         side_stream.synchronize()
 
         # Final fill + plan before capture
-        self._fill_buffers(0, 32)
+        self._fill_buffers(0, capture_kv)
         self._run_plan()
 
         graph = torch.cuda.CUDAGraph()
@@ -468,19 +469,20 @@ class DFlashDraftCudaGraph:
         logger.info("Capturing DFlash draft CUDA Graph (M=%d)...", self.num_tokens)
         self._init_wrapper()
 
+        capture_kv = 2048
         self._input_ids[0] = 1
         self._input_ids[1:self.num_tokens] = MASK_TOKEN_ID
-        self._fill_buffers(0, 32)
+        self._fill_buffers(0, capture_kv)
 
         side_stream = torch.cuda.Stream()
         with torch.cuda.stream(side_stream):
             for _ in range(3):
-                self._fill_buffers(0, 32)
+                self._fill_buffers(0, capture_kv)
                 self._run_plan()
                 self._build_metadata_and_forward()
         side_stream.synchronize()
 
-        self._fill_buffers(0, 32)
+        self._fill_buffers(0, capture_kv)
         self._run_plan()
 
         graph = torch.cuda.CUDAGraph()
