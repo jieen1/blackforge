@@ -839,6 +839,9 @@ class DFlashEngine:
         backend = self.backend
         slot = 0
         backend.reset_slot(slot)
+        # Reset draft KV cache to avoid stale data from previous generates
+        for kv_tensor in self._draft_kv_caches.values():
+            kv_tensor.zero_()
         torch.cuda.empty_cache()
 
         t0 = time.perf_counter()

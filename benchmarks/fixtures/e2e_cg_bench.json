@@ -1,0 +1,28 @@
+{
+  "64K": {
+    "warmup": {
+      "prefill_ms": 19931.688670003496,
+      "decode_ms": 9359.64016399521,
+      "total_ms": 29291.328833998705,
+      "num_tokens": 256,
+      "num_steps": 70,
+      "acceptance_rate": 0.17714285714285713,
+      "tokens_per_step": 3.642857142857143,
+      "tok_per_s": 27.2446371368995
+    },
+    "measured": {
+      "prefill_ms": 19666.732910001883,
+      "decode_ms": 6881.554523999512,
+      "total_ms": 26548.287434001395,
+      "num_tokens": 256,
+      "num_steps": 78,
+      "acceptance_rate": 0.15128205128205127,
+      "tokens_per_step": 3.269230769230769,
+      "tok_per_s": 37.05558084451473
+    },
+    "baseline_tps": 14.346618694459332,
+    "baseline_itl_ms": 69.70283530196564,
+    "speedup": 2.582879048623883,
+    "itl_ms": 26.98648832940985
+  }
+}
