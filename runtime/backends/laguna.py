@@ -625,6 +625,80 @@ class LagunaBackend:
 
         return logits
 
+    def _prefill_with_swa_chunked(
+        self, slot: int, prompt_ids: list[int]
+    ) -> torch.Tensor:
+        """Chunked prefill for prompts longer than SWA scratch capacity.
+
+        Processes the prompt in chunks of scratch_blocks * block_size tokens.
+        Full-attention layers see the whole prompt; SWA layers process each
+        chunk through scratch and copy the window to ring after each chunk.
+        """
+        sfc = self.static_forward_context
+        bs = self.block_size
+        chunk_tokens = self._swa_scratch_blocks * bs  # e.g. 256*16 = 4096
+        prompt_len = len(prompt_ids)
+        window = self._swa_window
+        ring_slots = self._ring_slots_per_slot
+        phys = _physical_slot(slot)
+        ring_base = phys * self._ring_blocks_per_slot
+
+        # For full-attention layers: process whole prompt at once
+        # For SWA layers: process in chunks via scratch
+        # Strategy: run full forward in chunks, SWA layers rebound to scratch
+        # per chunk, full layers use their normal KV.
+
+        # Process in chunks
+        all_logits = None
+        for chunk_start in range(0, prompt_len, chunk_tokens):
+            chunk_end = min(chunk_start + chunk_tokens, prompt_len)
+            chunk = prompt_ids[chunk_start:chunk_end]
+            chunk_len = len(chunk)
+
+            # Rebind SWA layers to scratch
+            for name in self._swa_layer_names:
+                sfc[name].kv_cache = self._swa_scratch[name]
+
+            # Run forward for this chunk
+            # kv_length for full layers = chunk_start (already written)
+            # kv_length for SWA scratch = 0 (fresh scratch each chunk)
+            logits = self._forward(
+                [slot], chunk, [chunk_start],
+                qo_len=chunk_len, is_decode=False
+            )
+            all_logits = logits  # keep last chunk's logits
+
+            # Copy window from scratch to ring
+            # Only need to copy the last `window` positions of this chunk
+            copy_start = max(0, chunk_len - window)
+            slabs: list[tuple[int, int, int]] = []
+            pos = copy_start
+            while pos < chunk_len:
+                abs_pos = chunk_start + pos
+                ring_slot_idx = abs_pos % ring_slots
+                until_wrap = ring_slots - ring_slot_idx
+                src_off = pos % bs
+                until_block_end = bs - src_off
+                count = min(until_wrap, until_block_end, chunk_len - pos)
+                slabs.append((pos, ring_slot_idx, count))
+                pos += count
+
+            for name in self._swa_layer_names:
+                scratch = self._swa_scratch[name]
+                ring = self.kv_caches[name]
+                for src_pos, dst_ring_slot, count in slabs:
+                    sb = src_pos // bs
+                    so = src_pos % bs
+                    db = dst_ring_slot // bs + ring_base
+                    do = dst_ring_slot % bs
+                    ring[db, :, do:do + count] = scratch[sb, :, so:so + count]
+
+            # Rebind SWA layers back to ring
+            for name in self._swa_layer_names:
+                sfc[name].kv_cache = self.kv_caches[name]
+
+        return all_logits
+
     def prefill(self, slot: int, prompt_ids: list[int]) -> int:
         """Prefill prompt and return the greedy first token."""
         if self.slot_kv_len[slot] != 0:
@@ -632,7 +706,12 @@ class LagunaBackend:
                 f"slot {slot} is not fresh (kv_len={self.slot_kv_len[slot]})"
             )
         if self._swa_scratch:
-            logits = self._prefill_with_swa_scratch(slot, prompt_ids)
+            prompt_len = len(prompt_ids)
+            scratch_capacity = self._swa_scratch_blocks * self.block_size
+            if prompt_len <= scratch_capacity:
+                logits = self._prefill_with_swa_scratch(slot, prompt_ids)
+            else:
+                logits = self._prefill_with_swa_chunked(slot, prompt_ids)
         else:
             logits = self._forward(
                 [slot], prompt_ids, [0], qo_len=len(prompt_ids), is_decode=False
