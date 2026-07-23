@@ -1,0 +1,274 @@
+{
+  "date": "2026-07-23T06:48:36",
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+  "warmup": 50,
+  "iters": 300,
+  "peak_bw_gbps": 1338.8,
+  "results": {
+    "gate_up_proj": {
+      "cutlass": {
+        "p50_ms": 0.3815,
+        "p10_ms": 0.3662,
+        "p90_ms": 0.4414,
+        "bw_gbps": 233.6,
+        "bw_pct_peak": 17.4,
+        "bit_exact_vs_cutlass": null,
+        "max_diff": null
+      },
+      "b12x": {
+        "p50_ms": 0.3527,
+        "p10_ms": 0.3236,
+        "p90_ms": 0.4075,
+        "bw_gbps": 252.7,
+        "bw_pct_peak": 18.9,
+        "bit_exact_vs_cutlass": true,
+        "max_diff": 0.0
+      },
+      "cute-dsl": {
+        "error": "mm_fp4 does not support backend 'cute-dsl' with capability 120"
+      },
+      "trtllm": {
+        "error": "mm_fp4 does not support backend 'trtllm' with capability 120"
+      },
+      "cudnn": {
+        "p50_ms": 0.4283,
+        "p10_ms": 0.4099,
+        "p90_ms": 0.4914,
+        "bw_gbps": 208.1,
+        "bw_pct_peak": 15.5,
+        "bit_exact_vs_cutlass": true,
+        "max_diff": 0.0
+      },
+      "_meta": {
+        "M": 4,
+        "N": 34816,
+        "K": 5120,
+        "count": 56,
+        "name": "gate_up_proj",
+        "weight_mb": 89.1
+      }
+    },
+    "down_proj": {
+      "cutlass": {
+        "p50_ms": 0.3491,
+        "p10_ms": 0.3312,
+        "p90_ms": 0.405,
+        "bw_gbps": 127.6,
+        "bw_pct_peak": 9.5,
+        "bit_exact_vs_cutlass": null,
+        "max_diff": null
+      },
+      "b12x": {
+        "p50_ms": 0.3195,
+        "p10_ms": 0.3091,
+        "p90_ms": 0.3678,
+        "bw_gbps": 139.5,
+        "bw_pct_peak": 10.4,
+        "bit_exact_vs_cutlass": true,
+        "max_diff": 0.0
+      },
+      "cute-dsl": {
+        "error": "mm_fp4 does not support backend 'cute-dsl' with capability 120"
+      },
+      "trtllm": {
+        "error": "mm_fp4 does not support backend 'trtllm' with capability 120"
+      },
+      "cudnn": {
+        "p50_ms": 0.3382,
+        "p10_ms": 0.317,
+        "p90_ms": 0.4122,
+        "bw_gbps": 131.8,
+        "bw_pct_peak": 9.8,
+        "bit_exact_vs_cutlass": true,
+        "max_diff": 0.0
+      },
+      "_meta": {
+        "M": 4,
+        "N": 5120,
+        "K": 17408,
+        "count": 56,
+        "name": "down_proj",
+        "weight_mb": 44.6
+      }
+    },
+    "down_proj_attn": {
+      "cutlass": {
+        "p50_ms": 0.4061,
+        "p10_ms": 0.3885,
+        "p90_ms": 0.4753,
+        "bw_gbps": 373.1,
+        "bw_pct_peak": 27.9,
+        "bit_exact_vs_cutlass": null,
+        "max_diff": null
+      },
+      "b12x": {
+        "p50_ms": 0.3605,
+        "p10_ms": 0.3431,
+        "p90_ms": 0.4513,
+        "bw_gbps": 420.3,
+        "bw_pct_peak": 31.4,
+        "bit_exact_vs_cutlass": true,
+        "max_diff": 0.0
+      },
+      "cute-dsl": {
+        "error": "mm_fp4 does not support backend 'cute-dsl' with capability 120"
+      },
+      "trtllm": {
+        "error": "mm_fp4 does not support backend 'trtllm' with capability 120"
+      },
+      "cudnn": {
+        "p50_ms": 0.4443,
+        "p10_ms": 0.4106,
+        "p90_ms": 0.5158,
+        "bw_gbps": 341.0,
+        "bw_pct_peak": 25.5,
+        "bit_exact_vs_cutlass": true,
+        "max_diff": 0.0
+      },
+      "_meta": {
+        "M": 4,
+        "N": 17408,
+        "K": 17408,
+        "count": 8,
+        "name": "down_proj_attn",
+        "weight_mb": 151.5
+      }
+    },
+    "out_proj": {
+      "cutlass": {
+        "p50_ms": 0.2579,
+        "p10_ms": 0.2412,
+        "p90_ms": 0.3286,
+        "bw_gbps": 73.2,
+        "bw_pct_peak": 5.5,
+        "bit_exact_vs_cutlass": null,
+        "max_diff": null
+      },
+      "b12x": {
+        "p50_ms": 0.2586,
+        "p10_ms": 0.244,
+        "p90_ms": 0.3201,
+        "bw_gbps": 73.0,
+        "bw_pct_peak": 5.5,
+        "bit_exact_vs_cutlass": true,
+        "max_diff": 0.0
+      },
+      "cute-dsl": {
+        "error": "mm_fp4 does not support backend 'cute-dsl' with capability 120"
+      },
+      "trtllm": {
+        "error": "mm_fp4 does not support backend 'trtllm' with capability 120"
+      },
+      "cudnn": {
+        "p50_ms": 0.3264,
+        "p10_ms": 0.2997,
+        "p90_ms": 0.3736,
+        "bw_gbps": 57.8,
+        "bw_pct_peak": 4.3,
+        "bit_exact_vs_cutlass": true,
+        "max_diff": 0.0
+      },
+      "_meta": {
+        "M": 4,
+        "N": 6144,
+        "K": 6144,
+        "count": 64,
+        "name": "out_proj",
+        "weight_mb": 18.9
+      }
+    },
+    "in_proj_qkvz": {
+      "cutlass": {
+        "p50_ms": 0.2711,
+        "p10_ms": 0.2404,
+        "p90_ms": 0.3132,
+        "bw_gbps": 48.3,
+        "bw_pct_peak": 3.6,
+        "bit_exact_vs_cutlass": null,
+        "max_diff": null
+      },
+      "b12x": {
+        "p50_ms": 0.249,
+        "p10_ms": 0.2384,
+        "p90_ms": 0.307,
+        "bw_gbps": 52.6,
+        "bw_pct_peak": 3.9,
+        "bit_exact_vs_cutlass": true,
+        "max_diff": 0.0
+      },
+      "cute-dsl": {
+        "error": "mm_fp4 does not support backend 'cute-dsl' with capability 120"
+      },
+      "trtllm": {
+        "error": "mm_fp4 does not support backend 'trtllm' with capability 120"
+      },
+      "cudnn": {
+        "p50_ms": 0.3238,
+        "p10_ms": 0.272,
+        "p90_ms": 0.3748,
+        "bw_gbps": 40.5,
+        "bw_pct_peak": 3.0,
+        "bit_exact_vs_cutlass": true,
+        "max_diff": 0.0
+      },
+      "_meta": {
+        "M": 4,
+        "N": 5120,
+        "K": 5120,
+        "count": 72,
+        "name": "in_proj_qkvz",
+        "weight_mb": 13.1
+      }
+    },
+    "in_proj_ba": {
+      "cutlass": {
+        "p50_ms": 0.2519,
+        "p10_ms": 0.2201,
+        "p90_ms": 0.3138,
+        "bw_gbps": 1.0,
+        "bw_pct_peak": 0.1,
+        "bit_exact_vs_cutlass": null,
+        "max_diff": null
+      },
+      "b12x": {
+        "p50_ms": 0.2402,
+        "p10_ms": 0.2158,
+        "p90_ms": 0.3084,
+        "bw_gbps": 1.0,
+        "bw_pct_peak": 0.1,
+        "bit_exact_vs_cutlass": true,
+        "max_diff": 0.0
+      },
+      "cute-dsl": {
+        "error": "mm_fp4 does not support backend 'cute-dsl' with capability 120"
+      },
+      "trtllm": {
+        "error": "mm_fp4 does not support backend 'trtllm' with capability 120"
+      },
+      "cudnn": {
+        "p50_ms": 0.303,
+        "p10_ms": 0.2667,
+        "p90_ms": 0.3918,
+        "bw_gbps": 0.8,
+        "bw_pct_peak": 0.1,
+        "bit_exact_vs_cutlass": true,
+        "max_diff": 0.0
+      },
+      "_meta": {
+        "M": 4,
+        "N": 96,
+        "K": 5120,
+        "count": 48,
+        "name": "in_proj_ba",
+        "weight_mb": 0.2
+      }
+    }
+  },
+  "totals_weighted_ms": {
+    "cutlass": 92.278,
+    "b12x": 86.535,
+    "cute-dsl": 0.0,
+    "trtllm": 0.0,
+    "cudnn": 105.226
+  }
+}

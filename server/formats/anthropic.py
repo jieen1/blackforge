@@ -170,6 +170,7 @@ def build_response(
     finish_reason: str,
     input_tokens: int,
     output_tokens: int,
+    cache_read_input_tokens: int = 0,
 ) -> dict:
     """Build a non-streaming Anthropic Messages API response."""
     visible_text, tool_calls = parse_tool_calls(text)
@@ -196,7 +197,7 @@ def build_response(
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "cache_creation_input_tokens": 0,
-            "cache_read_input_tokens": 0,
+            "cache_read_input_tokens": cache_read_input_tokens,
         },
     }
 

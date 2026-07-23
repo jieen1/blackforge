@@ -1,0 +1,86 @@
+{
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+  "sm_count": 188,
+  "date": "2026-07-23T06:24:04",
+  "results": [
+    {
+      "name": "gate_up_proj",
+      "m": 4,
+      "n": 34816,
+      "k": 5120,
+      "count": 56,
+      "cutlass_ms": 0.109,
+      "bf16_ms": 0.2115,
+      "cutlass_quant_ms": 0.1232,
+      "weight_mb": 89.1,
+      "cutlass_bw_gbps": 817516.9,
+      "weighted_ms": 6.105
+    },
+    {
+      "name": "down_proj",
+      "m": 4,
+      "n": 5120,
+      "k": 17408,
+      "count": 56,
+      "cutlass_ms": 0.0708,
+      "bf16_ms": 0.112,
+      "cutlass_quant_ms": 0.0764,
+      "weight_mb": 44.6,
+      "cutlass_bw_gbps": 629584.1,
+      "weighted_ms": 3.964
+    },
+    {
+      "name": "down_proj_attn",
+      "m": 4,
+      "n": 17408,
+      "k": 17408,
+      "count": 8,
+      "cutlass_ms": 0.1868,
+      "bf16_ms": 0.368,
+      "cutlass_quant_ms": 0.2041,
+      "weight_mb": 151.5,
+      "cutlass_bw_gbps": 811061.3,
+      "weighted_ms": 1.495
+    },
+    {
+      "name": "out_proj",
+      "m": 4,
+      "n": 6144,
+      "k": 6144,
+      "count": 64,
+      "cutlass_ms": 0.0301,
+      "bf16_ms": 0.0199,
+      "cutlass_quant_ms": 0.0342,
+      "weight_mb": 18.9,
+      "cutlass_bw_gbps": 627472.3,
+      "weighted_ms": 1.925
+    },
+    {
+      "name": "in_proj_qkvz",
+      "m": 4,
+      "n": 5120,
+      "k": 5120,
+      "count": 72,
+      "cutlass_ms": 0.026,
+      "bf16_ms": 0.0157,
+      "cutlass_quant_ms": 0.0302,
+      "weight_mb": 13.1,
+      "cutlass_bw_gbps": 504433.5,
+      "weighted_ms": 1.871
+    },
+    {
+      "name": "in_proj_ba",
+      "m": 4,
+      "n": 96,
+      "k": 5120,
+      "count": 48,
+      "cutlass_ms": 0.025,
+      "bf16_ms": 0.0231,
+      "cutlass_quant_ms": 0.0303,
+      "weight_mb": 0.2,
+      "cutlass_bw_gbps": 9833.5,
+      "weighted_ms": 1.2
+    }
+  ],
+  "total_weighted_ms": 16.56
+}

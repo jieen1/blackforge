@@ -464,4 +464,3 @@ class GdnStateManager:
         torch._foreach_copy_(ssm_dsts, ssm_srcs)
         if not allow_cross_slot:
             snapshot["__consumed__"] = True
-

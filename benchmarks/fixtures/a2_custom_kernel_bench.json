@@ -1,0 +1,199 @@
+{
+  "date": "2026-07-23T07:21:43",
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+  "results": {
+    "gate_up_proj": {
+      "baseline_p50_ms": 0.3256,
+      "A(128x128,nopersist)": {
+        "p50_ms": 0.3013,
+        "bw_gbps": 295.8,
+        "speedup": 1.08,
+        "bit_exact": true,
+        "max_diff": 0.0
+      },
+      "B(128x128,persist)": {
+        "p50_ms": 0.2999,
+        "bw_gbps": 297.2,
+        "speedup": 1.086,
+        "bit_exact": true,
+        "max_diff": 0.0
+      },
+      "C(256x128,persist)": {
+        "p50_ms": 0.3996,
+        "bw_gbps": 223.0,
+        "speedup": 0.815,
+        "bit_exact": true,
+        "max_diff": 0.0
+      },
+      "D(128x256,persist)": {
+        "p50_ms": 0.2749,
+        "bw_gbps": 324.2,
+        "speedup": 1.184,
+        "bit_exact": true,
+        "max_diff": 0.0
+      }
+    },
+    "down_proj": {
+      "baseline_p50_ms": 0.2864,
+      "A(128x128,nopersist)": {
+        "p50_ms": 0.2537,
+        "bw_gbps": 175.6,
+        "speedup": 1.129,
+        "bit_exact": true,
+        "max_diff": 0.0
+      },
+      "B(128x128,persist)": {
+        "p50_ms": 0.2629,
+        "bw_gbps": 169.5,
+        "speedup": 1.089,
+        "bit_exact": true,
+        "max_diff": 0.0
+      },
+      "C(256x128,persist)": {
+        "p50_ms": 0.3355,
+        "bw_gbps": 132.8,
+        "speedup": 0.854,
+        "bit_exact": true,
+        "max_diff": 0.0
+      },
+      "D(128x256,persist)": {
+        "p50_ms": 0.3222,
+        "bw_gbps": 138.3,
+        "speedup": 0.889,
+        "bit_exact": true,
+        "max_diff": 0.0
+      }
+    },
+    "down_proj_attn": {
+      "baseline_p50_ms": 0.3989,
+      "A(128x128,nopersist)": {
+        "p50_ms": 0.3629,
+        "bw_gbps": 417.5,
+        "speedup": 1.099,
+        "bit_exact": true,
+        "max_diff": 0.0
+      },
+      "B(128x128,persist)": {
+        "p50_ms": 0.3561,
+        "bw_gbps": 425.5,
+        "speedup": 1.12,
+        "bit_exact": true,
+        "max_diff": 0.0
+      },
+      "C(256x128,persist)": {
+        "p50_ms": 0.5186,
+        "bw_gbps": 292.2,
+        "speedup": 0.769,
+        "bit_exact": true,
+        "max_diff": 0.0
+      },
+      "D(128x256,persist)": {
+        "p50_ms": 0.3176,
+        "bw_gbps": 477.1,
+        "speedup": 1.256,
+        "bit_exact": true,
+        "max_diff": 0.0
+      }
+    },
+    "out_proj": {
+      "baseline_p50_ms": 0.2229,
+      "A(128x128,nopersist)": {
+        "p50_ms": 0.2127,
+        "bw_gbps": 88.7,
+        "speedup": 1.048,
+        "bit_exact": true,
+        "max_diff": 0.0
+      },
+      "B(128x128,persist)": {
+        "p50_ms": 0.2404,
+        "bw_gbps": 78.5,
+        "speedup": 0.927,
+        "bit_exact": true,
+        "max_diff": 0.0
+      },
+      "C(256x128,persist)": {
+        "p50_ms": 0.2234,
+        "bw_gbps": 84.5,
+        "speedup": 0.998,
+        "bit_exact": true,
+        "max_diff": 0.0
+      },
+      "D(128x256,persist)": {
+        "p50_ms": 0.2407,
+        "bw_gbps": 78.4,
+        "speedup": 0.926,
+        "bit_exact": true,
+        "max_diff": 0.0
+      }
+    },
+    "in_proj_qkvz": {
+      "baseline_p50_ms": 0.218,
+      "A(128x128,nopersist)": {
+        "p50_ms": 0.1683,
+        "bw_gbps": 77.9,
+        "speedup": 1.295,
+        "bit_exact": true,
+        "max_diff": 0.0
+      },
+      "B(128x128,persist)": {
+        "p50_ms": 0.1417,
+        "bw_gbps": 92.5,
+        "speedup": 1.538,
+        "bit_exact": true,
+        "max_diff": 0.0
+      },
+      "C(256x128,persist)": {
+        "p50_ms": 0.1661,
+        "bw_gbps": 78.9,
+        "speedup": 1.312,
+        "bit_exact": true,
+        "max_diff": 0.0
+      },
+      "D(128x256,persist)": {
+        "p50_ms": 0.1662,
+        "bw_gbps": 78.9,
+        "speedup": 1.312,
+        "bit_exact": true,
+        "max_diff": 0.0
+      }
+    },
+    "in_proj_ba": {
+      "baseline_p50_ms": 0.1803,
+      "A(128x128,nopersist)": {
+        "p50_ms": 0.1449,
+        "bw_gbps": 1.7,
+        "speedup": 1.244,
+        "bit_exact": true,
+        "max_diff": 0.0
+      },
+      "B(128x128,persist)": {
+        "p50_ms": 0.1437,
+        "bw_gbps": 1.7,
+        "speedup": 1.255,
+        "bit_exact": true,
+        "max_diff": 0.0
+      },
+      "C(256x128,persist)": {
+        "p50_ms": 0.1997,
+        "bw_gbps": 1.2,
+        "speedup": 0.903,
+        "bit_exact": true,
+        "max_diff": 0.0
+      },
+      "D(128x256,persist)": {
+        "p50_ms": 0.1718,
+        "bw_gbps": 1.4,
+        "speedup": 1.05,
+        "bit_exact": true,
+        "max_diff": 0.0
+      }
+    }
+  },
+  "totals_weighted_ms": {
+    "baseline": 76.079,
+    "A(128x128,nopersist)": 66.669,
+    "B(128x128,persist)": 66.851,
+    "C(256x128,persist)": 81.157,
+    "D(128x256,persist)": 71.596
+  }
+}

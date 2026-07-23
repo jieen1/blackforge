@@ -1,4 +1,5 @@
 """Unit tests for runtime/block_pool.py — CPU-only."""
+
 from __future__ import annotations
 
 import pytest

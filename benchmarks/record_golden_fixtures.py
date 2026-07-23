@@ -243,7 +243,7 @@ def main() -> None:
     with open(os.path.join(args.out, "golden_gdn_norms.json"), "w") as f:
         json.dump(gdn_out, f)
 
-    print(f"\n=== Golden Fixtures Recorded ===")
+    print("\n=== Golden Fixtures Recorded ===")
     print(f"  Output: {args.out}")
     for s in slots:
         n_tokens = len(committed_tokens[s])
@@ -254,8 +254,8 @@ def main() -> None:
     gdn_vals = len(gdn_norms_record[slots[0]][0]) if gdn_steps > 0 else 0
     print(f"  GDN norms: {gdn_steps} steps × {gdn_vals} values/step")
     print(f"  Logits top-k: {len(logits_record[slots[0]])} steps × 16 entries")
-    print(f"  Files: golden_meta.json, golden_tokens.json, golden_logits.json, "
-          f"golden_mtp_accept.json, golden_gdn_norms.json")
+    print("  Files: golden_meta.json, golden_tokens.json, golden_logits.json, "
+          "golden_mtp_accept.json, golden_gdn_norms.json")
 
 
 if __name__ == "__main__":

@@ -17,7 +17,6 @@ multi-request batching -- this round's scope does not need).
 
 from __future__ import annotations
 
-
 import torch
 
 from runtime.compat_vllm import (
@@ -47,7 +46,7 @@ _SM120_BACKEND_PATH = "vllm.v1.attention.backends.sm120_gqa.SM120GQABackend"
 # section). Root cause of the 100%-deterministic wrong output this round:
 # our hand-built metadata hardcoded physical index = logical slot (so slot
 # 0 -> physical index 0), which real vLLM's convention never produces --
-from runtime.block_pool import (
+from runtime.block_pool import (  # noqa: E402
     RESERVED_PHYSICAL_SLOTS,
     BlockHash,
     BlockPool,
@@ -227,7 +226,7 @@ def allocate_fixed_slot_kv_caches(
     return kv_caches
 
 
-from runtime.metadata_builders import (
+from runtime.metadata_builders import (  # noqa: E402
     build_attention_metadata,
     build_attention_metadata_batch,
     build_gdn_metadata,
@@ -280,13 +279,13 @@ def build_vllm_config(
     return config
 
 
-from runtime.backends.qwen36 import Qwen36Backend
-from runtime.cuda_graphs import CapturedBatchDecodeGraph, CapturedMTPDraftStepGraph
-from runtime.logprobs import compute_logprobs
-from runtime.model_spec import ModelSpec
-from runtime.gdn_state import GdnStateManager
-from runtime.prefix_cache import PrefixCacheOps
-from server.metrics import (
+from runtime.backends.qwen36 import Qwen36Backend  # noqa: E402
+from runtime.cuda_graphs import CapturedBatchDecodeGraph, CapturedMTPDraftStepGraph  # noqa: E402
+from runtime.gdn_state import GdnStateManager  # noqa: E402
+from runtime.logprobs import compute_logprobs  # noqa: E402
+from runtime.model_spec import ModelSpec  # noqa: E402
+from runtime.prefix_cache import PrefixCacheOps  # noqa: E402
+from server.metrics import (  # noqa: E402
     record_prefix_cache_hit,
     record_prefix_cache_miss,
 )
@@ -463,12 +462,32 @@ class DirectModelRunner:
         self._verify_graphs: dict[tuple[int, int], CapturedBatchDecodeGraph] = {}
         self._draft_step_graphs: dict[tuple[int, int], CapturedMTPDraftStepGraph] = {}
 
+        # A2: prefer B12x NVFP4 kernel on SM120+ (bit-exact, ~6% faster)
+        from runtime.nvfp4_b12x_patch import patch_nvfp4_prefer_b12x
+
+        patch_nvfp4_prefer_b12x()
+
+        # A2: option to force direct CUTLASS (bypasses FlashInfer Python wrapper)
+        from runtime.nvfp4_cutlass_direct_patch import patch_nvfp4_prefer_cutlass_direct
+
+        patch_nvfp4_prefer_cutlass_direct()
+
+        # A2: 自研 SM120 NVFP4 GEMM kernel (per-shape tile config, bit-exact)
+        from runtime.nvfp4_custom_gemm import patch_nvfp4_custom_gemm
+
+        patch_nvfp4_custom_gemm()
+
         with set_current_vllm_config(vllm_config):
             init_method = get_distributed_init_method("127.0.0.1", get_open_port())
             init_worker_distributed_environment(
                 vllm_config, rank=0, distributed_init_method=init_method, local_rank=0
             )
             self.model = get_model(vllm_config=vllm_config)
+
+        # A2: patch NVFP4 GEMM to cuDNN backend (12.6% faster, bit-exact)
+        from runtime.nvfp4_cudnn_patch import patch_nvfp4_to_cudnn
+
+        patch_nvfp4_to_cudnn()
 
         sfc = vllm_config.compilation_config.static_forward_context
         self.static_forward_context = sfc
@@ -489,7 +508,8 @@ class DirectModelRunner:
         self.spec = ModelSpec.from_runner_init(
             model_id=vllm_config.model_config.model,
             architecture=getattr(
-                vllm_config.model_config, "architecture",
+                vllm_config.model_config,
+                "architecture",
                 "Qwen3_5ForConditionalGeneration",
             ),
             attn_layer_names=self.attn_layer_names,
@@ -1139,9 +1159,7 @@ class DirectModelRunner:
         logits = self._forward(slot, [token_id], start_pos=start_pos, is_decode=True)
         return int(logits[-1].argmax(dim=-1).item())
 
-    def decode_sampled(
-        self, slot: int, token_id: int, params: SamplingParams
-    ) -> int:
+    def decode_sampled(self, slot: int, token_id: int, params: SamplingParams) -> int:
         """Consume one token, return the sampled next token id.
 
         For ``temperature == 0`` this is bit-identical to ``decode()``.
@@ -1508,7 +1526,9 @@ class DirectModelRunner:
         if return_logprobs:
             lp_list = [
                 compute_logprobs(
-                    logits[i].unsqueeze(0), [results[i]], top_k=top_logprobs,
+                    logits[i].unsqueeze(0),
+                    [results[i]],
+                    top_k=top_logprobs,
                 )[0]
                 for i in range(len(results))
             ]
@@ -1562,7 +1582,9 @@ class DirectModelRunner:
         return_hidden: bool = False,
     ) -> torch.Tensor:
         return self.backend.verify_batch_spec(
-            slot_ids, draft_token_ids, kv_lengths,
+            slot_ids,
+            draft_token_ids,
+            kv_lengths,
             num_accepted_tokens_prev=num_accepted_tokens_prev,
             return_hidden=return_hidden,
         )
@@ -1581,7 +1603,9 @@ class DirectModelRunner:
         allow_cross_slot: bool = False,
     ) -> None:
         return self.gdn_state.restore_gdn_state(
-            slot, snapshot, allow_cross_slot=allow_cross_slot,
+            slot,
+            snapshot,
+            allow_cross_slot=allow_cross_slot,
         )
 
     def _mtp_forward(
@@ -1595,8 +1619,12 @@ class DirectModelRunner:
         is_decode: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return self.backend._mtp_forward(
-            slot, token_ids, hidden_states_in, start_pos,
-            prior_kv_len=prior_kv_len, is_decode=is_decode,
+            slot,
+            token_ids,
+            hidden_states_in,
+            start_pos,
+            prior_kv_len=prior_kv_len,
+            is_decode=is_decode,
         )
 
     def _mtp_sync_and_propose(
@@ -1609,8 +1637,12 @@ class DirectModelRunner:
         k: int,
     ) -> list[int]:
         return self.backend._mtp_sync_and_propose(
-            slot, shifted_input_ids, target_hidden_states,
-            start_pos, num_new_tokens, k,
+            slot,
+            shifted_input_ids,
+            target_hidden_states,
+            start_pos,
+            num_new_tokens,
+            k,
         )
 
     def mtp_prefill(self, slot: int, prompt_token_ids: list[int]) -> dict:
@@ -1632,8 +1664,13 @@ class DirectModelRunner:
         logits_last_position_only: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return self.backend._mtp_forward_batch(
-            slots, token_ids, hidden_states_in, prior_kv_lens,
-            start_pos_list, qo_len=qo_len, is_decode=is_decode,
+            slots,
+            token_ids,
+            hidden_states_in,
+            prior_kv_lens,
+            start_pos_list,
+            qo_len=qo_len,
+            is_decode=is_decode,
             logits_last_position_only=logits_last_position_only,
         )
 
@@ -1648,8 +1685,13 @@ class DirectModelRunner:
         k: int,
     ) -> None:
         return self.backend._mtp_run_continuation_steps(
-            slots, draft_tokens, prev_tokens, prev_hidden,
-            next_pos_list, running_prior_kv_len, k,
+            slots,
+            draft_tokens,
+            prev_tokens,
+            prev_hidden,
+            next_pos_list,
+            running_prior_kv_len,
+            k,
         )
 
     def _mtp_sync_and_propose_batch(
@@ -1663,8 +1705,12 @@ class DirectModelRunner:
         step0_logits_last_position_only: bool = False,
     ) -> dict[int, list[int]]:
         return self.backend._mtp_sync_and_propose_batch(
-            slots, shifted_input_ids_per_slot, target_hidden_states,
-            start_pos_list, num_new_tokens, k,
+            slots,
+            shifted_input_ids_per_slot,
+            target_hidden_states,
+            start_pos_list,
+            num_new_tokens,
+            k,
             step0_logits_last_position_only,
         )
 
@@ -1808,13 +1854,12 @@ class DirectModelRunner:
             for i, s in enumerate(slots):
                 state.anchors[s] = int(target_logits_chunk[i].argmax(dim=-1).item())
             shifted_chunk_per_slot = [
-                suffix_per_slot[i][chunk_start + 1:] + [state.anchors[slots[i]]]
+                suffix_per_slot[i][chunk_start + 1 :] + [state.anchors[slots[i]]]
                 for i in range(num_reqs)
             ]
         else:
             shifted_chunk_per_slot = [
-                suffix_per_slot[i][chunk_start + 1:chunk_end + 1]
-                for i in range(num_reqs)
+                suffix_per_slot[i][chunk_start + 1 : chunk_end + 1] for i in range(num_reqs)
             ]
 
         # Draft model forward for this chunk
@@ -1839,10 +1884,7 @@ class DirectModelRunner:
             state.step0_hidden = draft_hidden_chunk
 
         # P3.2 chunk-boundary GDN checkpoints (block-aligned boundaries)
-        if (
-            self.enable_persistent_prefix_cache
-            and not is_last_chunk
-        ):
+        if self.enable_persistent_prefix_cache and not is_last_chunk:
             abs_kv_end = self.slot_kv_len[slots[0]]
             if abs_kv_end % self.block_size == 0:
                 num_chunk_blocks = abs_kv_end // self.block_size
@@ -1912,7 +1954,9 @@ class DirectModelRunner:
         min_shared_prefix_tokens: int | None = None,
     ) -> dict[int, dict]:
         return self.backend.mtp_prefill_fanout_batch(
-            slots, prompts_per_slot, min_shared_prefix_tokens,
+            slots,
+            prompts_per_slot,
+            min_shared_prefix_tokens,
         )
 
     def _publish_committed_blocks(self, slot: int, token_ids: list[int], committed_len: int) -> int:
@@ -1959,8 +2003,9 @@ class DirectModelRunner:
         top_logprobs: int = 0,
     ) -> dict[int, dict]:
         return self.backend.mtp_verify_and_commit_batch(
-            slots, anchors, draft_tokens,
+            slots,
+            anchors,
+            draft_tokens,
             return_logprobs=return_logprobs,
             top_logprobs=top_logprobs,
         )
-

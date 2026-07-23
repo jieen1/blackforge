@@ -47,7 +47,6 @@ def capture_gdn_norms(runner, slot: int) -> list[float]:
 
 def run_recording(num_prompts: int, decode_steps: int, concurrency: int):
     """Run the same recording logic and return results dict."""
-    import torch
 
     sys.path.insert(0, "/home/bot/project/sm120-flash-attention/vllm_integration")
     import register_sm120_backend  # noqa: F401
@@ -312,9 +311,9 @@ def main() -> None:
             print(f"  • {f_msg}")
         sys.exit(1)
     else:
-        print(f"\n✅ PARITY CHECK PASSED")
-        print(f"  Tokens: bit-exact ✓")
-        print(f"  MTP acceptance: bit-exact ✓")
+        print("\n✅ PARITY CHECK PASSED")
+        print("  Tokens: bit-exact ✓")
+        print("  MTP acceptance: bit-exact ✓")
         print(f"  GDN norms: within rtol={args.gdn_rtol} ✓")
         print(f"  Logits top-k: ids bit-exact, values within atol={args.logits_atol} ✓")
         sys.exit(0)

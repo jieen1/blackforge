@@ -1,0 +1,95 @@
+[
+  {
+    "tag": "custom_v2",
+    "b12x": false,
+    "cudnn": false,
+    "gpu": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+    "date": "2026-07-23T07:44:32",
+    "prompt_len": 2048,
+    "max_tokens": 128,
+    "avg_accepted_tok_s": 53.3,
+    "avg_accept_rate": 0.768,
+    "reps": [
+      {
+        "rep": 0,
+        "tokens": 129,
+        "rounds": 42,
+        "elapsed_s": 2.4595,
+        "accepted_tok_s": 52.4,
+        "accept_rate": 0.768
+      },
+      {
+        "rep": 1,
+        "tokens": 129,
+        "rounds": 42,
+        "elapsed_s": 2.4536,
+        "accepted_tok_s": 52.6,
+        "accept_rate": 0.768
+      },
+      {
+        "rep": 2,
+        "tokens": 129,
+        "rounds": 42,
+        "elapsed_s": 2.257,
+        "accepted_tok_s": 57.2,
+        "accept_rate": 0.768
+      },
+      {
+        "rep": 3,
+        "tokens": 129,
+        "rounds": 42,
+        "elapsed_s": 2.3709,
+        "accepted_tok_s": 54.4,
+        "accept_rate": 0.768
+      },
+      {
+        "rep": 4,
+        "tokens": 129,
+        "rounds": 42,
+        "elapsed_s": 2.446,
+        "accepted_tok_s": 52.7,
+        "accept_rate": 0.768
+      },
+      {
+        "rep": 5,
+        "tokens": 129,
+        "rounds": 42,
+        "elapsed_s": 2.4685,
+        "accepted_tok_s": 52.3,
+        "accept_rate": 0.768
+      },
+      {
+        "rep": 6,
+        "tokens": 129,
+        "rounds": 42,
+        "elapsed_s": 2.3969,
+        "accepted_tok_s": 53.8,
+        "accept_rate": 0.768
+      },
+      {
+        "rep": 7,
+        "tokens": 129,
+        "rounds": 42,
+        "elapsed_s": 2.5427,
+        "accepted_tok_s": 50.7,
+        "accept_rate": 0.768
+      },
+      {
+        "rep": 8,
+        "tokens": 129,
+        "rounds": 42,
+        "elapsed_s": 2.6352,
+        "accepted_tok_s": 49.0,
+        "accept_rate": 0.768
+      },
+      {
+        "rep": 9,
+        "tokens": 129,
+        "rounds": 42,
+        "elapsed_s": 2.2337,
+        "accepted_tok_s": 57.8,
+        "accept_rate": 0.768
+      }
+    ]
+  }
+]

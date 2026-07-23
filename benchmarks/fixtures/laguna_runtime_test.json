@@ -1,0 +1,35 @@
+{
+  "model": "poolside/Laguna-S-2.1-NVFP4",
+  "date": "2026-07-23T07:13:18",
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+  "cutlass_direct": true,
+  "load_time_s": 297.1,
+  "gpu_mem_mib": 0,
+  "greedy_determinism": true,
+  "greedy_output": " Paris.\n\nThe user is asking for the capital of France. The answer is Paris. I should provide a clear and concise response. Let me confirm that there's no trick here. The question is straightforward. The capital of France is indeed Paris.",
+  "throughput": {
+    "single_tps": 21.0,
+    "batch4_tps": 80.9,
+    "itl_ms": 47.6,
+    "reps": 5
+  },
+  "quality": [
+    {
+      "name": "Math",
+      "passed": true,
+      "n_tokens": 200
+    },
+    {
+      "name": "Code",
+      "passed": true,
+      "n_tokens": 200
+    },
+    {
+      "name": "Knowledge",
+      "passed": true,
+      "n_tokens": 200
+    }
+  ],
+  "concurrent": true,
+  "all_pass": true
+}

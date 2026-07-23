@@ -1,9 +1,12 @@
 """Unit tests for runtime/mtp_accept.py — CPU-only."""
+
 from __future__ import annotations
 
-import torch
+import pytest
 
-from runtime.mtp_accept import determine_accept_reject, determine_accept_reject_batch
+torch = pytest.importorskip("torch")
+
+from runtime.mtp_accept import determine_accept_reject, determine_accept_reject_batch  # noqa: E402
 
 
 class TestDetermineAcceptReject:

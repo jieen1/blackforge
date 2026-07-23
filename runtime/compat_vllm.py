@@ -21,6 +21,10 @@ must preserve bit-level parity on the greedy fixed-prompt suite.
 from __future__ import annotations
 
 import socket
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import torch
 
 __all__ = [
     "FLA_CHUNK_SIZE",
@@ -182,25 +186,17 @@ def _extract_layer_index(layer_name: str, num_attn_module: int = 1) -> int:
         except ValueError:
             continue
     if num_attn_module == 1 or "attn" not in layer_name:
-        assert len(int_vals) == 1, (
-            f"layer name {layer_name} should only contain one integer"
-        )
+        assert len(int_vals) == 1, f"layer name {layer_name} should only contain one integer"
         return int_vals[0]
     else:
-        assert len(int_vals) <= 2, (
-            f"layer name {layer_name} should contain most two integers"
-        )
-        return (
-            int_vals[0] * num_attn_module + int_vals[1]
-            if len(int_vals) == 2
-            else int_vals[0]
-        )
+        assert len(int_vals) <= 2, f"layer name {layer_name} should contain most two integers"
+        return int_vals[0] * num_attn_module + int_vals[1] if len(int_vals) == 2 else int_vals[0]
 
 
 def bind_kv_cache(
-    kv_caches: "dict[str, torch.Tensor]",
-    forward_context: "dict[str, object]",
-    runner_kv_caches: "list[torch.Tensor]",
+    kv_caches: dict[str, torch.Tensor],
+    forward_context: dict[str, object],
+    runner_kv_caches: list[torch.Tensor],
     num_attn_module: int = 1,
 ) -> None:
     """Bind allocated KV caches to ModelRunner list and forward context.
@@ -238,7 +234,7 @@ from contextlib import contextmanager  # noqa: E402
 @contextmanager
 def set_forward_context(
     attn_metadata,
-    vllm_config: "VllmConfig",
+    vllm_config: VllmConfig,
     *,
     slot_mapping=None,
     **_ignored_kwargs,
@@ -254,7 +250,9 @@ def set_forward_context(
     """
     forward_context = ForwardContext(
         no_compile_layers=vllm_config.compilation_config.static_forward_context,
-        all_moe_layers=None,
+        all_moe_layers=getattr(
+            vllm_config.compilation_config, "static_all_moe_layers", None
+        ),
         attn_metadata=attn_metadata,
         slot_mapping=slot_mapping or {},
         dp_metadata=None,
@@ -286,17 +284,19 @@ _PAD_SLOT_ID = -1
 
 def _is_pin_memory_available() -> bool:
     import torch
+
     return torch.cuda.is_available() and hasattr(torch.Tensor, "pin_memory")
 
 
-def _np_to_pinned_tensor(array) -> "torch.Tensor":
+def _np_to_pinned_tensor(array) -> torch.Tensor:
     import torch
+
     t = torch.from_numpy(array)
     return t.pin_memory() if _is_pin_memory_available() else t
 
 
 def compute_causal_conv1d_metadata(
-    query_start_loc_p_cpu: "torch.Tensor", *, device: "torch.device"
+    query_start_loc_p_cpu: torch.Tensor, *, device: torch.device
 ) -> tuple:
     """Compute chunk metadata for causal_conv1d kernel.
 

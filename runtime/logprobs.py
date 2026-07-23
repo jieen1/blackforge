@@ -37,9 +37,7 @@ def compute_logprobs(
     """
     seq_len = len(token_ids)
     if logits.shape[0] < seq_len:
-        raise ValueError(
-            f"logits has {logits.shape[0]} positions but {seq_len} tokens requested"
-        )
+        raise ValueError(f"logits has {logits.shape[0]} positions but {seq_len} tokens requested")
     log_probs = torch.log_softmax(logits[:seq_len].float(), dim=-1)
 
     token_tensor = torch.tensor(token_ids, dtype=torch.long, device=logits.device)

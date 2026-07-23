@@ -1,0 +1,492 @@
+{
+  "date": "2026-07-23T07:47:30",
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+  "table": {
+    "M1_gate_up_proj": {
+      "M": 1,
+      "N": 34816,
+      "K": 5120,
+      "count": 56,
+      "best_config": "128x256p",
+      "best_p50_ms": 0.5154,
+      "all_exact": true,
+      "configs": {
+        "128x128": {
+          "p50_ms": 0.5504,
+          "exact": true
+        },
+        "128x128p": {
+          "p50_ms": 0.5549,
+          "exact": true
+        },
+        "256x128p": {
+          "p50_ms": 0.6309,
+          "exact": true
+        },
+        "128x256p": {
+          "p50_ms": 0.5154,
+          "exact": true
+        }
+      }
+    },
+    "M4_gate_up_proj": {
+      "M": 4,
+      "N": 34816,
+      "K": 5120,
+      "count": 56,
+      "best_config": "128x256p",
+      "best_p50_ms": 0.4881,
+      "all_exact": true,
+      "configs": {
+        "128x128": {
+          "p50_ms": 0.5227,
+          "exact": true
+        },
+        "128x128p": {
+          "p50_ms": 0.5889,
+          "exact": true
+        },
+        "256x128p": {
+          "p50_ms": 0.6549,
+          "exact": true
+        },
+        "128x256p": {
+          "p50_ms": 0.4881,
+          "exact": true
+        }
+      }
+    },
+    "M16_gate_up_proj": {
+      "M": 16,
+      "N": 34816,
+      "K": 5120,
+      "count": 56,
+      "best_config": "128x256p",
+      "best_p50_ms": 0.4106,
+      "all_exact": true,
+      "configs": {
+        "128x128": {
+          "p50_ms": 0.5553,
+          "exact": true
+        },
+        "128x128p": {
+          "p50_ms": 0.5103,
+          "exact": true
+        },
+        "256x128p": {
+          "p50_ms": 0.6175,
+          "exact": true
+        },
+        "128x256p": {
+          "p50_ms": 0.4106,
+          "exact": true
+        }
+      }
+    },
+    "M1_down_proj": {
+      "M": 1,
+      "N": 5120,
+      "K": 17408,
+      "count": 56,
+      "best_config": "128x128",
+      "best_p50_ms": 0.3596,
+      "all_exact": true,
+      "configs": {
+        "128x128": {
+          "p50_ms": 0.3596,
+          "exact": true
+        },
+        "128x128p": {
+          "p50_ms": 0.3608,
+          "exact": true
+        },
+        "256x128p": {
+          "p50_ms": 0.5315,
+          "exact": true
+        },
+        "128x256p": {
+          "p50_ms": 0.5644,
+          "exact": true
+        }
+      }
+    },
+    "M4_down_proj": {
+      "M": 4,
+      "N": 5120,
+      "K": 17408,
+      "count": 56,
+      "best_config": "128x128",
+      "best_p50_ms": 0.4014,
+      "all_exact": true,
+      "configs": {
+        "128x128": {
+          "p50_ms": 0.4014,
+          "exact": true
+        },
+        "128x128p": {
+          "p50_ms": 0.4221,
+          "exact": true
+        },
+        "256x128p": {
+          "p50_ms": 0.4875,
+          "exact": true
+        },
+        "128x256p": {
+          "p50_ms": 0.4887,
+          "exact": true
+        }
+      }
+    },
+    "M16_down_proj": {
+      "M": 16,
+      "N": 5120,
+      "K": 17408,
+      "count": 56,
+      "best_config": "128x128p",
+      "best_p50_ms": 0.4056,
+      "all_exact": true,
+      "configs": {
+        "128x128": {
+          "p50_ms": 0.4437,
+          "exact": true
+        },
+        "128x128p": {
+          "p50_ms": 0.4056,
+          "exact": true
+        },
+        "256x128p": {
+          "p50_ms": 0.5623,
+          "exact": true
+        },
+        "128x256p": {
+          "p50_ms": 0.5795,
+          "exact": true
+        }
+      }
+    },
+    "M1_down_proj_attn": {
+      "M": 1,
+      "N": 17408,
+      "K": 17408,
+      "count": 8,
+      "best_config": "128x256p",
+      "best_p50_ms": 0.6313,
+      "all_exact": true,
+      "configs": {
+        "128x128": {
+          "p50_ms": 0.6791,
+          "exact": true
+        },
+        "128x128p": {
+          "p50_ms": 0.6498,
+          "exact": true
+        },
+        "256x128p": {
+          "p50_ms": 0.8093,
+          "exact": true
+        },
+        "128x256p": {
+          "p50_ms": 0.6313,
+          "exact": true
+        }
+      }
+    },
+    "M4_down_proj_attn": {
+      "M": 4,
+      "N": 17408,
+      "K": 17408,
+      "count": 8,
+      "best_config": "128x256p",
+      "best_p50_ms": 0.5502,
+      "all_exact": true,
+      "configs": {
+        "128x128": {
+          "p50_ms": 0.659,
+          "exact": true
+        },
+        "128x128p": {
+          "p50_ms": 0.6559,
+          "exact": true
+        },
+        "256x128p": {
+          "p50_ms": 0.8237,
+          "exact": true
+        },
+        "128x256p": {
+          "p50_ms": 0.5502,
+          "exact": true
+        }
+      }
+    },
+    "M16_down_proj_attn": {
+      "M": 16,
+      "N": 17408,
+      "K": 17408,
+      "count": 8,
+      "best_config": "128x128",
+      "best_p50_ms": 0.5401,
+      "all_exact": true,
+      "configs": {
+        "128x128": {
+          "p50_ms": 0.5401,
+          "exact": true
+        },
+        "128x128p": {
+          "p50_ms": 0.6266,
+          "exact": true
+        },
+        "256x128p": {
+          "p50_ms": 0.7858,
+          "exact": true
+        },
+        "128x256p": {
+          "p50_ms": 0.5993,
+          "exact": true
+        }
+      }
+    },
+    "M1_out_proj": {
+      "M": 1,
+      "N": 6144,
+      "K": 6144,
+      "count": 64,
+      "best_config": "128x128",
+      "best_p50_ms": 0.4179,
+      "all_exact": true,
+      "configs": {
+        "128x128": {
+          "p50_ms": 0.4179,
+          "exact": true
+        },
+        "128x128p": {
+          "p50_ms": 0.458,
+          "exact": true
+        },
+        "256x128p": {
+          "p50_ms": 0.4372,
+          "exact": true
+        },
+        "128x256p": {
+          "p50_ms": 0.4535,
+          "exact": true
+        }
+      }
+    },
+    "M4_out_proj": {
+      "M": 4,
+      "N": 6144,
+      "K": 6144,
+      "count": 64,
+      "best_config": "128x128p",
+      "best_p50_ms": 0.3714,
+      "all_exact": true,
+      "configs": {
+        "128x128": {
+          "p50_ms": 0.3965,
+          "exact": true
+        },
+        "128x128p": {
+          "p50_ms": 0.3714,
+          "exact": true
+        },
+        "256x128p": {
+          "p50_ms": 0.4836,
+          "exact": true
+        },
+        "128x256p": {
+          "p50_ms": 0.3999,
+          "exact": true
+        }
+      }
+    },
+    "M16_out_proj": {
+      "M": 16,
+      "N": 6144,
+      "K": 6144,
+      "count": 64,
+      "best_config": "128x128p",
+      "best_p50_ms": 0.3915,
+      "all_exact": true,
+      "configs": {
+        "128x128": {
+          "p50_ms": 0.4617,
+          "exact": true
+        },
+        "128x128p": {
+          "p50_ms": 0.3915,
+          "exact": true
+        },
+        "256x128p": {
+          "p50_ms": 0.459,
+          "exact": true
+        },
+        "128x256p": {
+          "p50_ms": 0.4146,
+          "exact": true
+        }
+      }
+    },
+    "M1_in_proj_qkvz": {
+      "M": 1,
+      "N": 5120,
+      "K": 5120,
+      "count": 72,
+      "best_config": "128x256p",
+      "best_p50_ms": 0.2653,
+      "all_exact": true,
+      "configs": {
+        "128x128": {
+          "p50_ms": 0.409,
+          "exact": true
+        },
+        "128x128p": {
+          "p50_ms": 0.3789,
+          "exact": true
+        },
+        "256x128p": {
+          "p50_ms": 0.3694,
+          "exact": true
+        },
+        "128x256p": {
+          "p50_ms": 0.2653,
+          "exact": true
+        }
+      }
+    },
+    "M4_in_proj_qkvz": {
+      "M": 4,
+      "N": 5120,
+      "K": 5120,
+      "count": 72,
+      "best_config": "128x128p",
+      "best_p50_ms": 0.1949,
+      "all_exact": true,
+      "configs": {
+        "128x128": {
+          "p50_ms": 0.2303,
+          "exact": true
+        },
+        "128x128p": {
+          "p50_ms": 0.1949,
+          "exact": true
+        },
+        "256x128p": {
+          "p50_ms": 0.2183,
+          "exact": true
+        },
+        "128x256p": {
+          "p50_ms": 0.3558,
+          "exact": true
+        }
+      }
+    },
+    "M16_in_proj_qkvz": {
+      "M": 16,
+      "N": 5120,
+      "K": 5120,
+      "count": 72,
+      "best_config": "256x128p",
+      "best_p50_ms": 0.236,
+      "all_exact": true,
+      "configs": {
+        "128x128": {
+          "p50_ms": 0.2371,
+          "exact": true
+        },
+        "128x128p": {
+          "p50_ms": 0.2669,
+          "exact": true
+        },
+        "256x128p": {
+          "p50_ms": 0.236,
+          "exact": true
+        },
+        "128x256p": {
+          "p50_ms": 0.2423,
+          "exact": true
+        }
+      }
+    },
+    "M1_in_proj_ba": {
+      "M": 1,
+      "N": 96,
+      "K": 5120,
+      "count": 48,
+      "best_config": "128x128",
+      "best_p50_ms": 0.1936,
+      "all_exact": true,
+      "configs": {
+        "128x128": {
+          "p50_ms": 0.1936,
+          "exact": true
+        },
+        "128x128p": {
+          "p50_ms": 0.4266,
+          "exact": true
+        },
+        "256x128p": {
+          "p50_ms": 0.4454,
+          "exact": true
+        },
+        "128x256p": {
+          "p50_ms": 0.4131,
+          "exact": true
+        }
+      }
+    },
+    "M4_in_proj_ba": {
+      "M": 4,
+      "N": 96,
+      "K": 5120,
+      "count": 48,
+      "best_config": "128x128p",
+      "best_p50_ms": 0.3224,
+      "all_exact": true,
+      "configs": {
+        "128x128": {
+          "p50_ms": 0.3359,
+          "exact": true
+        },
+        "128x128p": {
+          "p50_ms": 0.3224,
+          "exact": true
+        },
+        "256x128p": {
+          "p50_ms": 0.3761,
+          "exact": true
+        },
+        "128x256p": {
+          "p50_ms": 0.3711,
+          "exact": true
+        }
+      }
+    },
+    "M16_in_proj_ba": {
+      "M": 16,
+      "N": 96,
+      "K": 5120,
+      "count": 48,
+      "best_config": "128x128p",
+      "best_p50_ms": 0.3598,
+      "all_exact": true,
+      "configs": {
+        "128x128": {
+          "p50_ms": 0.3706,
+          "exact": true
+        },
+        "128x128p": {
+          "p50_ms": 0.3598,
+          "exact": true
+        },
+        "256x128p": {
+          "p50_ms": 0.3825,
+          "exact": true
+        },
+        "128x256p": {
+          "p50_ms": 0.4183,
+          "exact": true
+        }
+      }
+    }
+  }
+}

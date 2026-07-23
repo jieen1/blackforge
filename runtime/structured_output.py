@@ -43,9 +43,7 @@ def _ensure_xgrammar(tokenizer) -> None:
     import xgrammar as xgr
 
     _xgr = xgr
-    _tokenizer_info = xgr.TokenizerInfo.from_huggingface(
-        tokenizer, vocab_size=tokenizer.vocab_size
-    )
+    _tokenizer_info = xgr.TokenizerInfo.from_huggingface(tokenizer, vocab_size=tokenizer.vocab_size)
     _compiler = xgr.GrammarCompiler(_tokenizer_info, max_threads=4, cache_enabled=True)
     logger.info("xgrammar compiler initialized (vocab_size=%d)", tokenizer.vocab_size)
 
@@ -62,7 +60,7 @@ class ResponseFormat:
         return self.type in ("json_object", "json_schema")
 
     @classmethod
-    def from_api(cls, response_format: dict | None) -> "ResponseFormat":
+    def from_api(cls, response_format: dict | None) -> ResponseFormat:
         if response_format is None:
             return cls(type="text")
         fmt_type = response_format.get("type", "text")
@@ -82,7 +80,6 @@ def _unpack_bitmask_to_mask(bitmask_row: torch.Tensor, vocab_size: int) -> torch
     """
     # bitmask_row: [ceil(vocab/32)] int32
     # Expand each int32 into 32 bits using bitwise AND with powers of 2
-    num_words = bitmask_row.shape[0]
     # Create bit position tensor [32]
     bit_positions = torch.arange(32, dtype=torch.int32)
     # Expand bitmask to [num_words, 32] via right-shift and AND

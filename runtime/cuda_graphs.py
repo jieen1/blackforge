@@ -3,11 +3,15 @@
 从 direct_model_runner.py 提取的 CapturedBatchDecodeGraph + CapturedMTPDraftStepGraph。
 纯移动不改逻辑（B5 parity 门禁）。
 """
+
 from __future__ import annotations
 
-from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
+
+if TYPE_CHECKING:
+    from runtime.direct_model_runner import DirectModelRunner
 
 from runtime.block_pool import RESERVED_PHYSICAL_SLOTS, _physical_slot, _ssm_spec_row
 from runtime.compat_vllm import (
@@ -15,10 +19,7 @@ from runtime.compat_vllm import (
     SM120GQAMetadata,
     set_forward_context,
 )
-from runtime.metadata_builders import (
-    build_attention_metadata,
-    build_gdn_metadata,
-)
+
 
 class CapturedBatchDecodeGraph:
     """CUDA-graph-captured batch decode/verify for a FIXED batch size and

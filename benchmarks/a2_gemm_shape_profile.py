@@ -11,7 +11,6 @@ import argparse
 import json
 import os
 import sys
-import time
 from collections import defaultdict
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -181,7 +180,7 @@ def main() -> None:
             print(f"  {op}{a_shape} × {b_shape}: {count}×")
 
     # Compute theoretical FLOPs per shape
-    print(f"\nTheoretical FLOPs per verify round (2*M*N*K per GEMM):")
+    print("\nTheoretical FLOPs per verify round (2*M*N*K per GEMM):")
     total_flops = 0
     for (m, n, k), count in sorted(shape_counts.items(), key=lambda x: -x[1]):
         flops_per_call = 2 * m * n * k

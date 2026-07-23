@@ -14,7 +14,6 @@ import argparse
 import json
 import os
 import sys
-import time
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:

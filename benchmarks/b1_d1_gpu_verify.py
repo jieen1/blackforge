@@ -51,9 +51,8 @@ def _build_runner(max_len: int):
 
 def test_b1_sampling(runner) -> None:
     """B1: Verify sampling produces valid, non-greedy output."""
-    import torch
 
-    from runtime.sampling import SamplingParams, make_generator, sample_from_logits
+    from runtime.sampling import SamplingParams
 
     print("\n=== B1: Sampling E2E Verification ===")
 

@@ -1,8 +1,10 @@
 """C3: tests for runtime/structured_output.py — structured output / JSON mode."""
-import pytest
-import torch
 
-from runtime.structured_output import ResponseFormat, _unpack_bitmask_to_mask
+import pytest
+
+torch = pytest.importorskip("torch")
+
+from runtime.structured_output import ResponseFormat, _unpack_bitmask_to_mask  # noqa: E402
 
 
 class TestResponseFormat:
@@ -25,10 +27,12 @@ class TestResponseFormat:
             "properties": {"name": {"type": "string"}},
             "required": ["name"],
         }
-        rf = ResponseFormat.from_api({
-            "type": "json_schema",
-            "json_schema": {"name": "test", "schema": schema},
-        })
+        rf = ResponseFormat.from_api(
+            {
+                "type": "json_schema",
+                "json_schema": {"name": "test", "schema": schema},
+            }
+        )
         assert rf.is_constrained
         assert rf.type == "json_schema"
         assert rf.json_schema is not None

@@ -3,9 +3,11 @@
 从 direct_model_runner.py 提取的 determine_accept_reject* 纯函数。
 纯移动不改逻辑（B5 parity 门禁）。
 """
+
 from __future__ import annotations
 
 import torch
+
 
 def determine_accept_reject(draft_tokens: list[int], verify_logits) -> dict:
     """Greedy MTP accept/reject (2026-07-17, moved here from
@@ -102,4 +104,3 @@ def determine_accept_reject_batch(
             "rejected_at": na if na < k else None,
         }
     return decisions
-

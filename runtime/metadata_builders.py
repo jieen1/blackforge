@@ -3,6 +3,7 @@
 从 direct_model_runner.py 提取的 build_*_metadata* 函数。
 纯移动不改逻辑（B5 parity 门禁）。
 """
+
 from __future__ import annotations
 
 import torch
@@ -16,6 +17,7 @@ from runtime.compat_vllm import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
 )
+
 
 def build_attention_metadata(
     *,
@@ -599,5 +601,3 @@ def build_gdn_metadata_spec_batch(
         spec_sequence_masks=spec_sequence_masks,
         num_accepted_tokens=num_accepted_tokens,
     )
-
-

@@ -10,7 +10,7 @@ B5 MTP methods extraction (Phase 2) by making the model boundary explicit.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
@@ -73,7 +73,7 @@ class ModelSpec:
         num_speculative_tokens: int = 0,
         kv_dtype: str = "fp8_e4m3",
         block_size: int = 16,
-    ) -> "ModelSpec":
+    ) -> ModelSpec:
         """Construct from runner initialization parameters."""
         return cls(
             model_id=model_id,

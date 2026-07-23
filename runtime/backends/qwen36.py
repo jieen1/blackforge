@@ -20,12 +20,12 @@ if TYPE_CHECKING:
     from runtime.direct_model_runner import DirectModelRunner
 
 from runtime.compat_vllm import set_forward_context
+from runtime.logprobs import compute_logprobs
 from runtime.metadata_builders import (
     _MAX_DECODE_QO_LEN,
     build_attention_metadata,
     build_attention_metadata_batch,
 )
-from runtime.logprobs import compute_logprobs
 from runtime.mtp_accept import determine_accept_reject, determine_accept_reject_batch
 from server.metrics import (
     record_mtp_acceptance,
@@ -636,8 +636,7 @@ class Qwen36Backend:
         ``CapturedMTPDraftStepGraph``'s own docstring documents."""
         num_reqs = len(slots)
         draft_step_graph = (
-            self._r._get_draft_step_graph(num_reqs)
-            if self._r.enable_cudagraph else None
+            self._r._get_draft_step_graph(num_reqs) if self._r.enable_cudagraph else None
         )
         for _ in range(1, k):
             if draft_step_graph is not None:
@@ -1309,7 +1308,6 @@ class Qwen36Backend:
             for i, s in enumerate(slots):
                 self._r._publish_committed_blocks(s, prompts_per_slot[i], prompt_lens[i])
         return {s: {"anchor": anchors[s], "draft_tokens": draft_tokens[s]} for s in slots}
-
 
     # =====================================================================
     # A5/B4: Incremental chunked prefill API (2026-07-22)
@@ -2105,7 +2103,8 @@ class Qwen36Backend:
             self._r.slot_kv_len[s] = kv_lens_before[s] + committed_lens[s]
             self._r.slot_num_accepted_tokens[s] = committed_lens[s]
             record_slot_kv_usage(
-                s, self._r.slot_kv_len[s] // self._r.block_size,
+                s,
+                self._r.slot_kv_len[s] // self._r.block_size,
                 self._r.blocks_per_slot,
             )
         # P3.2 decode-position populate (per slot): publish any newly-FULL
@@ -2139,12 +2138,12 @@ class Qwen36Backend:
         if return_logprobs:
             for i, s in enumerate(slots):
                 n_committed = committed_lens[s]
-                slot_logits = verify_logits[
-                    i * (k + 1) : i * (k + 1) + n_committed
-                ]
+                slot_logits = verify_logits[i * (k + 1) : i * (k + 1) + n_committed]
                 committed = decisions[s]["committed"]
                 logprobs_by_slot[s] = compute_logprobs(
-                    slot_logits, committed, top_k=top_logprobs,
+                    slot_logits,
+                    committed,
+                    top_k=top_logprobs,
                 )
 
         result: dict[int, dict] = {}
@@ -2158,5 +2157,3 @@ class Qwen36Backend:
             if return_logprobs:
                 result[s]["logprobs"] = logprobs_by_slot[s]
         return result
-
-

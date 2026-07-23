@@ -110,9 +110,7 @@ def _apply_top_p(logits: torch.Tensor, p: float) -> torch.Tensor:
     return sorted_logits.scatter(-1, sorted_indices, sorted_logits)
 
 
-def make_generator(
-    seed: int | None, device: str | None = None
-) -> torch.Generator | None:
+def make_generator(seed: int | None, device: str | None = None) -> torch.Generator | None:
     """Create a seeded generator for reproducible sampling.
 
     Returns ``None`` when ``seed is None`` (non-deterministic sampling).

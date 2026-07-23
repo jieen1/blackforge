@@ -212,19 +212,21 @@ class StreamProcessor:
             name_end = visible.find(">", func_pos + len(func_open))
             if name_end < 0:
                 break
-            func_name = visible[func_pos + len(func_open):name_end].strip()
+            func_name = visible[func_pos + len(func_open) : name_end].strip()
 
             # Emit name delta if not yet emitted for this index
             if not hasattr(self, "_tool_names_emitted"):
                 self._tool_names_emitted = set()
             if tc_idx not in self._tool_names_emitted:
                 self._tool_names_emitted.add(tc_idx)
-                deltas.append({
-                    "type": "name",
-                    "index": tc_idx,
-                    "name": func_name,
-                    "id": f"call_{func_name}_{tc_idx}",
-                })
+                deltas.append(
+                    {
+                        "type": "name",
+                        "index": tc_idx,
+                        "name": func_name,
+                        "id": f"call_{func_name}_{tc_idx}",
+                    }
+                )
 
             # Extract arguments (may be partial)
             args_start = name_end + 1
@@ -242,11 +244,13 @@ class StreamProcessor:
             if len(args_so_far) > prev_len:
                 delta_text = args_so_far[prev_len:]
                 self._tool_args_emitted_len[tc_idx] = len(args_so_far)
-                deltas.append({
-                    "type": "arguments_delta",
-                    "index": tc_idx,
-                    "delta": delta_text,
-                })
+                deltas.append(
+                    {
+                        "type": "arguments_delta",
+                        "index": tc_idx,
+                        "delta": delta_text,
+                    }
+                )
 
             search_start = args_end + len(func_close) if args_end >= 0 else len(visible)
             tc_idx += 1

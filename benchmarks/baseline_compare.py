@@ -19,7 +19,6 @@ import json
 import os
 import subprocess
 import sys
-import time
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASELINE_PATH = os.path.join(_REPO_ROOT, "benchmarks/fixtures/speed_baseline.json")
@@ -128,7 +127,7 @@ def main() -> None:
     args = parser.parse_args()
 
     baseline = load_baseline()
-    print(f"=== BlackForge Speed Baseline Comparison ===")
+    print("=== BlackForge Speed Baseline Comparison ===")
     print(f"  Baseline date: {baseline['date']}")
     print(f"  GPU: {baseline['gpu']}")
     print()

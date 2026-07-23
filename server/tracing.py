@@ -224,10 +224,18 @@ class RequestTracer:
             "active": len(self._active),
             "completed": len(completed),
             "slow_count": len(self._slow),
-            "avg_total_ms": round(sum(total_ms_list) / len(total_ms_list), 1) if total_ms_list else 0,
-            "p95_total_ms": round(sorted(total_ms_list)[int(len(total_ms_list) * 0.95)] if total_ms_list else 0, 1),
+            "avg_total_ms": (
+                round(sum(total_ms_list) / len(total_ms_list), 1) if total_ms_list else 0
+            ),
+            "p95_total_ms": (
+                round(sorted(total_ms_list)[int(len(total_ms_list) * 0.95)], 1)
+                if total_ms_list
+                else 0
+            ),
             "avg_tokens_per_sec": round(sum(tps_list) / len(tps_list), 1) if tps_list else 0,
-            "avg_prefill_ms": round(sum(prefill_list) / len(prefill_list), 1) if prefill_list else 0,
+            "avg_prefill_ms": (
+                round(sum(prefill_list) / len(prefill_list), 1) if prefill_list else 0
+            ),
         }
 
     def render_prometheus(self, model_name: str = "qwen3.6-27b") -> str:
@@ -248,7 +256,8 @@ class RequestTracer:
             f'vllm:trace_avg_total_ms{{model_name="{model_name}"}} {stats["avg_total_ms"]}',
             "# HELP vllm:trace_avg_tokens_per_sec Average decode throughput per request",
             "# TYPE vllm:trace_avg_tokens_per_sec gauge",
-            f'vllm:trace_avg_tokens_per_sec{{model_name="{model_name}"}} {stats["avg_tokens_per_sec"]}',
+            f'vllm:trace_avg_tokens_per_sec{{model_name="{model_name}"}} '
+            f"{stats['avg_tokens_per_sec']}",
         ]
         return "\n".join(lines)
 

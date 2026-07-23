@@ -1,0 +1,76 @@
+[
+  {
+    "tag": "stock2",
+    "b12x": false,
+    "cudnn": false,
+    "gpu": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+    "date": "2026-07-23T06:52:35",
+    "prompt_len": 2048,
+    "max_tokens": 128,
+    "avg_accepted_tok_s": 40.9,
+    "avg_accept_rate": 0.768,
+    "reps": [
+      {
+        "rep": 0,
+        "tokens": 129,
+        "rounds": 42,
+        "elapsed_s": 3.703,
+        "accepted_tok_s": 34.8,
+        "accept_rate": 0.768
+      },
+      {
+        "rep": 1,
+        "tokens": 129,
+        "rounds": 42,
+        "elapsed_s": 2.8827,
+        "accepted_tok_s": 44.7,
+        "accept_rate": 0.768
+      },
+      {
+        "rep": 2,
+        "tokens": 129,
+        "rounds": 42,
+        "elapsed_s": 2.987,
+        "accepted_tok_s": 43.2,
+        "accept_rate": 0.768
+      }
+    ]
+  },
+  {
+    "tag": "b12x",
+    "b12x": true,
+    "cudnn": false,
+    "gpu": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+    "date": "2026-07-23T06:53:35",
+    "prompt_len": 2048,
+    "max_tokens": 128,
+    "avg_accepted_tok_s": 39.6,
+    "avg_accept_rate": 0.768,
+    "reps": [
+      {
+        "rep": 0,
+        "tokens": 129,
+        "rounds": 42,
+        "elapsed_s": 3.2767,
+        "accepted_tok_s": 39.4,
+        "accept_rate": 0.768
+      },
+      {
+        "rep": 1,
+        "tokens": 129,
+        "rounds": 42,
+        "elapsed_s": 3.4346,
+        "accepted_tok_s": 37.6,
+        "accept_rate": 0.768
+      },
+      {
+        "rep": 2,
+        "tokens": 129,
+        "rounds": 42,
+        "elapsed_s": 3.082,
+        "accepted_tok_s": 41.9,
+        "accept_rate": 0.768
+      }
+    ]
+  }
+]

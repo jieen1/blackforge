@@ -124,45 +124,109 @@ def test_input_validation_and_unknown_batch_members_are_rejected() -> None:
 
 
 class TestWatchdog:
-    """Unit tests for the engine watchdog (D1)."""
+    """Unit tests for the engine watchdog (D1) via extracted pure functions."""
+
+    def test_find_stale_slots_detects_wedged_slot(self):
+        from server.engine import find_stale_slots
+
+        active = {
+            0: {"last_progress_round": 450},
+            1: {"last_progress_round": 100},
+            2: {"last_progress_round": 499},
+        }
+        stale = find_stale_slots(active, current_round=500, max_stale_rounds=200)
+        assert stale == [1]
+
+    def test_find_stale_slots_no_stale(self):
+        from server.engine import find_stale_slots
+
+        active = {
+            0: {"last_progress_round": 490},
+            1: {"last_progress_round": 495},
+        }
+        assert find_stale_slots(active, current_round=500, max_stale_rounds=200) == []
+
+    def test_find_stale_slots_disabled_at_zero(self):
+        from server.engine import find_stale_slots
+
+        active = {0: {"last_progress_round": 0}}
+        assert find_stale_slots(active, current_round=1000, max_stale_rounds=0) == []
+
+    def test_find_stale_slots_missing_key_defaults_to_zero(self):
+        from server.engine import find_stale_slots
+
+        active = {0: {}}  # no last_progress_round key
+        stale = find_stale_slots(active, current_round=300, max_stale_rounds=200)
+        assert stale == [0]
+
+    def test_find_stale_slots_empty_active(self):
+        from server.engine import find_stale_slots
+
+        assert find_stale_slots({}, current_round=100, max_stale_rounds=10) == []
+
+    def test_find_stale_slots_boundary_not_stale(self):
+        """Exactly max_stale_rounds behind is NOT stale (must exceed)."""
+        from server.engine import find_stale_slots
+
+        active = {0: {"last_progress_round": 300}}
+        assert find_stale_slots(active, current_round=500, max_stale_rounds=200) == []
 
     def test_watchdog_config_default(self):
         from server.engine import ServerEngine
 
         assert "watchdog_max_stale_rounds" in ServerEngine.__init__.__code__.co_varnames
 
-    def test_watchdog_stats_initialized(self):
-        """Watchdog stats fields exist in the stats dict template."""
-        import server.engine as eng_mod
-
-        src = open(eng_mod.__file__).read()
-        assert "watchdog_triggers" in src
-        assert "watchdog_events" in src
-
-    def test_watchdog_stale_detection_logic(self):
-        """Simulate the stale-slot detection predicate."""
-        max_stale = 200
-        current_round = 500
-        active = {
-            0: {"last_progress_round": 450},
-            1: {"last_progress_round": 100},
-            2: {"last_progress_round": 499},
-        }
-        stale = [
-            s
-            for s, st in active.items()
-            if current_round - st.get("last_progress_round", 0) > max_stale
-        ]
-        assert stale == [1]
-
-    def test_watchdog_disabled_at_zero(self):
-        """watchdog_max_stale_rounds=0 disables the watchdog."""
-        max_stale = 0
-        assert max_stale <= 0
-
 
 class TestRequestTimeout:
-    """Unit tests for request-level timeout (C5)."""
+    """Unit tests for request-level timeout (C5) via extracted pure functions."""
+
+    def test_find_timed_out_slots_detects_expired(self):
+        from server.engine import find_timed_out_slots
+
+        now = 1000.0
+        active = {
+            0: {"start_time": now - 100},
+            1: {"start_time": now - 700},
+            2: {"start_time": now - 50},
+        }
+        timed_out = find_timed_out_slots(active, now=now, timeout_s=600.0)
+        assert timed_out == [1]
+
+    def test_find_timed_out_slots_none_expired(self):
+        from server.engine import find_timed_out_slots
+
+        now = 1000.0
+        active = {
+            0: {"start_time": now - 10},
+            1: {"start_time": now - 20},
+        }
+        assert find_timed_out_slots(active, now=now, timeout_s=600.0) == []
+
+    def test_find_timed_out_slots_disabled_at_zero(self):
+        from server.engine import find_timed_out_slots
+
+        active = {0: {"start_time": 0.0}}
+        assert find_timed_out_slots(active, now=9999.0, timeout_s=0) == []
+
+    def test_find_timed_out_slots_missing_key_defaults_to_now(self):
+        """Missing start_time defaults to now (never times out)."""
+        from server.engine import find_timed_out_slots
+
+        active = {0: {}}
+        assert find_timed_out_slots(active, now=1000.0, timeout_s=600.0) == []
+
+    def test_find_timed_out_slots_empty_active(self):
+        from server.engine import find_timed_out_slots
+
+        assert find_timed_out_slots({}, now=1000.0, timeout_s=60.0) == []
+
+    def test_find_timed_out_slots_boundary_not_expired(self):
+        """Exactly at timeout boundary is NOT expired (must exceed)."""
+        from server.engine import find_timed_out_slots
+
+        now = 1000.0
+        active = {0: {"start_time": now - 600.0}}
+        assert find_timed_out_slots(active, now=now, timeout_s=600.0) == []
 
     def test_timeout_config_exists(self):
         import inspect
@@ -171,30 +235,3 @@ class TestRequestTimeout:
 
         sig = inspect.signature(ServerEngine.__init__)
         assert "request_timeout_s" in sig.parameters
-
-    def test_timeout_stats_field(self):
-        import server.engine as eng_mod
-
-        src = open(eng_mod.__file__).read()
-        assert '"timeouts"' in src
-
-    def test_timeout_detection_logic(self):
-        """Simulate the timeout detection predicate."""
-        import time
-
-        timeout_s = 600.0
-        now = time.perf_counter()
-        active = {
-            0: {"start_time": now - 100},
-            1: {"start_time": now - 700},
-            2: {"start_time": now - 50},
-        }
-        timed_out = [
-            s
-            for s, st in active.items()
-            if now - st.get("start_time", now) > timeout_s
-        ]
-        assert timed_out == [1]
-
-    def test_timeout_disabled_at_zero(self):
-        assert 0 <= 0

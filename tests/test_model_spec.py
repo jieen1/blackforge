@@ -1,4 +1,5 @@
 """E1 Phase 1: tests for runtime/model_spec.py — ModelSpec frozen dataclass."""
+
 import pytest
 
 from runtime.model_spec import ModelSpec

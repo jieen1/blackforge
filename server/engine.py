@@ -31,12 +31,36 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from runtime.sampling import SamplingParams
-from server.tracing import tracer
 from runtime.structured_output import GrammarState, ResponseFormat
+from server.tracing import tracer
 
 os.environ.setdefault("USE_LIBUV", "0")
 os.environ.setdefault("SM120_GQA_USE_V2_DECODE_KERNEL", "1")
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
+
+# -- D1/C5: Pure detection predicates (extracted for unit-testability) --------
+
+
+def find_timed_out_slots(active: dict[int, dict], now: float, timeout_s: float) -> list[int]:
+    """Return slot IDs whose requests have exceeded the timeout duration."""
+    if timeout_s <= 0:
+        return []
+    return [s for s, st in active.items() if now - st.get("start_time", now) > timeout_s]
+
+
+def find_stale_slots(
+    active: dict[int, dict], current_round: int, max_stale_rounds: int
+) -> list[int]:
+    """Return slot IDs that made no progress for too many consecutive rounds."""
+    if max_stale_rounds <= 0:
+        return []
+    return [
+        s
+        for s, st in active.items()
+        if current_round - st.get("last_progress_round", 0) > max_stale_rounds
+    ]
+
 
 SM120_VLLM_INTEGRATION = os.environ.get(
     "SM120_VLLM_INTEGRATION",
@@ -589,7 +613,11 @@ class ServerEngine:
             self.active[slot]["grammar"] = None
 
     def _finish_request(
-        self, slot: int, req: GenerationRequest, committed_tokens: list[int], finish_reason: str,
+        self,
+        slot: int,
+        req: GenerationRequest,
+        committed_tokens: list[int],
+        finish_reason: str,
         logprobs_data: list[dict] | None = None,
     ) -> None:
         tracer.request_finished(req.request_id, finish_reason)
@@ -688,9 +716,7 @@ class ServerEngine:
                 )
                 if req.stream_channel is not None:
                     self._stream_close(req.stream_channel)
-                self._fail_future(
-                    req.future, asyncio.CancelledError("request cancelled by client")
-                )
+                self._fail_future(req.future, asyncio.CancelledError("request cancelled by client"))
                 try:
                     self.runner.reset_slot(s)
                 except Exception:
@@ -698,9 +724,7 @@ class ServerEngine:
                 self.free_slots.append(s)
             # Also remove from waiting queue
             if self._cancel_set:
-                self.waiting = [
-                    r for r in self.waiting if r.request_id not in self._cancel_set
-                ]
+                self.waiting = [r for r in self.waiting if r.request_id not in self._cancel_set]
                 self._cancel_set.clear()
 
         # -- P4b: expire retained warm slots --
@@ -852,10 +876,12 @@ class ServerEngine:
         active_slots = list(self.active.keys())
         # C3: structured output requests use sampled path with grammar masking
         grammar_slots = [s for s in active_slots if self.active[s].get("grammar") is not None]
-        greedy_slots = [s for s in active_slots
-                        if not self.active[s].get("sampled") and s not in grammar_slots]
-        sampled_slots = [s for s in active_slots
-                         if self.active[s].get("sampled") or s in grammar_slots]
+        greedy_slots = [
+            s for s in active_slots if not self.active[s].get("sampled") and s not in grammar_slots
+        ]
+        sampled_slots = [
+            s for s in active_slots if self.active[s].get("sampled") or s in grammar_slots
+        ]
 
         self.stats["rounds"] += 1
         self.stats["round_batch_sizes"].append(len(active_slots))
@@ -870,13 +896,21 @@ class ServerEngine:
             kv_lengths = [self.runner.slot_kv_len[s] for s in slot_ids]
             params_list = [self.active[s]["req"].sampling_params for s in slot_ids]
             any_lp = any(self.active[s]["req"].logprobs for s in slot_ids)
-            top_lp = max(
-                (self.active[s]["req"].top_logprobs for s in slot_ids),
-                default=0,
-            ) if any_lp else 0
+            top_lp = (
+                max(
+                    (self.active[s]["req"].top_logprobs for s in slot_ids),
+                    default=0,
+                )
+                if any_lp
+                else 0
+            )
             decode_result = self.runner.decode_batch_sampled(
-                slot_ids, token_ids, kv_lengths, params_list,
-                return_logprobs=any_lp, top_logprobs=top_lp,
+                slot_ids,
+                token_ids,
+                kv_lengths,
+                params_list,
+                return_logprobs=any_lp,
+                top_logprobs=top_lp,
             )
             if any_lp:
                 next_tokens, lp_batch = decode_result
@@ -888,14 +922,20 @@ class ServerEngine:
                 req: GenerationRequest = st["req"]
                 if len(st["committed_tokens"]) >= req.max_tokens:
                     self._finish_request(
-                        s, req, st["committed_tokens"], "length",
+                        s,
+                        req,
+                        st["committed_tokens"],
+                        "length",
                         logprobs_data=st.get("logprobs_acc"),
                     )
                     newly_finished.append(s)
                     continue
                 if tok == self.eos_token_id:
                     self._finish_request(
-                        s, req, st["committed_tokens"], "stop",
+                        s,
+                        req,
+                        st["committed_tokens"],
+                        "stop",
                         logprobs_data=st.get("logprobs_acc"),
                     )
                     newly_finished.append(s)
@@ -913,7 +953,10 @@ class ServerEngine:
                     self._stream_put(req.stream_channel, [tok])
                 if len(st["committed_tokens"]) >= req.max_tokens:
                     self._finish_request(
-                        s, req, st["committed_tokens"], "length",
+                        s,
+                        req,
+                        st["committed_tokens"],
+                        "length",
                         logprobs_data=st.get("logprobs_acc"),
                     )
                     newly_finished.append(s)
@@ -922,10 +965,14 @@ class ServerEngine:
         if greedy_slots:
             _round_t0 = time.perf_counter()
             any_lp_g = any(self.active[s]["req"].logprobs for s in greedy_slots)
-            top_lp_g = max(
-                (self.active[s]["req"].top_logprobs for s in greedy_slots),
-                default=0,
-            ) if any_lp_g else 0
+            top_lp_g = (
+                max(
+                    (self.active[s]["req"].top_logprobs for s in greedy_slots),
+                    default=0,
+                )
+                if any_lp_g
+                else 0
+            )
             decisions = self.runner.mtp_verify_and_commit_batch(
                 greedy_slots,
                 {s: self.active[s]["anchor"] for s in greedy_slots},
@@ -976,7 +1023,10 @@ class ServerEngine:
                     continue
 
                 self._finish_request(
-                    s, req, st["committed_tokens"], finish_reason,
+                    s,
+                    req,
+                    st["committed_tokens"],
+                    finish_reason,
                     logprobs_data=st.get("logprobs_acc"),
                 )
                 newly_finished.append(s)
@@ -987,11 +1037,7 @@ class ServerEngine:
         # -- request timeout: reclaim slots exceeding max duration --
         if self.request_timeout_s > 0 and self.active:
             now = time.perf_counter()
-            timed_out = [
-                s
-                for s, st in self.active.items()
-                if now - st.get("start_time", now) > self.request_timeout_s
-            ]
+            timed_out = find_timed_out_slots(self.active, now, self.request_timeout_s)
             for s in timed_out:
                 st = self.active.pop(s)
                 req = st["req"]
@@ -1024,12 +1070,9 @@ class ServerEngine:
         # -- watchdog: force-reclaim slots that made no progress --
         if self.watchdog_max_stale_rounds > 0 and self.active:
             current_round = self.stats["rounds"]
-            stale_slots = [
-                s
-                for s, st in self.active.items()
-                if current_round - st.get("last_progress_round", 0)
-                > self.watchdog_max_stale_rounds
-            ]
+            stale_slots = find_stale_slots(
+                self.active, current_round, self.watchdog_max_stale_rounds
+            )
             for s in stale_slots:
                 st = self.active.pop(s)
                 req = st["req"]
@@ -1058,8 +1101,7 @@ class ServerEngine:
                 self._fail_future(
                     req.future,
                     RuntimeError(
-                        f"slot {s} watchdog: no progress for "
-                        f"{event['stale_rounds']} rounds"
+                        f"slot {s} watchdog: no progress for {event['stale_rounds']} rounds"
                     ),
                 )
                 if req.stream_channel is not None:

@@ -355,4 +355,3 @@ class PrefixCacheOps:
         self._publish_committed_blocks(slot, prompt, prompt_len)
         self._r.slot_pending_draft_tokens[slot] = draft_tokens_by_slot[slot]
         return {"anchor": anchor, "draft_tokens": draft_tokens_by_slot[slot]}
-

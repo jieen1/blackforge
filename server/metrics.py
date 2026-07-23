@@ -275,9 +275,11 @@ def render_d2_metrics(model_name: str = "qwen3.6-27b") -> str:
     lines: list[str] = []
     # MTP acceptance
     _render_histogram(
-        lines, "vllm:mtp_accepted_tokens",
+        lines,
+        "vllm:mtp_accepted_tokens",
         "MTP accepted tokens per verify round",
-        model_name, mtp_acceptance_histogram,
+        model_name,
+        mtp_acceptance_histogram,
     )
     # Prefix cache
     with _LOCK:

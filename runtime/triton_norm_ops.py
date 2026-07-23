@@ -189,6 +189,7 @@ def install_triton_norm_ops() -> None:
     _installed = True
 
     from runtime.compat_vllm import get_vllm_ir
+
     ir = get_vllm_ir()
 
     def _no_var(x, weight, epsilon, variance_size=None):

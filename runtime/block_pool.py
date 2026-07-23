@@ -3,12 +3,13 @@
 从 direct_model_runner.py 提取的 Block/BlockPool/FreeBlockQueue/hash 基础设施。
 纯移动不改逻辑（B5 parity 门禁）。
 """
+
 from __future__ import annotations
 
 import array
 import hashlib
 import os
-from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass
 
 # something about index 0 (padding/NULL_BLOCK_ID-adjacent) makes the model
@@ -177,7 +178,6 @@ class ChunkedPrefillState:
             self.slots = []
         if self.anchors is None:
             self.anchors = {}
-
 
 
 class FreeBlockQueue:
@@ -513,5 +513,3 @@ class BlockPool:
                 # this hit references it.
                 self._free_queue.remove(block)
             block.ref_cnt += 1
-
-

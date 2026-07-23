@@ -1,9 +1,12 @@
 """C2: tests for runtime/logprobs.py — logprobs computation from logits."""
+
 import math
 
-import torch
+import pytest
 
-from runtime.logprobs import compute_logprobs
+torch = pytest.importorskip("torch")
+
+from runtime.logprobs import compute_logprobs  # noqa: E402
 
 
 class TestComputeLogprobs:
@@ -42,11 +45,13 @@ class TestComputeLogprobs:
 
     def test_multi_position(self):
         """Multiple positions: each gets its own logprob entry."""
-        logits = torch.tensor([
-            [10.0, 0.0, 0.0],
-            [0.0, 10.0, 0.0],
-            [0.0, 0.0, 10.0],
-        ])
+        logits = torch.tensor(
+            [
+                [10.0, 0.0, 0.0],
+                [0.0, 10.0, 0.0],
+                [0.0, 0.0, 10.0],
+            ]
+        )
         tokens = [0, 1, 2]
         result = compute_logprobs(logits, tokens, top_k=2)
         assert len(result) == 3

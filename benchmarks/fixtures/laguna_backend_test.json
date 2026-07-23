@@ -1,0 +1,17 @@
+{
+  "model": "poolside/Laguna-S-2.1-NVFP4",
+  "backend": "LagunaBackend (direct forward)",
+  "date": "2026-07-23T08:59:35",
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+  "load_time_s": 72.0,
+  "gpu_mem_mib": 72528,
+  "greedy_determinism": true,
+  "greedy_output": " is is is is is is is is is is is is is is is is is is is is is is is is is is is is is is is is is is is is is is is is is is is is is is is is is is",
+  "throughput": {
+    "single_tps": 14.3,
+    "batch4_tps": 54.2,
+    "itl_ms": 70.2,
+    "reps": 5
+  },
+  "all_pass": true
+}

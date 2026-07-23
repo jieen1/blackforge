@@ -1,0 +1,38 @@
+[
+  {
+    "tag": "stock",
+    "cudnn": false,
+    "gpu": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+    "date": "2026-07-23T06:41:54",
+    "prompt_len": 2048,
+    "max_tokens": 128,
+    "avg_accepted_tok_s": 39.8,
+    "avg_accept_rate": 0.768,
+    "reps": [
+      {
+        "rep": 0,
+        "tokens": 129,
+        "rounds": 42,
+        "elapsed_s": 2.9319,
+        "accepted_tok_s": 44.0,
+        "accept_rate": 0.768
+      },
+      {
+        "rep": 1,
+        "tokens": 129,
+        "rounds": 42,
+        "elapsed_s": 3.2341,
+        "accepted_tok_s": 39.9,
+        "accept_rate": 0.768
+      },
+      {
+        "rep": 2,
+        "tokens": 129,
+        "rounds": 42,
+        "elapsed_s": 3.6468,
+        "accepted_tok_s": 35.4,
+        "accept_rate": 0.768
+      }
+    ]
+  }
+]

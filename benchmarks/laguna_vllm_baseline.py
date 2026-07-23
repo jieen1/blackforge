@@ -21,7 +21,6 @@ import gc
 import json
 import os
 import subprocess
-import sys
 import time
 
 os.environ.setdefault("USE_LIBUV", "0")
@@ -119,7 +118,6 @@ def measure_one_run(llm, prompt: str, max_tokens: int):
 def profile_kernels(llm, prompt: str, max_tokens: int):
     """Get kernel-level breakdown using torch profiler."""
     from vllm import SamplingParams
-    import torch
     from torch.profiler import profile, ProfilerActivity
 
     params = SamplingParams(max_tokens=max_tokens, temperature=0)
@@ -220,15 +218,15 @@ def main():
         pass
 
     print(f"{'='*70}")
-    print(f"  Laguna-S-2.1-NVFP4 · vLLM Baseline (Official Params)")
+    print("  Laguna-S-2.1-NVFP4 · vLLM Baseline (Official Params)")
     print(f"  Context: {CTX_LENGTHS} | Runs: {NUM_RUNS} | Decode: {DECODE_TOKENS} tok")
-    print(f"  GPU mem util: 0.85 | enforce_eager: True")
+    print("  GPU mem util: 0.85 | enforce_eager: True")
     print(f"{'='*70}\n")
 
     # ─── Load ───
     print("[1/3] Loading model...")
     t0 = time.perf_counter()
-    from vllm import LLM, SamplingParams
+    from vllm import LLM
     import vllm
     results["vllm_version"] = vllm.__version__
 
@@ -291,7 +289,7 @@ def main():
     results["tests"]["context_benchmarks"] = ctx_results
 
     # ─── Profiling ───
-    print(f"\n[3/3] Kernel profiling...")
+    print("\n[3/3] Kernel profiling...")
     profiling_results = {}
 
     for ctx_len in CTX_LENGTHS:

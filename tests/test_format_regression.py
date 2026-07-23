@@ -239,3 +239,29 @@ def test_anthropic_tool_use_ids_are_unique():
     for tid in ids_turn1 | ids_turn2:
         assert tid.startswith("toolu_")
         assert len(tid) == 30  # "toolu_" (6) + 24 hex chars
+
+
+def test_anthropic_cache_read_input_tokens_mapping():
+    """C6: build_response must propagate cache_read_input_tokens."""
+    from server.formats.anthropic import build_response
+
+    resp = build_response(
+        model="test",
+        text="Hello",
+        finish_reason="stop",
+        input_tokens=100,
+        output_tokens=10,
+        cache_read_input_tokens=42,
+    )
+    assert resp["usage"]["cache_read_input_tokens"] == 42
+    assert resp["usage"]["cache_creation_input_tokens"] == 0
+
+    # Default should be 0
+    resp_default = build_response(
+        model="test",
+        text="Hello",
+        finish_reason="stop",
+        input_tokens=100,
+        output_tokens=10,
+    )
+    assert resp_default["usage"]["cache_read_input_tokens"] == 0

@@ -35,12 +35,12 @@ from pydantic import BaseModel
 
 from runtime.sampling import SamplingParams
 from server import metrics
-from server.tracing import tracer
 from server.engine import ServerEngine
 from server.formats import anthropic as anthropic_format
 from server.formats import convert_tools_to_chat_template, strip_thinking
 from server.formats import openai as openai_format
 from server.formats.stream import StreamProcessor
+from server.tracing import tracer
 
 logger = logging.getLogger("qwen_sm120_server.app")
 
@@ -140,9 +140,9 @@ async def _tokenize_decode(engine_ref, token_ids):
     return await loop.run_in_executor(None, fn)
 
 
-
 def _format_logprobs_openai(
-    engine_ref, raw_logprobs: list[dict] | None,
+    engine_ref,
+    raw_logprobs: list[dict] | None,
 ) -> dict | None:
     """Format raw logprobs data into OpenAI API logprobs structure."""
     if not raw_logprobs:
@@ -159,11 +159,13 @@ def _format_logprobs_openai(
         top = []
         for alt in entry.get("top_logprobs", []):
             alt_str = tok.decode([alt["token_id"]])
-            top.append({
-                "token": alt_str,
-                "logprob": alt["logprob"],
-                "bytes": list(alt_str.encode("utf-8")),
-            })
+            top.append(
+                {
+                    "token": alt_str,
+                    "logprob": alt["logprob"],
+                    "bytes": list(alt_str.encode("utf-8")),
+                }
+            )
         item["top_logprobs"] = top
         content_list.append(item)
     return {"content": content_list}
@@ -467,8 +469,11 @@ async def debug_stats():
 async def chat_completions(req: ChatCompletionRequest, request: Request):
     assert engine is not None
     sampling_params = _build_sampling_params(
-        temperature=req.temperature, top_p=req.top_p, top_k=req.top_k,
-        seed=req.seed, n=req.n,
+        temperature=req.temperature,
+        top_p=req.top_p,
+        top_k=req.top_k,
+        seed=req.seed,
+        n=req.n,
     )
     max_tokens = _validate_and_resolve_max_tokens(req.max_tokens)
     t0 = time.perf_counter()
@@ -519,7 +524,9 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             yield f"data: {_json.dumps(first_chunk)}\n\n"
             _cancel_ref: list[str | None] = [None]
             async for item in engine.submit_stream(
-                prompt_ids, max_tokens, session_id=req.session_id,
+                prompt_ids,
+                max_tokens,
+                session_id=req.session_id,
                 sampling_params=sampling_params,
                 cancel_ref=_cancel_ref,
                 response_format=req.response_format,
@@ -567,16 +574,22 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                             "object": "chat.completion.chunk",
                             "created": created,
                             "model": model_name,
-                            "choices": [{
-                                "index": 0,
-                                "delta": {"tool_calls": [{
-                                    "index": td["index"],
-                                    "id": td["id"],
-                                    "type": "function",
-                                    "function": {"name": td["name"]},
-                                }]},
-                                "finish_reason": None,
-                            }],
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {
+                                        "tool_calls": [
+                                            {
+                                                "index": td["index"],
+                                                "id": td["id"],
+                                                "type": "function",
+                                                "function": {"name": td["name"]},
+                                            }
+                                        ]
+                                    },
+                                    "finish_reason": None,
+                                }
+                            ],
                         }
                         yield f"data: {_json.dumps(tc_chunk)}\n\n"
                     elif td["type"] == "arguments_delta":
@@ -585,14 +598,20 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                             "object": "chat.completion.chunk",
                             "created": created,
                             "model": model_name,
-                            "choices": [{
-                                "index": 0,
-                                "delta": {"tool_calls": [{
-                                    "index": td["index"],
-                                    "function": {"arguments": td["delta"]},
-                                }]},
-                                "finish_reason": None,
-                            }],
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {
+                                        "tool_calls": [
+                                            {
+                                                "index": td["index"],
+                                                "function": {"arguments": td["delta"]},
+                                            }
+                                        ]
+                                    },
+                                    "finish_reason": None,
+                                }
+                            ],
                         }
                         yield f"data: {_json.dumps(tc_chunk)}\n\n"
             finish = final_result["finish_reason"] if final_result else "stop"
@@ -602,14 +621,17 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             _lp_final = None
             if req.logprobs and final_result:
                 _lp_final = _format_logprobs_openai(
-                    engine, final_result.get("logprobs"),
+                    engine,
+                    final_result.get("logprobs"),
                 )
             done = {
                 "id": cmpl_id,
                 "object": "chat.completion.chunk",
                 "created": created,
                 "model": model_name,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": finish, "logprobs": _lp_final}],
+                "choices": [
+                    {"index": 0, "delta": {}, "finish_reason": finish, "logprobs": _lp_final}
+                ],
             }
             yield f"data: {_json.dumps(done)}\n\n"
             metrics.record_request(
@@ -629,8 +651,12 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
 
     # Non-streaming path
     result = await engine.submit(
-        prompt_ids, max_tokens, session_id=req.session_id, sampling_params=sampling_params,
-        logprobs=bool(req.logprobs), top_logprobs=req.top_logprobs or 0,
+        prompt_ids,
+        max_tokens,
+        session_id=req.session_id,
+        sampling_params=sampling_params,
+        logprobs=bool(req.logprobs),
+        top_logprobs=req.top_logprobs or 0,
     )
     raw_text = await _tokenize_decode(engine, result["committed_token_ids"])
     _THINK_OPEN = chr(60) + "think" + chr(62)
@@ -687,7 +713,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         resp["choices"][0]["message"]["reasoning_content"] = reasoning_content
     if req.logprobs:
         resp["choices"][0]["logprobs"] = _format_logprobs_openai(
-            engine, result.get("logprobs"),
+            engine,
+            result.get("logprobs"),
         )
     return resp
 
@@ -696,8 +723,11 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
 async def completions(req: CompletionRequest, request: Request):
     assert engine is not None
     sampling_params = _build_sampling_params(
-        temperature=req.temperature, top_p=req.top_p, top_k=req.top_k,
-        seed=req.seed, n=req.n,
+        temperature=req.temperature,
+        top_p=req.top_p,
+        top_k=req.top_k,
+        seed=req.seed,
+        n=req.n,
     )
     max_tokens = _validate_and_resolve_max_tokens(req.max_tokens)
     t0 = time.perf_counter()
@@ -706,8 +736,12 @@ async def completions(req: CompletionRequest, request: Request):
     _validate_capacity(prompt_ids, max_tokens, "completions")
 
     result = await engine.submit(
-        prompt_ids, max_tokens, session_id=req.session_id, sampling_params=sampling_params,
-        logprobs=bool(req.logprobs), top_logprobs=req.top_logprobs or 0,
+        prompt_ids,
+        max_tokens,
+        session_id=req.session_id,
+        sampling_params=sampling_params,
+        logprobs=bool(req.logprobs),
+        top_logprobs=req.top_logprobs or 0,
     )
     _raw_comp = await _tokenize_decode(engine, result["committed_token_ids"])
     _raw_comp_full = (
@@ -736,8 +770,16 @@ async def completions(req: CompletionRequest, request: Request):
         "created": int(time.time()),
         "model": req.model or ServerEngine.MODEL,
         "choices": [
-            {"index": 0, "text": text, "finish_reason": result["finish_reason"],
-             "logprobs": _format_logprobs_openai(engine, result.get("logprobs")) if req.logprobs else None}
+            {
+                "index": 0,
+                "text": text,
+                "finish_reason": result["finish_reason"],
+                "logprobs": (
+                    _format_logprobs_openai(engine, result.get("logprobs"))
+                    if req.logprobs
+                    else None
+                ),
+            }
         ],
         "usage": {
             "prompt_tokens": result["prompt_tokens"],
@@ -1074,7 +1116,9 @@ async def anthropic_messages(request: Request):
                     "usage": {
                         "input_tokens": len(prompt_ids),
                         "output_tokens": 0,
-                        "cache_read_input_tokens": final_result.get("prefix_cache_hit_tokens", 0) if final_result else 0,
+                        "cache_read_input_tokens": (
+                            final_result.get("prefix_cache_hit_tokens", 0) if final_result else 0
+                        ),
                         "cache_creation_input_tokens": 0,
                     },
                 },
@@ -1087,7 +1131,9 @@ async def anthropic_messages(request: Request):
 
             _cancel_ref: list[str | None] = [None]
             async for item in engine.submit_stream(
-                prompt_ids, effective_max, sampling_params=sampling_params,
+                prompt_ids,
+                effective_max,
+                sampling_params=sampling_params,
                 cancel_ref=_cancel_ref,
             ):
                 if await request.is_disconnected():
@@ -1206,7 +1252,9 @@ async def anthropic_messages(request: Request):
 
     # Non-streaming path
     result = await engine.submit(
-        prompt_ids, effective_max, sampling_params=sampling_params,
+        prompt_ids,
+        effective_max,
+        sampling_params=sampling_params,
     )
     _raw_anth = await _tokenize_decode(engine, result["committed_token_ids"])
     _raw_anth_full = (
@@ -1235,4 +1283,5 @@ async def anthropic_messages(request: Request):
         finish_reason=result["finish_reason"],
         input_tokens=result["prompt_tokens"],
         output_tokens=result["completion_tokens"],
+        cache_read_input_tokens=result.get("prefix_cache_hit_tokens", 0),
     )
