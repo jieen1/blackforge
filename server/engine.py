@@ -62,6 +62,36 @@ def find_stale_slots(
     ]
 
 
+def classify_decode_slots(
+    active_slots: list[int],
+    active: dict[int, dict],
+    grammar_slots: list[int],
+    mtp_capable: bool,
+) -> tuple[list[int], list[int]]:
+    """E1: split one round's active slots into (greedy_MTP, sampled).
+
+    MTP verify/commit only ever applies to a greedy request on an
+    MTP-capable backend. Everything else -- explicit sampling,
+    grammar-constrained structured output, or a backend with no
+    speculative decoding at all (e.g. Laguna, which has no MTP/DFlash
+    wired into this engine yet) -- goes through the plain per-step
+    ``decode_batch_sampled`` path. Greedy there is just temperature=0,
+    per B1, so this is not a behavior fork for those requests, only a
+    routing one.
+
+    For an MTP-capable backend this reproduces the original (pre-E1)
+    ``not sampled and not grammar`` / ``sampled or grammar`` split exactly,
+    so Qwen's decode round is unchanged.
+    """
+    if not mtp_capable:
+        return [], list(active_slots)
+    greedy_slots = [
+        s for s in active_slots if not active[s].get("sampled") and s not in grammar_slots
+    ]
+    sampled_slots = [s for s in active_slots if active[s].get("sampled") or s in grammar_slots]
+    return greedy_slots, sampled_slots
+
+
 SM120_VLLM_INTEGRATION = os.environ.get(
     "SM120_VLLM_INTEGRATION",
     os.path.join(
@@ -165,9 +195,21 @@ class ServerEngine:
     MODEL = "unsloth/Qwen3.6-27B-NVFP4"
     K = 3
 
+    # E1: model backends this engine knows how to load. "qwen36" is the
+    # existing production path (DirectModelRunner + MTP), unchanged.
+    # "laguna" drives LagunaBackend, which has no MTP/GDN -- its greedy
+    # decode goes through the same simple per-step sampled path as
+    # non-greedy requests (see classify_decode_slots).
+    _BACKENDS = ("qwen36", "laguna")
+    _BACKEND_MODEL_ID = {
+        "qwen36": "unsloth/Qwen3.6-27B-NVFP4",
+        "laguna": "poolside/Laguna-S-2.1-NVFP4",
+    }
+
     def __init__(
         self,
         *,
+        backend: str = "qwen36",
         capacity: int = 4,
         num_slots: int = 8,
         block_size: int = 16,
@@ -183,6 +225,17 @@ class ServerEngine:
         watchdog_max_stale_rounds: int = 200,
         request_timeout_s: float = 600.0,
     ) -> None:
+        if backend not in self._BACKENDS:
+            raise ValueError(f"backend={backend!r} must be one of {self._BACKENDS}")
+        self.backend_name = backend
+        # Instance-level overrides of the class defaults above: Qwen keeps
+        # the exact original values (MODEL/K unshadowed), Laguna gets its
+        # own model id and a zero MTP lookahead margin (no speculative
+        # decoding for this backend yet).
+        if backend != "qwen36":
+            self.MODEL = self._BACKEND_MODEL_ID[backend]
+            self.K = 0
+
         if production:
             min_slots = capacity + (capacity if enable_cudagraph else 0)
         else:
@@ -215,8 +268,35 @@ class ServerEngine:
         # -- tokenizer (CPU-only, thread-safe for reads) --
         from transformers import AutoTokenizer
 
-        self.tok = AutoTokenizer.from_pretrained(self.MODEL)
+        # Laguna ships a custom AutoConfig/tokenizer class (configuration_laguna.py)
+        # that transformers only loads with trust_remote_code=True; without it,
+        # config validation falls onto a generic path that chokes on Laguna's
+        # yarn rope_parameters (KeyError: 'original_max_position_embeddings').
+        # Scoped to non-Qwen backends so the Qwen path's call is byte-identical
+        # to before (trust_remote_code defaults to False either way).
+        self.tok = AutoTokenizer.from_pretrained(
+            self.MODEL, trust_remote_code=(self.backend_name != "qwen36")
+        )
         self.eos_token_id = self.tok.eos_token_id
+        # E1: Laguna's generation_config.json declares TWO stop tokens
+        # ([2, 24], not just the tokenizer's single eos_token) -- the
+        # `.eos_token_id` scalar above only carries token 2 for either
+        # model. eos_token_ids is the actual stop set every comparison
+        # site should use; for Qwen it is exactly {self.eos_token_id},
+        # so behavior there is provably unchanged.
+        if self.backend_name != "qwen36":
+            try:
+                from transformers import GenerationConfig
+
+                gen_cfg_eos = GenerationConfig.from_pretrained(self.MODEL).eos_token_id
+            except Exception:
+                gen_cfg_eos = self.eos_token_id
+            if isinstance(gen_cfg_eos, (list, tuple, set)):
+                self.eos_token_ids = frozenset(int(e) for e in gen_cfg_eos)
+            else:
+                self.eos_token_ids = frozenset({int(gen_cfg_eos)})
+        else:
+            self.eos_token_ids = frozenset({self.eos_token_id})
 
         # -- high-performance request channel (asyncio → engine thread) --
         # deque is GIL-atomic for append/popleft; pipe provides instant wakeup
@@ -286,6 +366,57 @@ class ServerEngine:
 
     # -- model loading (engine thread only) --------------------------------
     def _load_model(self) -> None:
+        """Load model + create the runner. MUST run on engine thread.
+
+        E1: dispatches on ``self.backend_name``. "qwen36" is the original,
+        unmodified production path; "laguna" is the new E1 second tenant.
+        """
+        if self.backend_name == "laguna":
+            self._load_laguna_model()
+            return
+        self._load_qwen36_model()
+
+    def _load_laguna_model(self) -> None:
+        """Load LagunaBackend. MUST run on engine thread.
+
+        No CUDA Graph (Lane 2 GPU work, not wired into the engine yet), no
+        MTP (no draft model loaded), no persistent prefix cache / session
+        affinity (LagunaBackend.reconcile_prefix_hit is a permanent-miss
+        stub -- see runtime/backends/laguna.py). ``enable_cudagraph`` /
+        ``enable_prefix_cache`` / ``enable_session_affinity`` are honored as
+        passed (server/app.py defaults them to False for this backend), not
+        overridden here -- ServerEngine stays a thin, honest pass-through of
+        whatever config the caller chose.
+        """
+        from runtime.backends.laguna import LagunaBackend
+        from runtime.compat_vllm import EngineArgs
+
+        max_model_len = self.blocks_per_slot * self.block_size
+        args = EngineArgs(
+            model=self.MODEL,
+            max_model_len=max_model_len,
+            gpu_memory_utilization=self._gpu_memory_utilization,
+            dtype="bfloat16",
+            disable_log_stats=True,
+            async_scheduling=False,
+        )
+        vllm_config = args.create_engine_config()
+        self._prefill_chunk_size = 512  # unused: Laguna prefill is one-shot (see LagunaBackend)
+        self.runner = LagunaBackend(
+            vllm_config,
+            num_slots=self.num_slots,
+            block_size=self.block_size,
+            blocks_per_slot=self.blocks_per_slot,
+        )
+        logger.info(
+            "Laguna model loaded on engine thread: num_slots=%d blocks_per_slot=%d "
+            "max_context=%d tokens/slot",
+            self.num_slots,
+            self.blocks_per_slot,
+            self.capacity_tokens_per_slot,
+        )
+
+    def _load_qwen36_model(self) -> None:
         """Load model + create DirectModelRunner. MUST run on engine thread."""
         sys.path.insert(0, SM120_VLLM_INTEGRATION)
         import register_sm120_backend  # noqa: F401
@@ -581,7 +712,7 @@ class ServerEngine:
         if not self.production and req.sampling_params.is_greedy:
             self._admission_bootstrap_check(slot, req, anchor)
 
-        if anchor == self.eos_token_id:
+        if anchor in self.eos_token_ids:
             if req.stream_channel is not None:
                 self._stream_close(req.stream_channel)
             self._finish_request(slot, req, committed_tokens=[], finish_reason="stop")
@@ -876,12 +1007,11 @@ class ServerEngine:
         active_slots = list(self.active.keys())
         # C3: structured output requests use sampled path with grammar masking
         grammar_slots = [s for s in active_slots if self.active[s].get("grammar") is not None]
-        greedy_slots = [
-            s for s in active_slots if not self.active[s].get("sampled") and s not in grammar_slots
-        ]
-        sampled_slots = [
-            s for s in active_slots if self.active[s].get("sampled") or s in grammar_slots
-        ]
+        # E1: a backend with no MTP (e.g. Laguna) routes every slot through
+        # the sampled path regardless of is_greedy -- see classify_decode_slots.
+        greedy_slots, sampled_slots = classify_decode_slots(
+            active_slots, self.active, grammar_slots, self.runner.spec.has_mtp
+        )
 
         self.stats["rounds"] += 1
         self.stats["round_batch_sizes"].append(len(active_slots))
@@ -930,7 +1060,7 @@ class ServerEngine:
                     )
                     newly_finished.append(s)
                     continue
-                if tok == self.eos_token_id:
+                if tok in self.eos_token_ids:
                     self._finish_request(
                         s,
                         req,
@@ -999,7 +1129,7 @@ class ServerEngine:
                     if len(st["committed_tokens"]) + len(kept) >= req.max_tokens:
                         finish_reason = "length"
                         break
-                    if t == self.eos_token_id:
+                    if t in self.eos_token_ids:
                         finish_reason = "stop"
                         break
                     kept.append(t)

@@ -73,8 +73,24 @@ DEFAULT_MAX_TOKENS = 16384
 # directly) since uvicorn's import-string app-loading convention
 # (``uvicorn.run("server.app:app", ...)``) needs ``app`` importable with
 # no constructor arguments.
-SERVER_CAPACITY = int(os.environ.get("QSR_SERVER_CAPACITY", "4"))
-SERVER_NUM_SLOTS = int(os.environ.get("QSR_SERVER_NUM_SLOTS", "8"))
+# E1: which model backend to serve. "qwen36" (default) is the original,
+# unmodified production path. "laguna" drives the new LagunaBackend second
+# tenant (roadmap Track E / L2) -- it has no CUDA Graph integration yet
+# (Lane 2 GPU work lives in runtime/backends/laguna_cuda_graph.py, not
+# wired into the engine), no persistent prefix cache, and no session
+# affinity, so those three default OFF for it below unless the operator
+# explicitly opts back in via the same env vars. It also has no SWA
+# ring-buffer KV yet (roadmap L2 TODO) -- every discovered attention layer,
+# including the 36 sliding-window ones, currently gets a KV cache sized for
+# the FULL context ceiling, so per-token memory cost is ~4x the roadmap L0
+# budget note's estimate (which assumed that optimization already existed).
+# SERVER_BLOCKS_PER_SLOT's Laguna default is sized conservatively for this
+# reality, not for the eventual ring-buffer-optimized budget.
+SERVER_MODEL_BACKEND = os.environ.get("QSR_SERVER_MODEL_BACKEND", "qwen36")
+_IS_LAGUNA = SERVER_MODEL_BACKEND == "laguna"
+
+SERVER_CAPACITY = int(os.environ.get("QSR_SERVER_CAPACITY", "1" if _IS_LAGUNA else "4"))
+SERVER_NUM_SLOTS = int(os.environ.get("QSR_SERVER_NUM_SLOTS", "1" if _IS_LAGUNA else "8"))
 SERVER_BLOCK_SIZE = int(os.environ.get("QSR_SERVER_BLOCK_SIZE", "16"))
 # 256K context support: blocks_per_slot = 262144 / block_size(16) = 16384.
 # The KV cache pool size is now determined by GPU memory profiling (see
@@ -83,14 +99,23 @@ SERVER_BLOCK_SIZE = int(os.environ.get("QSR_SERVER_BLOCK_SIZE", "16"))
 # per-slot MAXIMUM context ceiling; the actual pool is sized to fit the GPU.
 # The E2E check sets its OWN smaller blocks_per_slot (its prompts are moderate),
 # so it does not pay for the full long-context pool.
-SERVER_BLOCKS_PER_SLOT = int(os.environ.get("QSR_SERVER_BLOCKS_PER_SLOT", "16384"))
-SERVER_ENABLE_CUDAGRAPH = os.environ.get("QSR_SERVER_ENABLE_CUDAGRAPH", "1") != "0"
+# Laguna default (8192 = 128K/slot) is conservative pending the SWA
+# ring-buffer optimization above -- see notes/2026-07-23-laguna-server-
+# integration-plan.md for the memory math.
+SERVER_BLOCKS_PER_SLOT = int(
+    os.environ.get("QSR_SERVER_BLOCKS_PER_SLOT", "8192" if _IS_LAGUNA else "16384")
+)
+SERVER_ENABLE_CUDAGRAPH = os.environ.get(
+    "QSR_SERVER_ENABLE_CUDAGRAPH", "0" if _IS_LAGUNA else "1"
+) != "0"
 # P4a (notes/prefix-cache-design.md sec 5-P4): the prefix-cache rollback
 # spine, plumbed straight into ServerEngine(enable_prefix_cache=...). Default
 # ON (this is THE product value -- warm prefix hits served across requests);
 # `python -m server.app --no-prefix-cache` (or QSR_SERVER_ENABLE_PREFIX_CACHE=0)
 # turns it off => byte-for-byte the old server.
-SERVER_ENABLE_PREFIX_CACHE = os.environ.get("QSR_SERVER_ENABLE_PREFIX_CACHE", "1") != "0"
+SERVER_ENABLE_PREFIX_CACHE = os.environ.get(
+    "QSR_SERVER_ENABLE_PREFIX_CACHE", "0" if _IS_LAGUNA else "1"
+) != "0"
 # P4b session affinity (notes/2026-07-20-p4b-session-affinity-plan.md): opt-in
 # warm-slot retention. Default OFF => byte-for-byte P4a (without a session_id, or
 # with the flag off, _finish_request does the unconditional reset_slot). Requires
@@ -98,7 +123,14 @@ SERVER_ENABLE_PREFIX_CACHE = os.environ.get("QSR_SERVER_ENABLE_PREFIX_CACHE", "1
 # cache is off (warm-continue needs the persistent content-hash cache).
 SERVER_ENABLE_SESSION_AFFINITY = os.environ.get("QSR_SERVER_ENABLE_SESSION_AFFINITY", "0") != "0"
 SERVER_SESSION_TTL_S = float(os.environ.get("QSR_SERVER_SESSION_TTL_S", "30.0"))
-SERVER_KV_CACHE_DTYPE = os.environ.get("QSR_SERVER_KV_CACHE_DTYPE", "fp8_e4m3")
+# Laguna default: "auto" (vLLM's native/default KV dtype). FP8 KV has only
+# been validated for Qwen's path in this codebase; Laguna's Lane 2 CUDA
+# Graph benchmarks so far ran without an explicit override (see
+# benchmarks/laguna_cudagraph_bench.py) -- don't claim fp8_e4m3 works here
+# until that's actually exercised on GPU.
+SERVER_KV_CACHE_DTYPE = os.environ.get(
+    "QSR_SERVER_KV_CACHE_DTYPE", "auto" if _IS_LAGUNA else "fp8_e4m3"
+)
 SERVER_GPU_MEM_UTIL = float(os.environ.get("QSR_SERVER_GPU_MEM_UTIL", "0.85"))
 SERVER_PRODUCTION = os.environ.get("QSR_SERVER_PRODUCTION", "1") != "0"
 
@@ -268,8 +300,12 @@ async def _debug_log_stream_output(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global engine
-    logger.info("loading DirectModelRunner (this can take a while: model load + KV cache alloc)...")
+    logger.info(
+        "loading model backend=%s (this can take a while: model load + KV cache alloc)...",
+        SERVER_MODEL_BACKEND,
+    )
     engine = ServerEngine(
+        backend=SERVER_MODEL_BACKEND,
         capacity=SERVER_CAPACITY,
         num_slots=SERVER_NUM_SLOTS,
         block_size=SERVER_BLOCK_SIZE,
@@ -284,8 +320,10 @@ async def lifespan(app: FastAPI):
     )
     engine.start()
     logger.info(
-        "engine ready: capacity=%d num_slots=%d capacity_tokens_per_slot=%d "
+        "engine ready: backend=%s model=%s capacity=%d num_slots=%d capacity_tokens_per_slot=%d "
         "cudagraph=%s prefix_cache=%s session_affinity=%s ttl=%.1fs",
+        SERVER_MODEL_BACKEND,
+        engine.MODEL,
         engine.capacity,
         engine.num_slots,
         engine.capacity_tokens_per_slot,
@@ -495,7 +533,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     )
     _validate_capacity(prompt_ids, max_tokens, "chat")
 
-    model_name = req.model or ServerEngine.MODEL
+    model_name = req.model or engine.MODEL
 
     if req.stream:
         import json as _json
@@ -768,7 +806,7 @@ async def completions(req: CompletionRequest, request: Request):
         "id": f"cmpl-{uuid.uuid4().hex[:24]}",
         "object": "text_completion",
         "created": int(time.time()),
-        "model": req.model or ServerEngine.MODEL,
+        "model": req.model or engine.MODEL,
         "choices": [
             {
                 "index": 0,
@@ -849,7 +887,7 @@ if __name__ == "__main__":
 
 @app.get("/v1/models")
 async def list_models():
-    served = os.environ.get("QSR_SERVED_MODEL_NAME", ServerEngine.MODEL)
+    served = os.environ.get("QSR_SERVED_MODEL_NAME", engine.MODEL)
     names = served.split()
     return {
         "object": "list",
@@ -859,7 +897,7 @@ async def list_models():
                 "object": "model",
                 "created": int(time.time()),
                 "owned_by": "qwen-sm120-runtime",
-                "root": ServerEngine.MODEL,
+                "root": engine.MODEL,
                 "parent": None,
                 "max_model_len": engine.capacity_tokens_per_slot if engine else 0,
                 "permission": [
@@ -902,42 +940,42 @@ async def metrics_endpoint():
     lines = [
         "# HELP vllm:num_requests_running Number of requests currently running.",
         "# TYPE vllm:num_requests_running gauge",
-        f'vllm:num_requests_running{{model_name="{ServerEngine.MODEL}"}} {num_running}',
+        f'vllm:num_requests_running{{model_name="{engine.MODEL}"}} {num_running}',
         "# HELP vllm:num_requests_waiting Number of requests waiting to be processed.",
         "# TYPE vllm:num_requests_waiting gauge",
-        f'vllm:num_requests_waiting{{model_name="{ServerEngine.MODEL}"}} {num_waiting}',
+        f'vllm:num_requests_waiting{{model_name="{engine.MODEL}"}} {num_waiting}',
         "# HELP vllm:kv_cache_usage_perc KV cache usage percentage.",
         "# TYPE vllm:kv_cache_usage_perc gauge",
-        f'vllm:kv_cache_usage_perc{{model_name="{ServerEngine.MODEL}"}} {kv_usage:.4f}',
+        f'vllm:kv_cache_usage_perc{{model_name="{engine.MODEL}"}} {kv_usage:.4f}',
         "# HELP vllm:num_free_slots Number of free production slots.",
         "# TYPE vllm:num_free_slots gauge",
-        f'vllm:num_free_slots{{model_name="{ServerEngine.MODEL}"}} {num_free_slots}',
+        f'vllm:num_free_slots{{model_name="{engine.MODEL}"}} {num_free_slots}',
         "# HELP vllm:capacity_tokens_per_slot Max tokens per slot.",
         "# TYPE vllm:capacity_tokens_per_slot gauge",
-        f'vllm:capacity_tokens_per_slot{{model_name="{ServerEngine.MODEL}"}} '
+        f'vllm:capacity_tokens_per_slot{{model_name="{engine.MODEL}"}} '
         f"{engine.capacity_tokens_per_slot}",
         "# HELP vllm:requests_completed_total Total completed requests.",
         "# TYPE vllm:requests_completed_total counter",
-        f'vllm:requests_completed_total{{model_name="{ServerEngine.MODEL}"}} '
+        f'vllm:requests_completed_total{{model_name="{engine.MODEL}"}} '
         f"{engine.stats.get('requests_completed', 0)}",
         "# HELP vllm:prefix_cache_hit_rate Prefix cache hit rate.",
         "# TYPE vllm:prefix_cache_hit_rate gauge",
-        f'vllm:prefix_cache_hit_rate{{model_name="{ServerEngine.MODEL}"}} '
+        f'vllm:prefix_cache_hit_rate{{model_name="{engine.MODEL}"}} '
         f"{engine.stats.get('prefix_cache_hit_rate', 0.0):.4f}",
         "# HELP vllm:prefix_cache_hits_total Prefix cache hits.",
         "# TYPE vllm:prefix_cache_hits_total counter",
-        f'vllm:prefix_cache_hits_total{{model_name="{ServerEngine.MODEL}"}} '
+        f'vllm:prefix_cache_hits_total{{model_name="{engine.MODEL}"}} '
         f"{engine.stats.get('prefix_cache_hits', 0)}",
         "# HELP vllm:prefix_cache_misses_total Prefix cache misses.",
         "# TYPE vllm:prefix_cache_misses_total counter",
-        f'vllm:prefix_cache_misses_total{{model_name="{ServerEngine.MODEL}"}} '
+        f'vllm:prefix_cache_misses_total{{model_name="{engine.MODEL}"}} '
         f"{engine.stats.get('prefix_cache_misses', 0)}",
         "# HELP vllm:kv_cache_total_blocks Total KV cache blocks.",
         "# TYPE vllm:kv_cache_total_blocks gauge",
-        f'vllm:kv_cache_total_blocks{{model_name="{ServerEngine.MODEL}"}} {total_blocks}',
+        f'vllm:kv_cache_total_blocks{{model_name="{engine.MODEL}"}} {total_blocks}',
         "# HELP vllm:kv_cache_used_blocks Used KV cache blocks.",
         "# TYPE vllm:kv_cache_used_blocks gauge",
-        f'vllm:kv_cache_used_blocks{{model_name="{ServerEngine.MODEL}"}} {used_blocks}',
+        f'vllm:kv_cache_used_blocks{{model_name="{engine.MODEL}"}} {used_blocks}',
     ]
 
     # Accuracy/correctness signal: the admission bootstrap check re-runs each
@@ -949,7 +987,7 @@ async def metrics_endpoint():
     )
     lines.append("# TYPE vllm:bootstrap_checks_ok_total counter")
     lines.append(
-        f'vllm:bootstrap_checks_ok_total{{model_name="{ServerEngine.MODEL}"}} '
+        f'vllm:bootstrap_checks_ok_total{{model_name="{engine.MODEL}"}} '
         f"{engine.stats.get('bootstrap_checks_ok', 0)}"
     )
     lines.append(
@@ -957,19 +995,19 @@ async def metrics_endpoint():
     )
     lines.append("# TYPE vllm:bootstrap_checks_failed_total counter")
     lines.append(
-        f'vllm:bootstrap_checks_failed_total{{model_name="{ServerEngine.MODEL}"}} '
+        f'vllm:bootstrap_checks_failed_total{{model_name="{engine.MODEL}"}} '
         f"{engine.stats.get('bootstrap_checks_failed', 0)}"
     )
 
     # App-layer request metrics: latency, TTFT, TPOT, token throughput, and
     # success/error counters (recorded per request in the handlers above).
-    lines.extend(metrics.render(ServerEngine.MODEL))
+    lines.extend(metrics.render(engine.MODEL))
 
     # D2: runtime-internal metrics (MTP acceptance, prefix cache depth, per-slot KV)
-    lines.append(metrics.render_d2_metrics(ServerEngine.MODEL))
+    lines.append(metrics.render_d2_metrics(engine.MODEL))
 
     # D3: request-level tracing stats
-    lines.append(tracer.render_prometheus(ServerEngine.MODEL))
+    lines.append(tracer.render_prometheus(engine.MODEL))
 
     from fastapi.responses import PlainTextResponse
 
@@ -1000,7 +1038,7 @@ async def v1_root():
     return {
         "object": "api_info",
         "endpoints": ["/v1/models", "/v1/chat/completions", "/v1/completions", "/metrics"],
-        "model": ServerEngine.MODEL,
+        "model": engine.MODEL,
     }
 
 

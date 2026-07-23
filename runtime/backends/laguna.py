@@ -17,6 +17,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from runtime.block_pool import ChunkedPrefillState
 from runtime.compat_vllm import (
     VllmConfig,
     bind_kv_cache,
@@ -27,6 +28,8 @@ from runtime.compat_vllm import (
     set_current_vllm_config,
     set_forward_context,
 )
+from runtime.logprobs import compute_logprobs
+from runtime.model_spec import ModelSpec
 from runtime.sampling import SamplingParams, make_generator, sample_from_logits
 
 logger = logging.getLogger("qwen_sm120_runtime.laguna_backend")
@@ -170,6 +173,14 @@ class LagunaBackend:
         # Per-slot state
         self.slot_kv_len: list[int] = [0] * num_slots
         self.slot_committed_tokens: list[list[int]] = [[] for _ in range(num_slots)]
+        # E1: mirrors DirectModelRunner.block_table's role as a per-slot
+        # "has this slot ever been touched" dirty flag for admission. Laguna
+        # has no block-table indirection (physical slot is a direct
+        # arithmetic mapping, see _physical_slot) -- this list is never
+        # populated, only kept empty/falsy so ServerEngine's shared admission
+        # check (`slot_kv_len[slot] != 0 or block_table[slot]`) works
+        # unmodified against either backend.
+        self.block_table: list[list[int]] = [[] for _ in range(num_slots)]
 
         # Pre-allocated decode buffers (avoid per-step tensor allocation)
         max_batch = num_slots
@@ -186,7 +197,22 @@ class LagunaBackend:
 
         # Expose for engine compatibility
         self.num_speculative_tokens = 0
-        self.spec = None
+        model_id = getattr(vllm_config.model_config, "model", "poolside/Laguna-S-2.1-NVFP4")
+        architecture = getattr(hf_config, "architectures", ["LagunaForCausalLM"])[0]
+        # E1: no MTP draft model and no GDN layers -- Laguna has neither
+        # speculative decoding (DFlash is planned, roadmap L3, not wired
+        # into this backend yet) nor a GDN/SSM recursive state; every
+        # discovered layer is a (full or sliding-window) attention layer.
+        self.spec = ModelSpec.from_runner_init(
+            model_id=model_id,
+            architecture=architecture,
+            attn_layer_names=self.attn_layer_names,
+            gdn_layer_names=[],
+            mtp_model_id=None,
+            num_speculative_tokens=0,
+            kv_dtype=cache_dtype_str,
+            block_size=block_size,
+        )
         self.num_qo_heads = sfc[self.attn_layer_names[0]].num_heads
         self.num_kv_heads = sfc[self.attn_layer_names[0]].num_kv_heads
         self.head_dim = sfc[self.attn_layer_names[0]].head_size
@@ -431,22 +457,38 @@ class LagunaBackend:
         self,
         slot_ids: list[int],
         token_ids: list[int],
-        sampling_params_list: list[SamplingParams],
-        **kwargs: Any,
-    ) -> list[int]:
-        kv_lengths = [self.slot_kv_len[s] for s in slot_ids]
+        kv_lengths: list[int],
+        params_list: list[SamplingParams],
+        *,
+        return_logprobs: bool = False,
+        top_logprobs: int = 0,
+    ) -> list[int] | tuple[list[int], list[dict]]:
+        """Decode one token per slot with per-request sampling params.
+
+        Signature matches ``DirectModelRunner.decode_batch_sampled`` (E1: the
+        two backends share ServerEngine's calling convention) -- greedy is
+        temperature=0, a plain special case of sampling, per B1.
+        """
         logits = self._forward(
             slot_ids, token_ids, kv_lengths, qo_len=1, is_decode=True
         )
-        next_tokens = []
-        for i, slot in enumerate(slot_ids):
-            params = sampling_params_list[i]
-            row = logits[i].unsqueeze(0)
-            gen = make_generator(params.seed)
-            tok = int(sample_from_logits(row, params, generator=gen).item())
+        next_tokens: list[int] = []
+        for i, (slot, params) in enumerate(zip(slot_ids, params_list)):
+            if params.is_greedy:
+                tok = int(logits[i].argmax(dim=-1).item())
+            else:
+                row = logits[i].unsqueeze(0)
+                gen = make_generator(params.seed)
+                tok = int(sample_from_logits(row, params, generator=gen).item())
             next_tokens.append(tok)
             self.slot_kv_len[slot] += 1
             self.slot_committed_tokens[slot].append(token_ids[i])
+        if return_logprobs:
+            lp_list = [
+                compute_logprobs(logits[i].unsqueeze(0), [next_tokens[i]], top_k=top_logprobs)[0]
+                for i in range(len(next_tokens))
+            ]
+            return next_tokens, lp_list
         return next_tokens
 
     def reset_slot(self, slot: int) -> None:
@@ -457,6 +499,41 @@ class LagunaBackend:
         end = start + self.blocks_per_slot
         for cache in self.kv_caches.values():
             cache[start:end].zero_()
+
+    def reconcile_prefix_hit(self, token_ids: list[int]) -> int:
+        """E1 stub: Laguna has no persistent content-addressed prefix cache
+        yet (roadmap L2/L3 TODO) -- every admission is a cold miss."""
+        return 0
+
+    def prefill_chunked_begin(
+        self,
+        slots: list[int],
+        prompts_per_slot: list[list[int]],
+        chunk_size: int = 512,
+    ) -> ChunkedPrefillState:
+        """E1: one-shot prefill wrapper matching DirectModelRunner's chunked-
+        prefill contract so ServerEngine's admission path is backend-neutral.
+
+        Laguna has no incremental chunking yet (TODO, tracked for roadmap
+        L2/L3): this processes each slot's WHOLE prompt in one call and
+        always returns ``done=True`` immediately. A single very long prompt
+        will therefore block the engine thread for its entire prefill
+        instead of interleaving with other slots' decode rounds -- unlike
+        the Qwen path's true incremental chunking (A5/B4).
+        """
+        if len(slots) != len(prompts_per_slot):
+            raise ValueError("slots and prompts_per_slot must have equal length")
+        if not slots:
+            return ChunkedPrefillState(done=True, result={})
+        result: dict[int, dict] = {}
+        for slot, prompt in zip(slots, prompts_per_slot):
+            first_token = self.prefill(slot, prompt)
+            result[slot] = {"anchor": first_token, "draft_tokens": []}
+        return ChunkedPrefillState(done=True, result=result)
+
+    def prefill_chunked_step(self, state: ChunkedPrefillState) -> bool:
+        """Laguna prefill is never incremental; state is always already done."""
+        return state.done
 
     def generate(
         self,
