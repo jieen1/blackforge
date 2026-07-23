@@ -142,10 +142,9 @@ class DFlashVerifyCudaGraph:
         self._full_kv_indptr_gpu[:2].copy_(self._full_kv_indptr_cpu[:2], non_blocking=True)
         self._full_last_page_len_gpu[:1].copy_(self._full_last_page_len_cpu[:1], non_blocking=True)
 
-        # Full slot mapping
-        for j in range(self.num_tokens):
-            pos = kv_len + j
-            self._full_slot_mapping[j] = (full_base + pos // bs) * bs + pos % bs
+        # Full slot mapping (vectorized)
+        _pos = torch.arange(kv_len, kv_len + self.num_tokens, device=self.device)
+        self._full_slot_mapping[:self.num_tokens] = (full_base + _pos // bs) * bs + _pos % bs
 
         # SWA ring buffers
         if self._ring_blocks_per_slot > 0:
@@ -158,10 +157,9 @@ class DFlashVerifyCudaGraph:
             aligned_len = new_kv_len - aligned_start
             n_ring = min((aligned_len + bs - 1) // bs, self._ring_blocks_per_slot)
 
-            for j in range(n_ring):
-                actual_pos = aligned_start + j * bs
-                ring_block = (actual_pos % ring_slots) // bs
-                self._swa_kv_indices[j] = ring_base + ring_block
+            # Vectorized ring block indices
+            _ap = torch.arange(aligned_start, aligned_start + n_ring * bs, bs, device=self.device, dtype=torch.long)
+            self._swa_kv_indices[:n_ring] = ring_base + (_ap % ring_slots) // bs
 
             self._swa_kv_indptr_cpu[0] = 0
             self._swa_kv_indptr_cpu[1] = n_ring
@@ -170,11 +168,11 @@ class DFlashVerifyCudaGraph:
             self._swa_kv_indptr_gpu[:2].copy_(self._swa_kv_indptr_cpu[:2], non_blocking=True)
             self._swa_last_page_len_gpu[:1].copy_(self._swa_last_page_len_cpu[:1], non_blocking=True)
 
-            for j in range(self.num_tokens):
-                pos = kv_len + j
-                ring_block = (pos % ring_slots) // bs
-                ring_off = pos % bs
-                self._swa_slot_mapping[j] = (ring_base + ring_block) * bs + ring_off
+            # Vectorized SWA slot mapping
+            _sp = torch.arange(kv_len, kv_len + self.num_tokens, device=self.device)
+            _rb = (_sp % ring_slots) // bs
+            _ro = _sp % bs
+            self._swa_slot_mapping[:self.num_tokens] = (ring_base + _rb) * bs + _ro
 
     def _run_plan(self) -> None:
         """Run FlashInfer plan on all prefill wrappers."""
@@ -307,9 +305,8 @@ class DFlashVerifyCudaGraph:
             return None
 
         num_tokens = len(tokens)
-        self._input_ids[:num_tokens] = torch.tensor(
-            tokens, dtype=torch.long, device=self.device
-        )
+        for i, t in enumerate(tokens):
+            self._input_ids[i] = t
         self._fill_buffers(slot, kv_len)
         self._run_plan()
         self._graph.replay()
@@ -387,10 +384,9 @@ class DFlashDraftCudaGraph:
         aligned_len = new_kv_len - aligned_start
         n_ring = min((aligned_len + bs - 1) // bs, self._draft_blocks_per_slot)
 
-        for j in range(n_ring):
-            actual_pos = aligned_start + j * bs
-            ring_block = (actual_pos % ring_slots) // bs
-            self._kv_indices[j] = draft_base + ring_block
+        # Vectorized ring block indices
+        _ap = torch.arange(aligned_start, aligned_start + n_ring * bs, bs, device=self.device, dtype=torch.long)
+        self._kv_indices[:n_ring] = draft_base + (_ap % ring_slots) // bs
 
         self._kv_indptr_cpu[0] = 0
         self._kv_indptr_cpu[1] = n_ring
@@ -399,11 +395,11 @@ class DFlashDraftCudaGraph:
         self._kv_indptr_gpu[:2].copy_(self._kv_indptr_cpu[:2], non_blocking=True)
         self._last_page_len_gpu[:1].copy_(self._last_page_len_cpu[:1], non_blocking=True)
 
-        for j in range(self.num_tokens):
-            pos = kv_len + j
-            ring_block = (pos % ring_slots) // bs
-            ring_off = pos % bs
-            self._slot_mapping[j] = (draft_base + ring_block) * bs + ring_off
+        # Vectorized slot mapping
+        _sp = torch.arange(kv_len, kv_len + self.num_tokens, device=self.device)
+        _rb = (_sp % ring_slots) // bs
+        _ro = _sp % bs
+        self._slot_mapping[:self.num_tokens] = (draft_base + _rb) * bs + _ro
 
     def _run_plan(self) -> None:
         from runtime.backends.dflash_constants import DRAFT_HEAD_DIM, DRAFT_NUM_KV_HEADS, DRAFT_NUM_QO_HEADS
