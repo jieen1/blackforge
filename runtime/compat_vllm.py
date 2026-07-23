@@ -47,6 +47,9 @@ __all__ = [
     "set_current_vllm_config",
     "register_backend",
     "set_forward_context",
+    "get_flashinfer_metadata_builder",
+    "get_common_attn_metadata_cls",
+    "init_flashinfer_workspace",
 ]
 
 # ---------------------------------------------------------------------------

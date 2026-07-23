@@ -46,3 +46,15 @@ Laguna 的 tokenizer 通过 `post_processor` 注入 BOS，`add_special_tokens=Fa
 - "The capital of France is" → " Paris.\n\nThe user is asking about..."
 - 贪心确定性 ✅
 - 吞吐 14.2 tok/s (single), 61.5 tok/s (batch=4)
+
+## Server 层隐患（待 Laguna 接入时修复）
+
+`server/app.py:132` 的 `_tokenize_encode` 使用 `add_special_tokens=False`。
+Chat 路径（`_tokenize_chat`）通过 `apply_chat_template` 正确处理 BOS，不受影响。
+但 raw text 路径（completions API）会在 Laguna 接入时复发 BOS 缺失。
+
+修复方案：Laguna 接入 server 层时，`_tokenize_encode` 需要根据模型配置
+决定是否传 `add_special_tokens=False`。建议：
+- 在 engine/backend 层暴露 `tokenize_kwargs` 属性
+- Laguna: `{}` (默认 add_special_tokens=True)
+- Qwen: `{"add_special_tokens": False}` (保持现有行为)
