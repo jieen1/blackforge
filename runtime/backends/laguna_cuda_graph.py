@@ -277,10 +277,12 @@ class LagunaCudaGraphDecode:
         self._fill_buffers(warmup_slots, dummy_tokens, dummy_kv_lens)
         self._run_plan(warmup_slots, dummy_kv_lens)
 
-        # Capture
+        # Capture: forward + argmax + write next token (self-feeding graph)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             self._logits = self._build_metadata_and_forward()
+            # Argmax fused into graph: no separate kernel launch per step
+            self._input_ids[0] = self._logits[0].argmax(dim=-1).to(torch.long)
 
         self._graph = graph
         self._captured = True
@@ -344,9 +346,88 @@ class LagunaCudaGraphDecode:
         self._run_plan(slot_ids, kv_lengths)
         self._graph.replay()
 
+        # Argmax is fused in graph → input_ids already has next token(s)
         if bs == 1:
-            return [int(self._logits[0].argmax(dim=-1).item())]
-        return [int(self._logits[i].argmax(dim=-1).item()) for i in range(bs)]
+            return [int(self._input_ids[0].item())]
+        return [int(self._input_ids[i].item()) for i in range(bs)]
+
+    def generate(
+        self,
+        slot: int,
+        first_token: int,
+        max_tokens: int,
+        eos_tokens: tuple[int, ...] = (2, 24),
+    ) -> list[int]:
+        """Zero-sync decode loop: argmax stays on GPU, single sync at end.
+
+        Eliminates per-step .item() GPU synchronization by:
+        1. Writing argmax directly to _input_ids on GPU (GPU→GPU, no sync)
+        2. Accumulating tokens in a GPU tensor
+        3. Syncing ONCE at the end to read all tokens + check EOS
+
+        This pipelines Python buffer prep with GPU compute:
+          CPU: [prep N+1] [plan N+1] [replay N+1] [prep N+2] ...
+          GPU: [====compute N====]   [====compute N+1====]   ...
+        """
+        if not self._captured:
+            raise RuntimeError("Graph not captured. Call capture() first.")
+
+        backend = self.backend
+        ps = self.block_size
+        bps = self.blocks_per_slot
+        phys = slot + 1
+        base = phys * bps
+
+        # GPU token accumulator (avoids per-step sync)
+        out_tokens_gpu = torch.empty(max_tokens, dtype=torch.long, device=self.device)
+        out_tokens_gpu[0] = first_token
+        self._input_ids[0] = first_token
+
+        n_generated = max_tokens
+        for step in range(max_tokens - 1):
+            kvl = backend.slot_kv_len[slot]
+            new_kv = kvl + 1
+
+            self._positions[0] = kvl
+            self._slot_mapping[0] = base * ps + kvl
+
+            lpl = new_kv % ps
+            self._fi_last_page_len_staging[0] = lpl if lpl != 0 else ps
+
+            n_blocks = (new_kv + ps - 1) // ps
+            if n_blocks != self._prev_n_blocks[0]:
+                self._prev_n_blocks[0] = n_blocks
+                self._block_table[0, :n_blocks] = torch.arange(
+                    base, base + n_blocks, dtype=torch.int32, device=self.device
+                )
+                self._fi_indptr_cpu[0] = 0
+                self._fi_indptr_cpu[1] = n_blocks
+                self._fi_indices_gpu[:n_blocks] = torch.arange(
+                    base, base + n_blocks, dtype=torch.int32, device=self.device
+                )
+
+            self._fi_last_page_len_cpu[0] = self._fi_last_page_len_staging[0]
+            self._fi_indptr_gpu[:2].copy_(self._fi_indptr_cpu[:2], non_blocking=True)
+            self._fi_last_page_len_gpu[:1].copy_(self._fi_last_page_len_cpu[:1], non_blocking=True)
+            self._run_plan([slot], [kvl])
+            self._graph.replay()
+
+            # Argmax is fused in graph → input_ids[0] already has next token
+            out_tokens_gpu[step + 1] = self._input_ids[0]
+
+            backend.slot_kv_len[slot] += 1
+
+        # Single sync at end: read all tokens, truncate at EOS
+        torch.cuda.synchronize()
+        all_tokens = out_tokens_gpu[:max_tokens].tolist()
+        tokens = [first_token]
+        for tok in all_tokens[1:]:
+            tokens.append(tok)
+            backend.slot_committed_tokens[slot].append(tok)
+            if tok in eos_tokens:
+                break
+
+        return tokens
 
     def reset(self) -> None:
         """Reset per-slot tracking state for a fresh generation.
