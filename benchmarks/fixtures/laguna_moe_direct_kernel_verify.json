@@ -1,0 +1,65 @@
+{
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+  "date": "2026-07-24T00:07:18",
+  "shape": {
+    "hidden": 3072,
+    "intermediate": 1024,
+    "experts": 256,
+    "topk": 10
+  },
+  "gpu_mem_peak_mib": 8976.0,
+  "results": {
+    "eager_m1": {
+      "correct": true,
+      "max_diff": 0.0099,
+      "latency_ms": 0.098
+    },
+    "eager_m4": {
+      "correct": true,
+      "max_diff": 0.0136,
+      "latency_ms": 0.1507
+    },
+    "eager_m16": {
+      "correct": true,
+      "max_diff": 0.0138,
+      "latency_ms": 0.5462
+    },
+    "eager_m64": {
+      "correct": true,
+      "max_diff": 0.0168,
+      "latency_ms": 0.8391
+    },
+    "graph_m1": {
+      "correct": true,
+      "max_diff": 0.0123,
+      "latency_ms": 0.053,
+      "vs_baseline_pct": 71.4
+    },
+    "graph_m4": {
+      "correct": true,
+      "max_diff": 0.0137,
+      "latency_ms": 0.159,
+      "vs_baseline_pct": 14.4
+    },
+    "graph_m16": {
+      "correct": true,
+      "max_diff": 0.0137,
+      "latency_ms": 0.4138,
+      "vs_baseline_pct": -122.8
+    },
+    "graph_m64": {
+      "correct": true,
+      "max_diff": 0.02,
+      "latency_ms": 0.896,
+      "vs_baseline_pct": -382.4
+    },
+    "multibatch_m1": {
+      "correct": true,
+      "max_diff": 0.0117
+    },
+    "multibatch_m4": {
+      "correct": true,
+      "max_diff": 0.0147
+    }
+  }
+}
