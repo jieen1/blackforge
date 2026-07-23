@@ -748,81 +748,19 @@ class LagunaBackend:
     ) -> tuple[int, list[torch.Tensor] | None]:
         """Prefill prompt and return (first_token, aux_hidden_states).
 
-        Same as prefill() but also returns aux hidden states when
-        aux_hidden_state_layers is set (for DFlash context precomputation).
-
-        For prompts longer than scratch capacity, uses chunked prefill and
-        only returns aux hidden states from the last chunk (sufficient for
-        DFlash's initial context precompute).
+        Processes the prompt in chunks of PREFILL_CHUNK_SIZE tokens to
+        reduce peak GPU memory. Only returns aux hidden states from the
+        last chunk (sufficient for DFlash's initial context precompute).
         """
         if self.slot_kv_len[slot] != 0:
             raise RuntimeError(
                 f"slot {slot} is not fresh (kv_len={self.slot_kv_len[slot]})"
             )
         prompt_len = len(prompt_ids)
-        scratch_capacity = self._swa_scratch_blocks * self.block_size if self._swa_scratch else prompt_len
+        PREFILL_CHUNK = 2048  # tokens per chunk (limits peak logits to ~400 MB)
 
-        if self._swa_scratch and prompt_len > scratch_capacity:
-            # Chunked prefill: process in chunks, capture aux from last chunk only
-            sfc = self.static_forward_context
-            bs = self.block_size
-            chunk_tokens = self._swa_scratch_blocks * bs
-            window = self._swa_window
-            ring_slots = self._ring_slots_per_slot
-            phys = _physical_slot(slot)
-            ring_base = phys * self._ring_blocks_per_slot
-            aux = None
-
-            for chunk_start in range(0, prompt_len, chunk_tokens):
-                chunk_end = min(chunk_start + chunk_tokens, prompt_len)
-                chunk = prompt_ids[chunk_start:chunk_end]
-                chunk_len = len(chunk)
-                is_last_chunk = (chunk_end == prompt_len)
-
-                # Rebind SWA to scratch
-                for name in self._swa_layer_names:
-                    sfc[name].kv_cache = self._swa_scratch[name]
-
-                # Forward (capture aux only for last chunk)
-                if is_last_chunk:
-                    logits, aux = self._forward_with_aux(
-                        [slot], chunk, [chunk_start], qo_len=chunk_len, is_decode=False
-                    )
-                else:
-                    logits = self._forward(
-                        [slot], chunk, [chunk_start], qo_len=chunk_len, is_decode=False
-                    )
-
-                # Copy window from scratch to ring
-                copy_start = max(0, chunk_len - window)
-                slabs: list[tuple[int, int, int]] = []
-                pos = copy_start
-                while pos < chunk_len:
-                    abs_pos = chunk_start + pos
-                    ring_slot_idx = abs_pos % ring_slots
-                    until_wrap = ring_slots - ring_slot_idx
-                    src_off = pos % bs
-                    until_block_end = bs - src_off
-                    count = min(until_wrap, until_block_end, chunk_len - pos)
-                    slabs.append((pos, ring_slot_idx, count))
-                    pos += count
-
-                for name in self._swa_layer_names:
-                    scratch = self._swa_scratch[name]
-                    ring = self.kv_caches[name]
-                    for src_pos, dst_ring_slot, count in slabs:
-                        sb = src_pos // bs
-                        so = src_pos % bs
-                        db = dst_ring_slot // bs + ring_base
-                        do = dst_ring_slot % bs
-                        ring[db, :, do:do + count] = scratch[sb, :, so:so + count]
-
-                # Rebind SWA back to ring
-                for name in self._swa_layer_names:
-                    sfc[name].kv_cache = self.kv_caches[name]
-
-        elif self._swa_scratch:
-            # Short prompt: use scratch path directly
+        if prompt_len <= PREFILL_CHUNK and self._swa_scratch:
+            # Short prompt: use scratch path (single forward)
             sfc = self.static_forward_context
             bs = self.block_size
             for name in self._swa_layer_names:
@@ -838,7 +776,6 @@ class LagunaBackend:
             phys = _physical_slot(slot)
             ring_base = phys * self._ring_blocks_per_slot
             window_start = max(0, prompt_len - window)
-
             slabs = []
             pos = window_start
             while pos < prompt_len:
@@ -849,7 +786,6 @@ class LagunaBackend:
                 count = min(until_wrap, until_block_end, prompt_len - pos)
                 slabs.append((pos, ring_slot_idx, count))
                 pos += count
-
             for name in self._swa_layer_names:
                 scratch = self._swa_scratch[name]
                 ring = self.kv_caches[name]
@@ -859,13 +795,71 @@ class LagunaBackend:
                     db = dst_ring_slot // bs + ring_base
                     do = dst_ring_slot % bs
                     ring[db, :, do:do + count] = scratch[sb, :, so:so + count]
-
             for name in self._swa_layer_names:
                 sfc[name].kv_cache = self.kv_caches[name]
-        else:
+
+        elif prompt_len <= PREFILL_CHUNK:
+            # Short prompt, no SWA scratch
             logits, aux = self._forward_with_aux(
                 [slot], prompt_ids, [0], qo_len=prompt_len, is_decode=False
             )
+
+        else:
+            # Long prompt: chunked prefill (entire model, not just SWA)
+            sfc = self.static_forward_context
+            bs = self.block_size
+            window = self._swa_window
+            ring_slots = self._ring_slots_per_slot
+            phys = _physical_slot(slot)
+            ring_base = phys * self._ring_blocks_per_slot
+            aux = None
+
+            for chunk_start in range(0, prompt_len, PREFILL_CHUNK):
+                chunk_end = min(chunk_start + PREFILL_CHUNK, prompt_len)
+                chunk = prompt_ids[chunk_start:chunk_end]
+                chunk_len = len(chunk)
+                is_last = (chunk_end == prompt_len)
+
+                # Rebind SWA to scratch for this chunk
+                if self._swa_scratch:
+                    for name in self._swa_layer_names:
+                        sfc[name].kv_cache = self._swa_scratch[name]
+
+                # Forward: capture aux only for last chunk
+                if is_last:
+                    logits, aux = self._forward_with_aux(
+                        [slot], chunk, [chunk_start], qo_len=chunk_len, is_decode=False
+                    )
+                else:
+                    logits = self._forward(
+                        [slot], chunk, [chunk_start], qo_len=chunk_len, is_decode=False
+                    )
+
+                # Copy SWA window from scratch to ring
+                if self._swa_scratch:
+                    copy_start = max(0, chunk_len - window)
+                    slabs = []
+                    pos = copy_start
+                    while pos < chunk_len:
+                        abs_pos = chunk_start + pos
+                        ring_slot_idx = abs_pos % ring_slots
+                        until_wrap = ring_slots - ring_slot_idx
+                        src_off = pos % bs
+                        until_block_end = bs - src_off
+                        count = min(until_wrap, until_block_end, chunk_len - pos)
+                        slabs.append((pos, ring_slot_idx, count))
+                        pos += count
+                    for name in self._swa_layer_names:
+                        scratch = self._swa_scratch[name]
+                        ring = self.kv_caches[name]
+                        for src_pos, dst_ring_slot, count in slabs:
+                            sb = src_pos // bs
+                            so = src_pos % bs
+                            db = dst_ring_slot // bs + ring_base
+                            do = dst_ring_slot % bs
+                            ring[db, :, do:do + count] = scratch[sb, :, so:so + count]
+                    for name in self._swa_layer_names:
+                        sfc[name].kv_cache = self.kv_caches[name]
 
         first_token = int(logits[-1].argmax(dim=-1).item())
         self.slot_kv_len[slot] = prompt_len
