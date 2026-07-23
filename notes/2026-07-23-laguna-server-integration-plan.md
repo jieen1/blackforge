@@ -31,6 +31,13 @@
 
 5. **意外发现并修复的真实 bug**：`ServerEngine.__init__` 的 `AutoTokenizer.from_pretrained(self.MODEL)` 原本不传 `trust_remote_code`——Laguna 有自定义 `configuration_laguna.py`，没有这个标志时 transformers 走通用校验路径，会在 yarn rope_parameters 上炸 `KeyError: 'original_max_position_embeddings'`（benchmark 脚本一直是传了 `trust_remote_code=True` 的，engine.py 这条路径此前从未被走过，所以没暴露）。修复：`trust_remote_code=(self.backend_name != "qwen36")`——Qwen 路径的实际取值仍是 `False`（未传时的默认值），行为不变。
 
+6. **poolside_v1 tool-call 解析器 —— 含流式实时增量**（`server/formats/tools.py` + `server/formats/stream.py`）：读取本地已下载的 `chat_template.jinja` 拿到确切证据——Laguna 的 tool-call 内部格式与 Qwen 完全不同（`NAME<arg_key>K</arg_key><arg_value>V</arg_value>...`，无 `<function=>`/`<parameter=>` 包裹；两者共享外层 `<tool_call>...</tool_call>`）。
+   - **最终解析**（`parse_tool_calls`）：按内部形状自动识别（先试 Qwen 的 `<function=` 形状，否则退到 Poolside 形状），对 Qwen 路径行为可证明不变（正常输出两种实现产出完全一致；不匹配任一形状的畸形块保留原有"不识别就留在可见文本里"的安全语义，靠 `_IDENTIFIER_RE` 过滤防止误把散文当零参数调用解析）。
+   - **流式实时增量**（`StreamProcessor.drain_tool_deltas`）：同样按块自动识别两种形状，边生成边推送 `name`/`arguments_delta` 事件——Poolside 的函数名边界（无显式包裹标签）由首个 `<arg_key>` 或 `</tool_call>` 确定，在此之前不猜测、不提前发 name 事件（未知边界时按兵不动，等更多 token 到达），与 Qwen 分支"等 `<function=NAME>` 的收口 `>` 出现才发 name"的谨慎程度一致。Qwen 分支逐行核对过行为不变（现有 5 个流式测试原样全过）。
+   - thinking 标签（`<think>...</think>`）两个模型一致，`strip_thinking` 无需改动。
+   - 新增 13 个测试（8 个最终解析 + 5 个流式增量），全仓库 374 passed，零回归。
+   - **仍未做**：这是基于 chat_template 的"应然"格式推出的，真实生成是否完全遵循模板仍需 GPU 冒烟核实。
+
 ## 重要发现（非显而易见，需记录）
 
 ### 1. Laguna 当前实现没有 SWA 环形 KV，实际显存开销比 L0 账本高 ~4 倍
@@ -41,11 +48,11 @@
 
 `server/app.py` 的 Laguna 默认值（`capacity=1, num_slots=1, blocks_per_slot=8192`=128K）反映的是**当前的真实限制**，不是 roadmap 目标形态；等 L2 的 SWA 环形 KV 落地后应重新放宽。
 
-### 2. Laguna 的 tool-call / thinking 解析器与 Qwen 不同，尚未验证
+### 2. Laguna 的 tool-call / thinking 解析器与 Qwen 不同 —— 已按 chat_template 证据修复，仍待真实样本核实
 
-`generation_config.json` 声明 `tool_call_parser: "poolside_v1"`、`reasoning_parser: "poolside_v1"`——与 Qwen3.6 的格式是两回事。`server/formats/thinking.py`（`strip_thinking`）与 `server/formats/tools.py` 的正则完全绑死 Qwen 的具体标签形状（`<think>...</think>`、`<tool_call><function=...><parameter=...>`）。
+`generation_config.json` 声明 `tool_call_parser: "poolside_v1"`、`reasoning_parser: "poolside_v1"`——与 Qwen3.6 的格式是两回事。读 `chat_template.jinja` 拿到确切格式后，`server/formats/tools.py` + `server/formats/stream.py`（见"已完成 6"）已支持两种格式自动识别，**含流式实时增量**；`strip_thinking` 的 `<think>...</think>` 两个模型一致，不用改。
 
-**未做**：没有验证 Laguna 的真实输出格式（poolside_v1）是否与这些正则兼容——这需要真实生成样本，即需要 GPU。当前 Laguna 部署下，thinking/tool-call 的展示与解析**大概率不正确**，直到有人拿到真实输出样本核实。`chat_template_kwargs`（如 `enable_thinking`）的透传是通用的，这部分本来就没问题。
+**仍未做**：这是基于模板"应然"格式的修复，真实生成是否 100% 遵循模板未验证，需要真实生成样本（即需要 GPU）核实。
 
 ### 3. Prefill 是逐槽单独调用，非批量
 
@@ -59,5 +66,5 @@
 
 1. ~~在 GPU 能力环境里跑 5 个结构测试~~ ✅ 已完成（用户批准 import 级别使用，12/12 全绿，全仓库回归 361 passed 零退化）。
 2. **真实 GPU 冒烟**：`_load_laguna_model` 从未跑过——需要验证 `EngineArgs`/`create_engine_config` 组合、`blocks_per_slot=8192` 的显存是否真的够、以及 `LagunaBackend` 通过 `ServerEngine` 完整走一遍 prefill→decode→finish 的循环（含真实 HTTP 请求，双协议各打一轮）。
-3. **确认 Laguna 真实输出格式**：拿到一段真实生成文本，核实 thinking/tool-call 解析是否需要 poolside_v1 专用解析器。
+3. **确认 Laguna 真实输出格式**：拿到一段真实生成文本，核实 poolside_v1 tool-call 解析器（最终解析 + 流式实时增量均已按 chat_template 实现，见"已完成 6"）与真实模型输出是否完全吻合。
 4. **确认 `kv_cache_dtype="auto"` 在 Laguna 路径下的实际行为**（是否真的退到 bf16，还是 vLLM 对 NVFP4 模型有别的默认值）。

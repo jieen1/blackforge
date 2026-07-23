@@ -1,8 +1,24 @@
 """Tool-call parsing and formatting.
 
-The Qwen3.6 model emits tool calls as XML-ish text inside its generation.
-This module parses that text into structured tool-call objects and
-formats them for each API style (OpenAI / Anthropic).
+Models emit tool calls as XML-ish text inside their generation, sharing a
+common outer ``<tool_call>...</tool_call>`` delimiter but disagreeing on the
+interior shape:
+
+- Qwen3.6: ``<function=NAME>...<parameter=K>V</parameter>...</function>``
+- Laguna-S-2.1 (poolside_v1, per its ``chat_template.jinja``): bare ``NAME``
+  followed by zero or more ``<arg_key>K</arg_key><arg_value>V</arg_value>``
+  pairs -- no ``<function=>``/``<parameter=>`` wrapper at all.
+
+``parse_tool_calls`` detects which shape a block uses (the two are mutually
+exclusive) and parses accordingly. This module parses that text into
+structured tool-call objects and formats them for each API style
+(OpenAI / Anthropic).
+
+Streaming incremental deltas (``server/formats/stream.py``'s
+``drain_tool_deltas``) are NOT covered by this -- they only recognize
+Qwen's ``<function=`` shape mid-generation. A Laguna tool call still
+resolves correctly in the final response (``StreamProcessor.finalize()``
+calls ``parse_tool_calls``), it just won't stream incrementally yet.
 """
 
 from __future__ import annotations
@@ -11,14 +27,17 @@ import json
 import re
 from typing import Any
 
-_TOOL_CALL_RE = re.compile(
-    r"<tool_call>\s*<function=([^>]+)>(.*?)</function>\s*</tool_call>",
-    re.DOTALL,
+_TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+_QWEN_FUNCTION_RE = re.compile(r"<function=([^>]+)>(.*?)</function>", re.DOTALL)
+_QWEN_PARAM_RE = re.compile(r"<parameter=([^>]+)>\s*(.*?)\s*</parameter>", re.DOTALL)
+_POOLSIDE_ARG_RE = re.compile(
+    r"<arg_key>([^<]*)</arg_key>\s*<arg_value>(.*?)</arg_value>", re.DOTALL
 )
-_PARAM_RE = re.compile(
-    r"<parameter=([^>]+)>\s*(.*?)\s*</parameter>",
-    re.DOTALL,
-)
+# Real tool names are always simple identifiers (OpenAI's function-calling
+# spec requires this shape). Since the Poolside interior has no wrapper tag
+# at all, this guards against misreading arbitrary/malformed <tool_call>
+# content (e.g. prose) as a bogus zero-argument call.
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.\-]*$")
 
 
 def _repair_json(value: str) -> str:
@@ -46,31 +65,77 @@ def _repair_json(value: str) -> str:
     return repaired
 
 
+def _parse_value(raw: str) -> Any:
+    """Parse one argument value: JSON if possible, else the repaired JSON,
+    else the raw string verbatim (models occasionally emit bare strings
+    the template doesn't quote -- see chat_template.jinja's
+    ``v if v is string else v | tojson``)."""
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        try:
+            return json.loads(_repair_json(raw))
+        except (json.JSONDecodeError, ValueError):
+            return raw
+
+
+def _parse_tool_call_block(block: str) -> dict | None:
+    """Parse one ``<tool_call>...</tool_call>`` block's interior.
+
+    Returns None if the block matches neither known shape (left as visible
+    text by the caller, same as if it hadn't matched at all).
+    """
+    func_match = _QWEN_FUNCTION_RE.search(block)
+    if func_match:
+        name = func_match.group(1).strip()
+        params_block = func_match.group(2)
+        arguments = {
+            m.group(1).strip(): _parse_value(m.group(2).strip())
+            for m in _QWEN_PARAM_RE.finditer(params_block)
+        }
+        return {"name": name, "arguments": arguments}
+
+    # Poolside shape: bare NAME, optionally followed by <arg_key>/<arg_value>
+    # pairs -- e.g. "get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value>"
+    # or a zero-argument call, just "get_weather".
+    first_arg_idx = block.find("<arg_key>")
+    name = block[:first_arg_idx].strip() if first_arg_idx >= 0 else block.strip()
+    if not _IDENTIFIER_RE.match(name):
+        return None
+    args_block = block[first_arg_idx:] if first_arg_idx >= 0 else ""
+    arguments = {
+        m.group(1).strip(): _parse_value(m.group(2).strip())
+        for m in _POOLSIDE_ARG_RE.finditer(args_block)
+    }
+    return {"name": name, "arguments": arguments}
+
+
 def parse_tool_calls(text: str) -> tuple[str, list[dict]]:
     """Parse tool calls from model output.
 
     Returns (visible_text, tool_calls) where visible_text is the output
-    with tool_call blocks removed, and tool_calls is a list of dicts
-    with keys: name, arguments (dict).
+    with successfully-parsed tool_call blocks removed, and tool_calls is a
+    list of dicts with keys: name, arguments (dict). A block matching
+    neither known interior shape is left untouched in visible_text (same
+    as a non-match, not counted as a tool call).
     """
     tool_calls: list[dict] = []
-    for match in _TOOL_CALL_RE.finditer(text):
-        func_name = match.group(1).strip()
-        params_block = match.group(2)
-        arguments: dict[str, Any] = {}
-        for param_match in _PARAM_RE.finditer(params_block):
-            param_name = param_match.group(1).strip()
-            param_value = param_match.group(2).strip()
-            try:
-                arguments[param_name] = json.loads(param_value)
-            except (json.JSONDecodeError, ValueError):
-                # Attempt repair of common model JSON errors
-                try:
-                    arguments[param_name] = json.loads(_repair_json(param_value))
-                except (json.JSONDecodeError, ValueError):
-                    arguments[param_name] = param_value
-        tool_calls.append({"name": func_name, "arguments": arguments})
-    visible = _TOOL_CALL_RE.sub("", text).strip()
+    spans: list[tuple[int, int]] = []
+    for match in _TOOL_CALL_BLOCK_RE.finditer(text):
+        parsed = _parse_tool_call_block(match.group(1))
+        if parsed is None:
+            continue
+        tool_calls.append(parsed)
+        spans.append(match.span())
+    if not spans:
+        return text.strip(), tool_calls
+    pieces = []
+    last = 0
+    for start, end in spans:
+        pieces.append(text[last:start])
+        last = end
+    pieces.append(text[last:])
+    visible = "".join(pieces).strip()
     return visible, tool_calls
 
 

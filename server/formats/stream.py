@@ -185,6 +185,13 @@ class StreamProcessor:
 
         Enables streaming tool_call arguments as they are generated,
         rather than freezing until the complete tool call is parsed.
+
+        Recognizes both interior shapes (see server/formats/tools.py):
+        Qwen's ``<function=NAME>...</function>`` and Laguna's poolside_v1
+        ``NAME<arg_key>...</arg_key><arg_value>...</arg_value>`` (bare name,
+        no wrapper tag) -- detected per block the same way the final
+        ``parse_tool_calls`` does, so a block isn't misread as one shape
+        while genuinely being the other.
         """
         if not self._tool_call_started:
             return []
@@ -193,10 +200,16 @@ class StreamProcessor:
         visible = strip_thinking(raw)
         deltas = []
 
-        # Find tool_call blocks (complete or partial)
         tc_open = "<tool_call>"
+        tc_close = "</tool_call>"
         func_open = "<function="
         func_close = "</function>"
+        arg_key_open = "<arg_key>"
+
+        if not hasattr(self, "_tool_names_emitted"):
+            self._tool_names_emitted = set()
+        if not hasattr(self, "_tool_args_emitted_len"):
+            self._tool_args_emitted_len = {}
 
         search_start = 0
         tc_idx = 0
@@ -205,18 +218,42 @@ class StreamProcessor:
             if tc_pos < 0:
                 break
             after_open = tc_pos + len(tc_open)
-            func_pos = visible.find(func_open, after_open)
-            if func_pos < 0:
-                break
-            # Extract function name
-            name_end = visible.find(">", func_pos + len(func_open))
-            if name_end < 0:
-                break
-            func_name = visible[func_pos + len(func_open) : name_end].strip()
 
-            # Emit name delta if not yet emitted for this index
-            if not hasattr(self, "_tool_names_emitted"):
-                self._tool_names_emitted = set()
+            func_pos = visible.find(func_open, after_open)
+            arg_key_pos = visible.find(arg_key_open, after_open)
+            tc_close_pos = visible.find(tc_close, after_open)
+            # Qwen shape: <function=NAME> present, and not preceded by a
+            # poolside delimiter -- otherwise this is a poolside block.
+            is_qwen = (
+                func_pos >= 0
+                and (arg_key_pos < 0 or func_pos < arg_key_pos)
+                and (tc_close_pos < 0 or func_pos < tc_close_pos)
+            )
+
+            if is_qwen:
+                name_end = visible.find(">", func_pos + len(func_open))
+                if name_end < 0:
+                    break
+                func_name = visible[func_pos + len(func_open) : name_end].strip()
+                args_start = name_end + 1
+                args_end = visible.find(func_close, args_start)
+                args_so_far = (
+                    visible[args_start:] if args_end < 0 else visible[args_start:args_end]
+                )
+                block_end = args_end + len(func_close) if args_end >= 0 else -1
+            else:
+                # Poolside shape: bare NAME up to the first <arg_key> or the
+                # closing </tool_call> (zero-argument call). Neither has
+                # arrived yet -- wait for more tokens before guessing.
+                name_end = arg_key_pos if arg_key_pos >= 0 else tc_close_pos
+                if name_end < 0:
+                    break
+                func_name = visible[after_open:name_end].strip()
+                args_so_far = (
+                    visible[name_end:] if tc_close_pos < 0 else visible[name_end:tc_close_pos]
+                )
+                block_end = tc_close_pos + len(tc_close) if tc_close_pos >= 0 else -1
+
             if tc_idx not in self._tool_names_emitted:
                 self._tool_names_emitted.add(tc_idx)
                 deltas.append(
@@ -228,18 +265,6 @@ class StreamProcessor:
                     }
                 )
 
-            # Extract arguments (may be partial)
-            args_start = name_end + 1
-            args_end = visible.find(func_close, args_start)
-            if args_end < 0:
-                # Partial arguments (still streaming)
-                args_so_far = visible[args_start:]
-            else:
-                args_so_far = visible[args_start:args_end]
-
-            # Emit arguments delta
-            if not hasattr(self, "_tool_args_emitted_len"):
-                self._tool_args_emitted_len = {}
             prev_len = self._tool_args_emitted_len.get(tc_idx, 0)
             if len(args_so_far) > prev_len:
                 delta_text = args_so_far[prev_len:]
@@ -252,7 +277,9 @@ class StreamProcessor:
                     }
                 )
 
-            search_start = args_end + len(func_close) if args_end >= 0 else len(visible)
+            if block_end < 0:
+                break
+            search_start = block_end
             tc_idx += 1
 
         return deltas

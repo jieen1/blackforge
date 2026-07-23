@@ -85,6 +85,86 @@ class TestParseToolCalls:
         assert calls[0]["name"] == "no_args"
         assert calls[0]["arguments"] == {}
 
+    def test_unrecognized_shape_left_as_visible_text(self):
+        """A <tool_call> block matching neither known interior shape is
+        left untouched -- same as a non-match, not counted as a call."""
+        text = "Before " + TC_OPEN + "garbage, no known tags" + TC_CLOSE + " After"
+        visible, calls = parse_tool_calls(text)
+        assert calls == []
+        assert visible == text.strip()
+
+
+ARG_KEY_OPEN = chr(60) + "arg_key" + chr(62)
+ARG_KEY_CLOSE = chr(60) + "/arg_key" + chr(62)
+ARG_VALUE_OPEN = chr(60) + "arg_value" + chr(62)
+ARG_VALUE_CLOSE = chr(60) + "/arg_value" + chr(62)
+
+
+def _make_poolside_tool_call(func_name, params):
+    """Build a tool_call block in Laguna's poolside_v1 shape (per its
+    chat_template.jinja): bare NAME directly inside <tool_call>, followed
+    by <arg_key>/<arg_value> pairs -- no <function=>/<parameter=> wrapper."""
+    parts = [TC_OPEN, func_name]
+    for key, val in params.items():
+        parts.append(ARG_KEY_OPEN + key + ARG_KEY_CLOSE)
+        parts.append(ARG_VALUE_OPEN + val + ARG_VALUE_CLOSE)
+    parts.append(TC_CLOSE)
+    return "".join(parts)
+
+
+class TestParseToolCallsPoolside:
+    """Laguna-S-2.1's poolside_v1 tool-call shape (no <function=>/<parameter=>
+    wrapper) -- see chat_template.jinja lines ~64-73."""
+
+    def test_single_tool_call(self):
+        tc = _make_poolside_tool_call("get_weather", {"city": "Paris"})
+        text = "Sure! " + tc
+        visible, calls = parse_tool_calls(text)
+        assert visible == "Sure!"
+        assert len(calls) == 1
+        assert calls[0]["name"] == "get_weather"
+        assert calls[0]["arguments"] == {"city": "Paris"}
+
+    def test_multiple_args(self):
+        tc = _make_poolside_tool_call("search", {"query": "python", "limit": "10"})
+        _, calls = parse_tool_calls(tc)
+        assert calls[0]["arguments"] == {"query": "python", "limit": 10}
+
+    def test_multiple_tool_calls(self):
+        tc1 = _make_poolside_tool_call("foo", {"x": "1"})
+        tc2 = _make_poolside_tool_call("bar", {"y": json.dumps("hello")})
+        text = "Result: " + tc1 + " and " + tc2
+        visible, calls = parse_tool_calls(text)
+        assert visible == "Result:  and"
+        assert len(calls) == 2
+        assert calls[0]["name"] == "foo"
+        assert calls[0]["arguments"] == {"x": 1}
+        assert calls[1]["name"] == "bar"
+        assert calls[1]["arguments"] == {"y": "hello"}
+
+    def test_zero_argument_call(self):
+        tc = _make_poolside_tool_call("no_args", {})
+        _, calls = parse_tool_calls(tc)
+        assert calls[0]["name"] == "no_args"
+        assert calls[0]["arguments"] == {}
+
+    def test_invalid_json_falls_back_to_string(self):
+        tc = _make_poolside_tool_call("run", {"code": "not json at all"})
+        _, calls = parse_tool_calls(tc)
+        assert calls[0]["arguments"]["code"] == "not json at all"
+
+    def test_json_repair_trailing_comma(self):
+        tc = _make_poolside_tool_call("fn", {"items": "[1, 2, 3,]"})
+        _, calls = parse_tool_calls(tc)
+        assert calls[0]["arguments"]["items"] == [1, 2, 3]
+
+    def test_non_string_value_is_json_encoded_per_template(self):
+        """Template: `v | tojson if v is not string else v` -- a bool/number
+        argument arrives JSON-encoded, a string argument arrives raw."""
+        tc = _make_poolside_tool_call("toggle", {"enabled": "true", "count": "3"})
+        _, calls = parse_tool_calls(tc)
+        assert calls[0]["arguments"] == {"enabled": True, "count": 3}
+
 
 class TestFormatToolCallsOpenAI:
     def test_basic_format(self):
@@ -282,3 +362,116 @@ class TestStreamToolDeltas:
         # After tool call starts, content should be frozen
         proc.add_tokens(_ids("more text"))
         assert proc.drain_content() == []
+
+
+class TestStreamToolDeltasPoolside:
+    """Real-time (streaming) tool-call deltas for Laguna's poolside_v1 shape
+    -- bare NAME<arg_key>K</arg_key><arg_value>V</arg_value>..., no
+    <function=>/<parameter=> wrapper. Mirrors TestStreamToolDeltas above."""
+
+    def test_tool_name_delta_zero_arg(self):
+        """Name boundary for a zero-argument call is only known once
+        </tool_call> itself arrives -- not emitted before that."""
+        proc = StreamProcessor(_FakeTok())
+        close_think = chr(60) + "/think" + chr(62)
+        tc_open = chr(60) + "tool_call" + chr(62)
+        proc.add_tokens(_ids("think" + close_think + "Sure! " + tc_open + "get_time"))
+        proc.drain_content()
+        assert proc.drain_tool_deltas() == []  # no </tool_call> or <arg_key> yet
+        tc_close = chr(60) + "/tool_call" + chr(62)
+        proc.add_tokens(_ids(tc_close))
+        deltas = proc.drain_tool_deltas()
+        name_deltas = [d for d in deltas if d["type"] == "name"]
+        assert len(name_deltas) == 1
+        assert name_deltas[0]["name"] == "get_time"
+        assert name_deltas[0]["index"] == 0
+
+    def test_tool_name_delta_with_args(self):
+        proc = StreamProcessor(_FakeTok())
+        close_think = chr(60) + "/think" + chr(62)
+        tc_open = chr(60) + "tool_call" + chr(62)
+        arg_key_open = chr(60) + "arg_key" + chr(62)
+        proc.add_tokens(_ids("think" + close_think + "Sure! " + tc_open + "get_weather"))
+        proc.drain_content()
+        assert proc.drain_tool_deltas() == []  # name boundary not known yet
+        proc.add_tokens(_ids(arg_key_open))
+        deltas = proc.drain_tool_deltas()
+        name_deltas = [d for d in deltas if d["type"] == "name"]
+        assert len(name_deltas) == 1
+        assert name_deltas[0]["name"] == "get_weather"
+
+    def test_arguments_delta_incremental(self):
+        proc = StreamProcessor(_FakeTok())
+        close_think = chr(60) + "/think" + chr(62)
+        tc_open = chr(60) + "tool_call" + chr(62)
+        arg_key_open = chr(60) + "arg_key" + chr(62)
+        arg_key_close = chr(60) + "/arg_key" + chr(62)
+        arg_value_open = chr(60) + "arg_value" + chr(62)
+        proc.add_tokens(
+            _ids(
+                "t"
+                + close_think
+                + tc_open
+                + "fn"
+                + arg_key_open
+                + "x"
+                + arg_key_close
+                + arg_value_open
+                + "12"
+            )
+        )
+        proc.drain_content()
+        deltas1 = proc.drain_tool_deltas()
+        arg_deltas1 = [d for d in deltas1 if d["type"] == "arguments_delta"]
+        assert len(arg_deltas1) >= 1
+        proc.add_tokens(_ids("34"))
+        deltas2 = proc.drain_tool_deltas()
+        arg_deltas2 = [d for d in deltas2 if d["type"] == "arguments_delta"]
+        assert len(arg_deltas2) >= 1
+        assert "34" in arg_deltas2[0]["delta"]
+        assert "12" not in arg_deltas2[0]["delta"]
+
+    def test_finalize_after_tool_deltas(self):
+        proc = StreamProcessor(_FakeTok())
+        close_think = chr(60) + "/think" + chr(62)
+        tc_open = chr(60) + "tool_call" + chr(62)
+        tc_close = chr(60) + "/tool_call" + chr(62)
+        arg_key_open = chr(60) + "arg_key" + chr(62)
+        arg_key_close = chr(60) + "/arg_key" + chr(62)
+        arg_value_open = chr(60) + "arg_value" + chr(62)
+        arg_value_close = chr(60) + "/arg_value" + chr(62)
+        full = (
+            "think"
+            + close_think
+            + "Result: "
+            + tc_open
+            + "add"
+            + arg_key_open
+            + "x"
+            + arg_key_close
+            + arg_value_open
+            + "42"
+            + arg_value_close
+            + tc_close
+        )
+        proc.add_tokens(_ids(full))
+        proc.drain_content()
+        proc.drain_tool_deltas()
+        visible, calls = proc.finalize()
+        assert visible == "Result:"
+        assert len(calls) == 1
+        assert calls[0]["name"] == "add"
+        assert calls[0]["arguments"] == {"x": 42}
+
+    def test_multiple_tool_calls_sequential(self):
+        proc = StreamProcessor(_FakeTok())
+        close_think = chr(60) + "/think" + chr(62)
+        tc_open = chr(60) + "tool_call" + chr(62)
+        tc_close = chr(60) + "/tool_call" + chr(62)
+        full = "think" + close_think + tc_open + "foo" + tc_close + tc_open + "bar" + tc_close
+        proc.add_tokens(_ids(full))
+        proc.drain_content()
+        deltas = proc.drain_tool_deltas()
+        names = [d for d in deltas if d["type"] == "name"]
+        assert [n["name"] for n in names] == ["foo", "bar"]
+        assert [n["index"] for n in names] == [0, 1]
