@@ -1,25 +1,20 @@
 """CUDA Graph wrapper for DFlash speculative decoding.
 
-Captures the verify (M=16) and draft (M=16) forward passes as CUDA Graphs
-for zero-overhead replay during decode. The main model's decode (M=1) uses
-the existing LagunaCudaGraphDecode.
+Captures verify (M=16) and draft (M=16) forward passes as CUDA Graphs
+using FlashInfer prefill wrappers with use_cuda_graph=True.
 
-Architecture:
-- Verify graph: main model forward with qo_len=16 (parallel verify)
-- Draft graph: draft model forward with 16 tokens (1 bonus + 15 mask)
-- Decode graph: main model forward with qo_len=1 (existing, from laguna_cuda_graph.py)
-
-Per speculative step with CUDA Graphs:
-1. Decode graph replay (M=1) → bonus token + aux hidden states
-2. combine + precompute_context_kv (eager, small ops)
-3. Draft graph replay (M=16) → 15 draft tokens
-4. Verify graph replay (M=16) → accept/reject
+Per speculative step:
+1. Main decode (M=1): LagunaCudaGraphDecode (existing)
+2. combine + precompute_context_kv: eager (small ops)
+3. Draft forward (M=16): CUDA Graph with prefill wrapper
+4. Verify forward (M=16): CUDA Graph with prefill wrapper
 """
 from __future__ import annotations
 
 import logging
 from typing import Any
 
+import numpy as np
 import torch
 
 from runtime.backends.dflash_constants import (
@@ -28,188 +23,483 @@ from runtime.backends.dflash_constants import (
     NUM_QUERY_PER_REQ,
     NUM_SPECULATIVE_TOKENS,
 )
-from runtime.backends.laguna import _physical_slot
+from runtime.backends.laguna import LagunaBackend, _physical_slot
 
 logger = logging.getLogger("qwen_sm120_runtime.dflash_cudagraph")
 
 
-class DFlashCudaGraphDecode:
-    """CUDA Graph wrapper for DFlash speculative decode (single slot).
+class DFlashVerifyCudaGraph:
+    """CUDA Graph for main model verify forward (M=16).
 
-    Captures three graphs:
-    1. Main decode (M=1): existing LagunaCudaGraphDecode handles this
-    2. Draft forward (M=16): draft model with 16 query tokens
-    3. Verify forward (M=16): main model with 16 query tokens
-
-    The draft and verify graphs are captured at fixed batch_size=1 (single slot)
-    with padded token count=16.
+    Uses FlashInfer prefill wrappers with use_cuda_graph=True.
+    Separate wrappers for full-attention and SWA layer groups.
     """
 
-    def __init__(self, engine, batch_size: int = 1) -> None:
-        """Initialize DFlash CUDA Graph wrapper.
+    def __init__(self, backend: LagunaBackend) -> None:
+        self.backend = backend
+        self.device = backend.device
+        self.block_size = backend.block_size
+        self.blocks_per_slot = backend.blocks_per_slot
+        self.num_tokens = NUM_QUERY_PER_REQ  # 16
 
-        Args:
-            engine: DFlashEngine instance
-            batch_size: number of slots (currently only 1 supported)
-        """
-        self.engine = engine
-        self.backend = engine.backend
-        self.device = engine.device
-        self.batch_size = batch_size
-        self.block_size = engine.block_size
+        # Ring buffer params
+        self._ring_blocks_per_slot = backend._ring_blocks_per_slot
+        self._ring_slots_per_slot = backend._ring_slots_per_slot
+        self._swa_window = backend._swa_window
+
+        # Pre-allocated input buffers (fixed address for graph)
+        self._input_ids = torch.zeros(self.num_tokens, dtype=torch.long, device=self.device)
+        self._positions = torch.zeros(self.num_tokens, dtype=torch.long, device=self.device)
+
+        # Full-attention FlashInfer buffers
+        max_full_pages = self.blocks_per_slot
+        self._full_qo_indptr = torch.tensor([0, self.num_tokens], dtype=torch.int32, device=self.device)
+        self._full_kv_indptr_cpu = torch.zeros(2, dtype=torch.int32, pin_memory=True)
+        self._full_kv_indptr_gpu = torch.zeros(2, dtype=torch.int32, device=self.device)
+        self._full_kv_indices = torch.zeros(max_full_pages, dtype=torch.int32, device=self.device)
+        self._full_last_page_len_cpu = torch.zeros(1, dtype=torch.int32, pin_memory=True)
+        self._full_last_page_len_gpu = torch.zeros(1, dtype=torch.int32, device=self.device)
+        self._full_slot_mapping = torch.zeros(self.num_tokens, dtype=torch.long, device=self.device)
+
+        # SWA ring FlashInfer buffers
+        if self._ring_blocks_per_slot > 0:
+            max_swa_pages = self._ring_blocks_per_slot
+            self._swa_qo_indptr = torch.tensor([0, self.num_tokens], dtype=torch.int32, device=self.device)
+            self._swa_kv_indptr_cpu = torch.zeros(2, dtype=torch.int32, pin_memory=True)
+            self._swa_kv_indptr_gpu = torch.zeros(2, dtype=torch.int32, device=self.device)
+            self._swa_kv_indices = torch.zeros(max_swa_pages, dtype=torch.int32, device=self.device)
+            self._swa_last_page_len_cpu = torch.zeros(1, dtype=torch.int32, pin_memory=True)
+            self._swa_last_page_len_gpu = torch.zeros(1, dtype=torch.int32, device=self.device)
+            self._swa_slot_mapping = torch.zeros(self.num_tokens, dtype=torch.long, device=self.device)
+
+        # FlashInfer prefill wrappers (one per layer group)
+        self._prefill_wrappers: dict[tuple, Any] = {}
+        self._workspaces: list[torch.Tensor] = []
 
         # Graph state
-        self._verify_graph: torch.cuda.CUDAGraph | None = None
-        self._draft_graph: torch.cuda.CUDAGraph | None = None
+        self._graph: torch.cuda.CUDAGraph | None = None
+        self._logits: torch.Tensor | None = None
         self._captured = False
 
-        # Pre-allocated buffers for verify graph
-        self._verify_input_ids = torch.zeros(
-            NUM_QUERY_PER_REQ, dtype=torch.long, device=self.device
-        )
-        self._verify_positions = torch.zeros(
-            NUM_QUERY_PER_REQ, dtype=torch.long, device=self.device
-        )
-        self._verify_logits: torch.Tensor | None = None
+    def _init_wrappers(self) -> None:
+        """Create FlashInfer prefill wrappers with use_cuda_graph=True."""
+        from flashinfer.prefill import BatchPrefillWithPagedKVCacheWrapper
 
-        # Pre-allocated buffers for draft graph
-        self._draft_input_ids = torch.zeros(
-            NUM_QUERY_PER_REQ, dtype=torch.long, device=self.device
+        backend = self.backend
+        for group_key, builder in backend._metadata_builders.items():
+            workspace = torch.empty(
+                builder._get_workspace_buffer().numel(),
+                dtype=torch.uint8,
+                device=self.device,
+            )
+            wl = group_key[0]
+            is_swa = wl >= 0 and self._ring_blocks_per_slot > 0
+            if is_swa:
+                wrapper = BatchPrefillWithPagedKVCacheWrapper(
+                    workspace,
+                    "NHD",
+                    use_cuda_graph=True,
+                    qo_indptr_buf=self._swa_qo_indptr,
+                    paged_kv_indptr_buf=self._swa_kv_indptr_gpu,
+                    paged_kv_indices_buf=self._swa_kv_indices,
+                    paged_kv_last_page_len_buf=self._swa_last_page_len_gpu,
+                )
+            else:
+                wrapper = BatchPrefillWithPagedKVCacheWrapper(
+                    workspace,
+                    "NHD",
+                    use_cuda_graph=True,
+                    qo_indptr_buf=self._full_qo_indptr,
+                    paged_kv_indptr_buf=self._full_kv_indptr_gpu,
+                    paged_kv_indices_buf=self._full_kv_indices,
+                    paged_kv_last_page_len_buf=self._full_last_page_len_gpu,
+                )
+            self._prefill_wrappers[group_key] = wrapper
+            self._workspaces.append(workspace)
+
+    def _fill_buffers(self, slot: int, kv_len: int) -> None:
+        """Update pre-allocated buffers for verify replay."""
+        backend = self.backend
+        bs = self.block_size
+        phys = _physical_slot(slot)
+        new_kv_len = kv_len + self.num_tokens
+
+        # Positions
+        self._positions[:self.num_tokens] = torch.arange(
+            kv_len, kv_len + self.num_tokens, dtype=torch.long, device=self.device
         )
-        self._draft_positions = torch.zeros(
-            NUM_QUERY_PER_REQ, dtype=torch.long, device=self.device
+
+        # Full-attention buffers
+        full_base = phys * self.blocks_per_slot
+        n_full_blocks = (new_kv_len + bs - 1) // bs
+        self._full_kv_indices[:n_full_blocks] = torch.arange(
+            full_base, full_base + n_full_blocks, dtype=torch.int32, device=self.device
         )
-        self._draft_logits: torch.Tensor | None = None
+        self._full_kv_indptr_cpu[0] = 0
+        self._full_kv_indptr_cpu[1] = n_full_blocks
+        lpl = new_kv_len % bs
+        self._full_last_page_len_cpu[0] = lpl if lpl != 0 else bs
+        self._full_kv_indptr_gpu[:2].copy_(self._full_kv_indptr_cpu[:2], non_blocking=True)
+        self._full_last_page_len_gpu[:1].copy_(self._full_last_page_len_cpu[:1], non_blocking=True)
+
+        # Full slot mapping
+        for j in range(self.num_tokens):
+            pos = kv_len + j
+            self._full_slot_mapping[j] = (full_base + pos // bs) * bs + pos % bs
+
+        # SWA ring buffers
+        if self._ring_blocks_per_slot > 0:
+            ring_base = phys * self._ring_blocks_per_slot
+            ring_slots = self._ring_slots_per_slot
+            window = self._swa_window
+
+            window_start = max(0, kv_len - window + 1)
+            aligned_start = (window_start // bs) * bs
+            aligned_len = new_kv_len - aligned_start
+            n_ring = min((aligned_len + bs - 1) // bs, self._ring_blocks_per_slot)
+
+            for j in range(n_ring):
+                actual_pos = aligned_start + j * bs
+                ring_block = (actual_pos % ring_slots) // bs
+                self._swa_kv_indices[j] = ring_base + ring_block
+
+            self._swa_kv_indptr_cpu[0] = 0
+            self._swa_kv_indptr_cpu[1] = n_ring
+            swa_lpl = aligned_len % bs
+            self._swa_last_page_len_cpu[0] = swa_lpl if swa_lpl != 0 else bs
+            self._swa_kv_indptr_gpu[:2].copy_(self._swa_kv_indptr_cpu[:2], non_blocking=True)
+            self._swa_last_page_len_gpu[:1].copy_(self._swa_last_page_len_cpu[:1], non_blocking=True)
+
+            for j in range(self.num_tokens):
+                pos = kv_len + j
+                ring_block = (pos % ring_slots) // bs
+                ring_off = pos % bs
+                self._swa_slot_mapping[j] = (ring_base + ring_block) * bs + ring_off
+
+    def _run_plan(self) -> None:
+        """Run FlashInfer plan on all prefill wrappers."""
+        from flashinfer.prefill import BatchPrefillWithPagedKVCacheWrapper
+
+        backend = self.backend
+        for group_key, wrapper in self._prefill_wrappers.items():
+            wl, nqh, nkvh = group_key
+            head_dim = backend.head_dim
+            page_size = self.block_size
+            is_swa = wl >= 0 and self._ring_blocks_per_slot > 0
+
+            kv_dtype = torch.float8_e4m3fn if "fp8" in backend._cache_dtype_str else torch.bfloat16
+            builder_sm_scale = backend._metadata_builders[group_key].sm_scale
+
+            if is_swa:
+                qo_indptr = self._swa_qo_indptr
+                kv_indptr = self._swa_kv_indptr_gpu
+                kv_indices = self._swa_kv_indices
+                last_page_len = self._swa_last_page_len_gpu
+                window_left = wl
+            else:
+                qo_indptr = self._full_qo_indptr
+                kv_indptr = self._full_kv_indptr_gpu
+                kv_indices = self._full_kv_indices
+                last_page_len = self._full_last_page_len_gpu
+                window_left = -1
+
+            wrapper.plan(
+                qo_indptr=qo_indptr,
+                paged_kv_indptr=kv_indptr,
+                paged_kv_indices=kv_indices,
+                paged_kv_last_page_len=last_page_len,
+                num_qo_heads=nqh,
+                num_kv_heads=nkvh,
+                head_dim_qk=head_dim,
+                page_size=page_size,
+                causal=True,
+                pos_encoding_mode="NONE",
+                window_left=window_left,
+                logits_soft_cap=None,
+                q_data_type=torch.bfloat16,
+                kv_data_type=kv_dtype,
+                sm_scale=builder_sm_scale,
+            )
+
+    def _build_metadata_and_forward(self) -> torch.Tensor:
+        """Build FlashInferMetadata from pre-allocated buffers and run forward."""
+        from runtime.compat_vllm import set_current_vllm_config, set_forward_context
+        from vllm.v1.attention.backends.flashinfer import FIPrefill, FlashInferMetadata
+
+        backend = self.backend
+        attn_metadata_dict: dict[str, Any] = {}
+        slot_mapping_dict: dict[str, torch.Tensor] = {}
+
+        for group_key, wrapper in self._prefill_wrappers.items():
+            wl = group_key[0]
+            is_swa = wl >= 0 and self._ring_blocks_per_slot > 0
+            sm = self._swa_slot_mapping[:self.num_tokens] if is_swa else self._full_slot_mapping[:self.num_tokens]
+            metadata = FlashInferMetadata(
+                num_actual_tokens=self.num_tokens,
+                slot_mapping=sm,
+                q_data_type_prefill=torch.bfloat16,
+                q_data_type_decode=torch.bfloat16,
+                num_decodes=0,
+                num_decode_tokens=0,
+                num_prefills=1,
+                num_prefill_tokens=self.num_tokens,
+                causal=True,
+                use_cascade=False,
+                prefill=FIPrefill(wrapper=wrapper),
+                decode=None,
+                cascade_wrapper=None,
+            )
+            for name in backend._layer_groups[group_key]:
+                attn_metadata_dict[name] = metadata
+                slot_mapping_dict[name] = sm
+
+        with set_current_vllm_config(backend.vllm_config):
+            with set_forward_context(
+                attn_metadata_dict, backend.vllm_config, slot_mapping=slot_mapping_dict
+            ):
+                result = backend.model.forward(
+                    self._input_ids[:self.num_tokens],
+                    self._positions[:self.num_tokens],
+                )
+
+        if isinstance(result, tuple):
+            hidden_states = result[0]
+        else:
+            hidden_states = result
+        return backend.model.compute_logits(hidden_states)
 
     def capture(self) -> None:
-        """Capture verify and draft CUDA Graphs.
-
-        Must be called after the engine is initialized and KV caches are allocated.
-        Uses dummy data for warmup and capture.
-        """
+        """Warmup + plan + capture the verify forward."""
         if self._captured:
             return
 
-        logger.info("Capturing DFlash CUDA Graphs (verify M=16, draft M=16)...")
+        logger.info("Capturing DFlash verify CUDA Graph (M=%d)...", self.num_tokens)
+        self._init_wrappers()
 
-        # Warmup: run verify and draft forward 3x on side stream
+        # Warmup with dummy data
+        self._input_ids[:self.num_tokens] = 1
+        self._fill_buffers(0, 32)
+
         side_stream = torch.cuda.Stream()
         with torch.cuda.stream(side_stream):
             for _ in range(3):
-                self._warmup_verify()
-                self._warmup_draft()
+                self._fill_buffers(0, 32)
+                self._run_plan()
+                self._build_metadata_and_forward()
         side_stream.synchronize()
 
-        # Capture verify graph
-        self._capture_verify()
+        # Final fill + plan before capture
+        self._fill_buffers(0, 32)
+        self._run_plan()
 
-        # Capture draft graph
-        self._capture_draft()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            self._logits = self._build_metadata_and_forward()
 
+        self._graph = graph
         self._captured = True
-        logger.info("DFlash CUDA Graphs captured successfully")
+        logger.info("DFlash verify CUDA Graph captured")
 
-    def _warmup_verify(self) -> None:
-        """Warmup run for verify forward (no graph capture)."""
-        # Fill with dummy data
-        self._verify_input_ids[:NUM_QUERY_PER_REQ] = 1
-        self._verify_positions[:NUM_QUERY_PER_REQ] = torch.arange(
-            32, 32 + NUM_QUERY_PER_REQ, dtype=torch.long, device=self.device
-        )
-        # Run verify forward (eager)
-        self.engine._forward_verify(0, [1] * NUM_QUERY_PER_REQ, 32, NUM_QUERY_PER_REQ)
+    def replay(self, slot: int, tokens: list[int], kv_len: int) -> torch.Tensor:
+        """Replay verify graph with real data. Returns logits [16, vocab]."""
+        if self._graph is None:
+            return None
 
-    def _warmup_draft(self) -> None:
-        """Warmup run for draft forward (no graph capture)."""
-        self._draft_input_ids[0] = 1
-        self._draft_input_ids[1:NUM_QUERY_PER_REQ] = MASK_TOKEN_ID
-        self._draft_positions[:NUM_QUERY_PER_REQ] = torch.arange(
-            32, 32 + NUM_QUERY_PER_REQ, dtype=torch.long, device=self.device
-        )
-        # Run draft forward (eager)
-        self.engine._draft_forward(0, 1, 32)
-
-    def _capture_verify(self) -> None:
-        """Capture the verify forward as a CUDA Graph."""
-        # Final fill before capture
-        self._verify_input_ids[:NUM_QUERY_PER_REQ] = 1
-        self._verify_positions[:NUM_QUERY_PER_REQ] = torch.arange(
-            32, 32 + NUM_QUERY_PER_REQ, dtype=torch.long, device=self.device
-        )
-
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            logits, _ = self.engine._forward_verify(
-                0, [1] * NUM_QUERY_PER_REQ, 32, NUM_QUERY_PER_REQ
-            )
-            self._verify_logits = logits
-
-        self._verify_graph = graph
-
-    def _capture_draft(self) -> None:
-        """Capture the draft forward as a CUDA Graph."""
-        self._draft_input_ids[0] = 1
-        self._draft_input_ids[1:NUM_QUERY_PER_REQ] = MASK_TOKEN_ID
-        self._draft_positions[:NUM_QUERY_PER_REQ] = torch.arange(
-            32, 32 + NUM_QUERY_PER_REQ, dtype=torch.long, device=self.device
-        )
-
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            # Draft forward returns token list (involves .tolist() sync)
-            # For CUDA Graph, we capture the logits computation only
-            draft_model = self.engine.draft_model
-            num_tokens = NUM_QUERY_PER_REQ
-
-            # Build metadata (must be done outside graph for FlashInfer plan)
-            # Actually, FlashInfer plan cannot be inside CUDA Graph
-            # So we only capture the model forward, not the metadata build
-            pass
-
-        # Note: Draft graph capture is complex because FlashInfer plan
-        # must run outside the graph. For now, draft stays eager.
-        # TODO: Implement draft graph with pre-planned FlashInfer wrappers
-        self._draft_graph = None
-        logger.info("Draft graph: deferred (FlashInfer plan incompatible with capture)")
-
-    def replay_verify(
-        self,
-        slot: int,
-        tokens: list[int],
-        kv_len: int,
-    ) -> torch.Tensor:
-        """Replay the verify CUDA Graph with real data.
-
-        Args:
-            slot: slot index
-            tokens: [bonus_token] + draft_tokens (16 tokens)
-            kv_len: current KV length
-
-        Returns:
-            logits tensor [16, vocab_size]
-        """
-        if self._verify_graph is None:
-            # Fallback to eager
-            logits, _ = self.engine._forward_verify(slot, tokens, kv_len, len(tokens))
-            return logits
-
-        # Update input buffers (GPU→GPU copy, no sync)
         num_tokens = len(tokens)
-        self._verify_input_ids[:num_tokens] = torch.tensor(
+        self._input_ids[:num_tokens] = torch.tensor(
             tokens, dtype=torch.long, device=self.device
         )
-        self._verify_positions[:num_tokens] = torch.arange(
-            kv_len, kv_len + num_tokens, dtype=torch.long, device=self.device
+        self._fill_buffers(slot, kv_len)
+        self._run_plan()
+        self._graph.replay()
+        return self._logits
+
+
+class DFlashDraftCudaGraph:
+    """CUDA Graph for draft model forward (M=16).
+
+    Draft model has 6 SWA layers (window=512). Uses ring buffer KV.
+    """
+
+    def __init__(self, engine) -> None:
+        self.engine = engine
+        self.device = engine.device
+        self.block_size = engine.block_size
+        self.num_tokens = NUM_QUERY_PER_REQ
+
+        self._draft_blocks_per_slot = engine._draft_blocks_per_slot
+        self._ring_slots = self._draft_blocks_per_slot * self.block_size
+
+        # Pre-allocated input buffers
+        self._input_ids = torch.zeros(self.num_tokens, dtype=torch.long, device=self.device)
+        self._positions = torch.zeros(self.num_tokens, dtype=torch.long, device=self.device)
+
+        # FlashInfer buffers for draft (all SWA)
+        max_pages = self._draft_blocks_per_slot
+        self._qo_indptr = torch.tensor([0, self.num_tokens], dtype=torch.int32, device=self.device)
+        self._kv_indptr_cpu = torch.zeros(2, dtype=torch.int32, pin_memory=True)
+        self._kv_indptr_gpu = torch.zeros(2, dtype=torch.int32, device=self.device)
+        self._kv_indices = torch.zeros(max_pages, dtype=torch.int32, device=self.device)
+        self._last_page_len_cpu = torch.zeros(1, dtype=torch.int32, pin_memory=True)
+        self._last_page_len_gpu = torch.zeros(1, dtype=torch.int32, device=self.device)
+        self._slot_mapping = torch.zeros(self.num_tokens, dtype=torch.long, device=self.device)
+
+        self._wrapper = None
+        self._workspace = None
+        self._graph: torch.cuda.CUDAGraph | None = None
+        self._logits: torch.Tensor | None = None
+        self._captured = False
+
+    def _init_wrapper(self) -> None:
+        from flashinfer.prefill import BatchPrefillWithPagedKVCacheWrapper
+        from runtime.backends.dflash_constants import DRAFT_HEAD_DIM, DRAFT_NUM_KV_HEADS, DRAFT_NUM_QO_HEADS
+
+        # Get sm_scale from the first draft attention layer
+        first_attn = self.engine._draft_attn_layers[self.engine._draft_layer_names[0]]
+        self._sm_scale = first_attn.impl.scale
+
+        workspace = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=self.device)
+        self._wrapper = BatchPrefillWithPagedKVCacheWrapper(
+            workspace,
+            "NHD",
+            use_cuda_graph=True,
+            qo_indptr_buf=self._qo_indptr,
+            paged_kv_indptr_buf=self._kv_indptr_gpu,
+            paged_kv_indices_buf=self._kv_indices,
+            paged_kv_last_page_len_buf=self._last_page_len_gpu,
+        )
+        self._workspace = workspace
+
+    def _fill_buffers(self, slot: int, kv_len: int) -> None:
+        bs = self.block_size
+        phys = _physical_slot(slot)
+        draft_base = phys * self._draft_blocks_per_slot
+        ring_slots = self._ring_slots
+        new_kv_len = kv_len + self.num_tokens
+
+        self._positions[:self.num_tokens] = torch.arange(
+            kv_len, kv_len + self.num_tokens, dtype=torch.long, device=self.device
         )
 
-        # Update attention metadata (FlashInfer plan - must be outside graph)
-        # This is the bottleneck: plan must run every step
-        self.engine._update_verify_plan(slot, kv_len, num_tokens)
+        window_start = max(0, kv_len - DRAFT_WINDOW + 1)
+        aligned_start = (window_start // bs) * bs
+        aligned_len = new_kv_len - aligned_start
+        n_ring = min((aligned_len + bs - 1) // bs, self._draft_blocks_per_slot)
 
-        # Replay graph
-        self._verify_graph.replay()
-        return self._verify_logits
+        for j in range(n_ring):
+            actual_pos = aligned_start + j * bs
+            ring_block = (actual_pos % ring_slots) // bs
+            self._kv_indices[j] = draft_base + ring_block
 
-    @property
-    def is_captured(self) -> bool:
-        return self._captured
+        self._kv_indptr_cpu[0] = 0
+        self._kv_indptr_cpu[1] = n_ring
+        lpl = aligned_len % bs
+        self._last_page_len_cpu[0] = lpl if lpl != 0 else bs
+        self._kv_indptr_gpu[:2].copy_(self._kv_indptr_cpu[:2], non_blocking=True)
+        self._last_page_len_gpu[:1].copy_(self._last_page_len_cpu[:1], non_blocking=True)
+
+        for j in range(self.num_tokens):
+            pos = kv_len + j
+            ring_block = (pos % ring_slots) // bs
+            ring_off = pos % bs
+            self._slot_mapping[j] = (draft_base + ring_block) * bs + ring_off
+
+    def _run_plan(self) -> None:
+        from runtime.backends.dflash_constants import DRAFT_HEAD_DIM, DRAFT_NUM_KV_HEADS, DRAFT_NUM_QO_HEADS
+
+        self._wrapper.plan(
+            qo_indptr=self._qo_indptr,
+            paged_kv_indptr=self._kv_indptr_gpu,
+            paged_kv_indices=self._kv_indices,
+            paged_kv_last_page_len=self._last_page_len_gpu,
+            num_qo_heads=DRAFT_NUM_QO_HEADS,
+            num_kv_heads=DRAFT_NUM_KV_HEADS,
+            head_dim_qk=DRAFT_HEAD_DIM,
+            page_size=self.block_size,
+            causal=True,
+            pos_encoding_mode="NONE",
+            window_left=DRAFT_WINDOW - 1,
+            logits_soft_cap=None,
+            q_data_type=torch.bfloat16,
+            kv_data_type=torch.float8_e4m3fn,
+            sm_scale=self._sm_scale,
+        )
+
+    def _build_metadata_and_forward(self) -> torch.Tensor:
+        from runtime.compat_vllm import set_current_vllm_config, set_forward_context
+        from vllm.v1.attention.backends.flashinfer import FIPrefill, FlashInferMetadata
+
+        engine = self.engine
+        metadata = FlashInferMetadata(
+            num_actual_tokens=self.num_tokens,
+            slot_mapping=self._slot_mapping[:self.num_tokens],
+            q_data_type_prefill=torch.bfloat16,
+            q_data_type_decode=torch.bfloat16,
+            num_decodes=0,
+            num_decode_tokens=0,
+            num_prefills=1,
+            num_prefill_tokens=self.num_tokens,
+            causal=True,
+            use_cascade=False,
+            prefill=FIPrefill(wrapper=self._wrapper),
+            decode=None,
+            cascade_wrapper=None,
+        )
+
+        attn_metadata_dict = {name: metadata for name in engine._draft_layer_names}
+        slot_mapping_dict = {name: self._slot_mapping[:self.num_tokens] for name in engine._draft_layer_names}
+
+        with set_current_vllm_config(engine.vllm_config):
+            with set_forward_context(
+                attn_metadata_dict, engine.vllm_config, slot_mapping=slot_mapping_dict
+            ):
+                draft_hidden = engine.draft_model(
+                    input_ids=self._input_ids[:self.num_tokens],
+                    positions=self._positions[:self.num_tokens],
+                    inputs_embeds=None,
+                )
+
+        return engine.draft_model.compute_logits(draft_hidden)
+
+    def capture(self) -> None:
+        if self._captured:
+            return
+
+        logger.info("Capturing DFlash draft CUDA Graph (M=%d)...", self.num_tokens)
+        self._init_wrapper()
+
+        self._input_ids[0] = 1
+        self._input_ids[1:self.num_tokens] = MASK_TOKEN_ID
+        self._fill_buffers(0, 32)
+
+        side_stream = torch.cuda.Stream()
+        with torch.cuda.stream(side_stream):
+            for _ in range(3):
+                self._fill_buffers(0, 32)
+                self._run_plan()
+                self._build_metadata_and_forward()
+        side_stream.synchronize()
+
+        self._fill_buffers(0, 32)
+        self._run_plan()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            self._logits = self._build_metadata_and_forward()
+
+        self._graph = graph
+        self._captured = True
+        logger.info("DFlash draft CUDA Graph captured")
+
+    def replay(self, slot: int, bonus_token: int, kv_len: int) -> list[int]:
+        """Replay draft graph. Returns 15 draft tokens."""
+        if self._graph is None:
+            return []
+
+        self._input_ids[0] = bonus_token
+        self._input_ids[1:self.num_tokens] = MASK_TOKEN_ID
+        self._fill_buffers(slot, kv_len)
+        self._run_plan()
+        self._graph.replay()
+        draft_tokens = self._logits[1:self.num_tokens].argmax(dim=-1)
+        return draft_tokens.tolist()

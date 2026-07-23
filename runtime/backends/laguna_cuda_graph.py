@@ -98,6 +98,9 @@ class LagunaCudaGraphDecode:
         # ── Per-slot page-crossing tracker ──
         self._prev_n_blocks: list[int] = [0] * batch_size
 
+        # ── DFlash aux hidden states (captured in graph) ──
+        self._aux_hidden_states: list[torch.Tensor] | None = None
+
     def _init_wrappers(self) -> None:
         """Create FlashInfer cudagraph-enabled decode wrappers per layer group.
 
@@ -319,9 +322,10 @@ class LagunaCudaGraphDecode:
 
         # Handle tuple return when aux_hidden_state_layers is set (DFlash)
         if isinstance(result, tuple):
-            hidden_states = result[0]
+            hidden_states, self._aux_hidden_states = result
         else:
             hidden_states = result
+            self._aux_hidden_states = None
         return backend.model.compute_logits(hidden_states)
 
     def capture(self) -> None:
@@ -477,6 +481,16 @@ class LagunaCudaGraphDecode:
         if bs == 1:
             return [int(self._input_ids[0].item())]
         return [int(self._input_ids[i].item()) for i in range(bs)]
+
+    def replay_with_aux(
+        self,
+        slot_ids: list[int],
+        token_ids: list[int],
+        kv_lengths: list[int],
+    ) -> tuple[list[int], list[torch.Tensor] | None]:
+        """Replay graph and return (next_tokens, aux_hidden_states)."""
+        next_tokens = self.replay(slot_ids, token_ids, kv_lengths)
+        return next_tokens, self._aux_hidden_states
 
     def generate(
         self,

@@ -68,6 +68,9 @@ class DFlashEngine:
         self.block_size = backend.block_size
         self.num_slots = backend.num_slots
 
+        # Verify SWA layers are rebound to ring KV (审查 P3a: rebind leak guard)
+        backend.assert_swa_rebind()
+
         # Load DFlash draft model
         self.draft_model = self._load_draft_model(dflash_model_path)
 
@@ -83,9 +86,15 @@ class DFlashEngine:
         # Pre-allocated buffers
         self._init_buffers()
 
+        # CUDA Graph for main model decode (M=1)
+        self._cuda_graph = None
+        self._use_cuda_graph = os.environ.get("QSR_DFLASH_CUDA_GRAPH", "1") != "0"
+        if self._use_cuda_graph:
+            self._init_cuda_graph()
+
         logger.info(
-            "DFlashEngine initialized: K=%d speculative tokens, draft %d layers",
-            NUM_SPECULATIVE_TOKENS, DRAFT_NUM_LAYERS,
+            "DFlashEngine initialized: K=%d speculative tokens, draft %d layers, cuda_graph=%s",
+            NUM_SPECULATIVE_TOKENS, DRAFT_NUM_LAYERS, self._cuda_graph is not None,
         )
 
     def _load_draft_model(self, model_path: str | None) -> Any:
@@ -264,6 +273,25 @@ class DFlashEngine:
         self._draft_qsl = torch.tensor([0, max_tokens], dtype=torch.int32, device=device)
         self._draft_qsl_cpu = torch.tensor([0, max_tokens], dtype=torch.int32)
 
+    def _init_cuda_graph(self) -> None:
+        """Initialize and capture CUDA Graphs for decode, verify, and draft."""
+        from runtime.backends.laguna_cuda_graph import LagunaCudaGraphDecode
+
+        try:
+            cg = LagunaCudaGraphDecode(self.backend, batch_size=1)
+            cg.capture()
+            self._cuda_graph = cg
+            logger.info("DFlash: CUDA Graph captured for main decode (M=1)")
+        except Exception as e:
+            logger.warning("DFlash: main decode CUDA Graph failed: %s", e)
+            self._cuda_graph = None
+
+        # Verify/Draft CUDA Graph (M=16) — disabled: FlashInfer prefill wrapper
+        # CUDA Graph mode produces incorrect attention with variable-length KV.
+        # TODO: fix by pre-computing causal masks or using decode-style wrappers.
+        self._verify_cg = None
+        self._draft_cg = None
+
     def _forward_main_with_aux(
         self,
         slot_ids: list[int],
@@ -344,7 +372,11 @@ class DFlashEngine:
         return logits, aux_hidden_states
 
     def _build_draft_attn_metadata(self, slot: int, kv_len: int, num_tokens: int):
-        """Build CommonAttentionMetadata for draft model forward."""
+        """Build CommonAttentionMetadata for draft model forward.
+
+        Draft KV cache is a ring buffer (SWA window=512). All positions
+        must be wrapped modulo ring_slots to avoid OOB writes.
+        """
         from runtime.compat_vllm import get_common_attn_metadata_cls
 
         CommonAttentionMetadata = get_common_attn_metadata_cls()
@@ -352,26 +384,31 @@ class DFlashEngine:
         bs = self.block_size
         phys = _physical_slot(slot)
         draft_base = phys * self._draft_blocks_per_slot
+        ring_slots = self._draft_blocks_per_slot * bs
         new_kv_len = kv_len + num_tokens
 
-        # Block table: contiguous blocks for draft
-        n_blocks = min(
-            (new_kv_len + bs - 1) // bs,
+        # Ring block table: cover the SWA window aligned to block boundary
+        window_start = max(0, kv_len - DRAFT_WINDOW + 1)
+        aligned_start = (window_start // bs) * bs
+        aligned_len = new_kv_len - aligned_start
+        n_ring = min(
+            -(-aligned_len // bs),  # cdiv
             self._draft_blocks_per_slot,
         )
-        self._draft_block_table[0, :n_blocks] = torch.arange(
-            draft_base, draft_base + n_blocks, dtype=torch.int32, device=self.device
-        )
+        for j in range(n_ring):
+            actual_pos = aligned_start + j * bs
+            ring_block = (actual_pos % ring_slots) // bs
+            self._draft_block_table[0, j] = draft_base + ring_block
 
-        # Seq lens
-        self._draft_seq_lens[0] = new_kv_len
+        # Seq lens: window-aligned, not absolute
+        self._draft_seq_lens[0] = aligned_len
 
-        # Slot mapping for new tokens
+        # Slot mapping: ring-wrapped positions
         for j in range(num_tokens):
             pos = kv_len + j
-            bid = draft_base + pos // bs
-            off = pos % bs
-            self._draft_slot_mapping[j] = bid * bs + off
+            ring_block = (pos % ring_slots) // bs
+            ring_off = pos % bs
+            self._draft_slot_mapping[j] = (draft_base + ring_block) * bs + ring_off
 
         # Query start loc
         self._draft_qsl[1] = num_tokens
@@ -384,8 +421,8 @@ class DFlashEngine:
             num_reqs=1,
             num_actual_tokens=num_tokens,
             max_query_len=num_tokens,
-            max_seq_len=new_kv_len,
-            block_table_tensor=self._draft_block_table[:1, :n_blocks],
+            max_seq_len=aligned_len,
+            block_table_tensor=self._draft_block_table[:1, :n_ring],
             slot_mapping=self._draft_slot_mapping[:num_tokens],
             causal=True,
         )
@@ -456,11 +493,12 @@ class DFlashEngine:
         bs = self.block_size
         phys = _physical_slot(slot)
         draft_base = phys * self._draft_blocks_per_slot
+        ring_slots = self._draft_blocks_per_slot * bs
 
-        # Slot mapping for this single position
-        bid = draft_base + position // bs
-        off = position % bs
-        slot_mapping_val = bid * bs + off
+        # Slot mapping: ring-wrapped position
+        ring_block = (position % ring_slots) // bs
+        ring_off = position % bs
+        slot_mapping_val = (draft_base + ring_block) * bs + ring_off
         context_positions = torch.tensor(
             [position], dtype=torch.long, device=self.device
         )
@@ -473,6 +511,29 @@ class DFlashEngine:
             context_positions,
             context_slot_mapping,
         )
+
+    def _accept_reject(
+        self,
+        verify_logits: torch.Tensor,
+        draft_tokens: list[int],
+        bonus_token: int,
+    ) -> tuple[list[int], int]:
+        """Greedy accept/reject from verify logits (CUDA Graph path)."""
+        num_tokens = 1 + len(draft_tokens)
+        verify_argmax = verify_logits[:num_tokens - 1].argmax(dim=-1).tolist()
+
+        accepted = [bonus_token]
+        num_accepted = 0
+        for verify_tok, draft_tok in zip(verify_argmax, draft_tokens):
+            if verify_tok == draft_tok:
+                accepted.append(draft_tok)
+                num_accepted += 1
+            else:
+                accepted.append(verify_tok)
+                num_accepted += 1
+                break
+
+        return accepted, num_accepted
 
     def _verify(
         self,
@@ -653,10 +714,16 @@ class DFlashEngine:
         kv_len = backend.slot_kv_len[slot]
 
         # Step 1: Main model decode with aux hidden states
-        logits, aux_hidden_states = self._forward_main_with_aux(
-            [slot], [last_token], [kv_len], qo_len=1
-        )
-        bonus_token = int(logits[0].argmax(dim=-1).item())
+        if self._cuda_graph is not None:
+            next_tokens, aux_hidden_states = self._cuda_graph.replay_with_aux(
+                [slot], [last_token], [kv_len]
+            )
+            bonus_token = next_tokens[0]
+        else:
+            logits, aux_hidden_states = self._forward_main_with_aux(
+                [slot], [last_token], [kv_len], qo_len=1
+            )
+            bonus_token = int(logits[0].argmax(dim=-1).item())
         backend.slot_kv_len[slot] += 1
 
         # Step 2: Combine hidden states and precompute context KV
@@ -668,12 +735,22 @@ class DFlashEngine:
             self._precompute_context_kv(slot, combined, kv_len)
 
         # Step 3: Draft forward → 15 draft tokens
-        draft_tokens = self._draft_forward(slot, bonus_token, kv_len + 1)
+        if self._draft_cg is not None:
+            draft_tokens = self._draft_cg.replay(slot, bonus_token, kv_len + 1)
+        else:
+            draft_tokens = self._draft_forward(slot, bonus_token, kv_len + 1)
 
         # Step 4: Verify
-        accepted, num_accepted = self._verify(
-            slot, bonus_token, draft_tokens, kv_len + 1
-        )
+        if self._verify_cg is not None:
+            verify_tokens = [bonus_token] + draft_tokens
+            verify_logits = self._verify_cg.replay(slot, verify_tokens, kv_len + 1)
+            accepted, num_accepted = self._accept_reject(
+                verify_logits, draft_tokens, bonus_token
+            )
+        else:
+            accepted, num_accepted = self._verify(
+                slot, bonus_token, draft_tokens, kv_len + 1
+            )
 
         # Update slot state
         backend.slot_kv_len[slot] += num_accepted
@@ -701,10 +778,11 @@ class DFlashEngine:
         combined_input = torch.cat(aux_hidden_states, dim=-1)
         combined = self.draft_model.combine_hidden_states(combined_input)
 
-        # Precompute context KV
+        # Precompute context KV (ring-wrapped positions)
         bs = self.block_size
         phys = _physical_slot(slot)
         draft_base = phys * self._draft_blocks_per_slot
+        ring_slots = self._draft_blocks_per_slot * bs
 
         context_positions = torch.arange(
             position_offset, position_offset + num_positions,
@@ -713,9 +791,9 @@ class DFlashEngine:
         slot_mappings = torch.zeros(num_positions, dtype=torch.long, device=self.device)
         for i in range(num_positions):
             pos = position_offset + i
-            bid = draft_base + pos // bs
-            off = pos % bs
-            slot_mappings[i] = bid * bs + off
+            ring_block = (pos % ring_slots) // bs
+            ring_off = pos % bs
+            slot_mappings[i] = (draft_base + ring_block) * bs + ring_off
 
         self.draft_model.precompute_and_store_context_kv(
             combined,
@@ -741,6 +819,7 @@ class DFlashEngine:
         backend = self.backend
         slot = 0
         backend.reset_slot(slot)
+        torch.cuda.empty_cache()
 
         t0 = time.perf_counter()
 
@@ -798,7 +877,7 @@ class DFlashEngine:
             "num_steps": num_steps,
             "acceptance_rate": total_accepted / max(total_draft, 1),
             "tokens_per_step": (len(tokens) - 1) / max(num_steps, 1),
-            "tok_per_s": (len(tokens) - 1) / max((t_total - t_prefill) / 1000, 1e-6),
+            "tok_per_s": (len(tokens) - 1) / max(t_total - t_prefill, 1e-6),
         }
 
         return tokens, stats
