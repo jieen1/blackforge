@@ -481,40 +481,164 @@ class DFlashEngine:
         draft_tokens: list[int],
         kv_len: int,
     ) -> tuple[list[int], int]:
-        """Verify draft tokens with main model using sequential decode.
+        """Verify draft tokens with main model (parallel, single forward).
 
-        Runs the main model decode one token at a time for [bonus_token] +
-        draft_tokens, collecting logits for greedy verification.
-        This avoids the qo_len>1 SWA ring metadata issue.
+        Runs main model forward with [bonus_token] + draft_tokens (16 tokens)
+        in a single pass. Uses decode-style ring metadata extended for qo>1.
 
         Returns (accepted_tokens, num_accepted).
         """
         backend = self.backend
+        num_tokens = 1 + len(draft_tokens)  # 16
         verify_tokens = [bonus_token] + draft_tokens
+
+        # Build attention metadata for parallel verify
+        # Use decode-style buffers but with qo_len=num_tokens
+        logits, _ = self._forward_verify(slot, verify_tokens, kv_len, num_tokens)
+
+        # Greedy verification:
+        # logits[i] predicts token at position kv_len + i + 1
+        # logits[0] → should match draft_tokens[0]
+        verify_argmax = logits[:num_tokens - 1].argmax(dim=-1).tolist()
+
         accepted = [bonus_token]
         num_accepted = 0
-
-        for i, token in enumerate(verify_tokens):
-            # Run single decode step
-            current_kv_len = kv_len + i
-            logits, _ = self._forward_main_with_aux(
-                [slot], [token], [current_kv_len], qo_len=1
-            )
-            predicted = int(logits[0].argmax(dim=-1).item())
-
-            if i < len(draft_tokens):
-                # logits predicts what comes after verify_tokens[i]
-                # Should match draft_tokens[i]
-                if predicted == draft_tokens[i]:
-                    accepted.append(draft_tokens[i])
-                    num_accepted += 1
-                else:
-                    # Rejection: use model's prediction as correction
-                    accepted.append(predicted)
-                    num_accepted += 1
-                    break
+        for verify_tok, draft_tok in zip(verify_argmax, draft_tokens):
+            if verify_tok == draft_tok:
+                accepted.append(draft_tok)
+                num_accepted += 1
+            else:
+                accepted.append(verify_tok)
+                num_accepted += 1
+                break
 
         return accepted, num_accepted
+
+    def _forward_verify(
+        self,
+        slot: int,
+        tokens: list[int],
+        kv_len: int,
+        num_tokens: int,
+    ) -> tuple[torch.Tensor, None]:
+        """Forward pass for verify: qo_len>1 with correct ring metadata.
+
+        Builds attention metadata that correctly maps to the ring buffer
+        for SWA layers and contiguous blocks for full layers.
+        """
+        backend = self.backend
+        bs = backend.block_size
+        device = self.device
+
+        # Input tensors
+        input_ids = torch.tensor(tokens, dtype=torch.long, device=device)
+        positions = torch.arange(kv_len, kv_len + num_tokens, dtype=torch.long, device=device)
+
+        # Build full-attention metadata (standard contiguous blocks)
+        from runtime.compat_vllm import get_common_attn_metadata_cls, set_current_vllm_config
+        CommonAttentionMetadata = get_common_attn_metadata_cls()
+
+        phys = _physical_slot(slot)
+        new_kv_len = kv_len + num_tokens
+        n_blocks_full = (new_kv_len + bs - 1) // bs
+        full_base = phys * backend.blocks_per_slot
+
+        # Full block table
+        full_bt = torch.zeros(1, n_blocks_full, dtype=torch.int32, device=device)
+        full_bt[0, :n_blocks_full] = torch.arange(
+            full_base, full_base + n_blocks_full, dtype=torch.int32, device=device
+        )
+
+        # Full slot mapping
+        full_sm = torch.zeros(num_tokens, dtype=torch.long, device=device)
+        for j in range(num_tokens):
+            pos = kv_len + j
+            full_sm[j] = (full_base + pos // bs) * bs + pos % bs
+
+        qsl = torch.tensor([0, num_tokens], dtype=torch.int32, device=device)
+        qsl_cpu = torch.tensor([0, num_tokens], dtype=torch.int32)
+        seq_lens = torch.tensor([new_kv_len], dtype=torch.int32, device=device)
+
+        full_meta = CommonAttentionMetadata(
+            query_start_loc=qsl,
+            query_start_loc_cpu=qsl_cpu,
+            seq_lens=seq_lens,
+            num_reqs=1,
+            num_actual_tokens=num_tokens,
+            max_query_len=num_tokens,
+            max_seq_len=new_kv_len,
+            block_table_tensor=full_bt,
+            slot_mapping=full_sm,
+            causal=True,
+        )
+
+        # Build SWA ring metadata for verify (qo>1)
+        if backend._ring_blocks_per_slot > 0:
+            ring_base = phys * backend._ring_blocks_per_slot
+            ring_slots = backend._ring_slots_per_slot
+            window = backend._swa_window
+
+            # Window start for the earliest query position
+            window_start = max(0, kv_len - window + 1)
+            aligned_start = (window_start // bs) * bs
+            aligned_len = new_kv_len - aligned_start
+            n_ring = min((aligned_len + bs - 1) // bs, backend._ring_blocks_per_slot)
+
+            ring_bt = torch.zeros(1, n_ring, dtype=torch.int32, device=device)
+            for j in range(n_ring):
+                actual_pos = aligned_start + j * bs
+                ring_block = (actual_pos % ring_slots) // bs
+                ring_bt[0, j] = ring_base + ring_block
+
+            ring_sm = torch.zeros(num_tokens, dtype=torch.long, device=device)
+            for j in range(num_tokens):
+                pos = kv_len + j
+                ring_block = (pos % ring_slots) // bs
+                ring_off = pos % bs
+                ring_sm[j] = (ring_base + ring_block) * bs + ring_off
+
+            ring_seq_lens = torch.tensor([aligned_len], dtype=torch.int32, device=device)
+
+            swa_meta = CommonAttentionMetadata(
+                query_start_loc=qsl,
+                query_start_loc_cpu=qsl_cpu,
+                seq_lens=ring_seq_lens,
+                num_reqs=1,
+                num_actual_tokens=num_tokens,
+                max_query_len=num_tokens,
+                max_seq_len=aligned_len,
+                block_table_tensor=ring_bt,
+                slot_mapping=ring_sm,
+                causal=True,
+            )
+        else:
+            swa_meta = None
+
+        # Build FlashInfer metadata for each group
+        attn_metadata_dict = {}
+        slot_mapping_dict = {}
+        for group_key, builder in backend._metadata_builders.items():
+            wl = group_key[0]
+            is_swa = wl >= 0
+            meta = swa_meta if (is_swa and swa_meta is not None) else full_meta
+            with set_current_vllm_config(backend.vllm_config):
+                metadata = builder.build(common_prefix_len=0, common_attn_metadata=meta)
+            for name in backend._layer_groups[group_key]:
+                attn_metadata_dict[name] = metadata
+                slot_mapping_dict[name] = meta.slot_mapping
+
+        with set_forward_context(
+            attn_metadata_dict, backend.vllm_config, slot_mapping=slot_mapping_dict
+        ):
+            result = backend.model.forward(input_ids, positions)
+
+        if isinstance(result, tuple):
+            hidden_states = result[0]
+        else:
+            hidden_states = result
+
+        logits = backend.model.compute_logits(hidden_states)
+        return logits, None
 
     def speculative_decode_step(
         self,
