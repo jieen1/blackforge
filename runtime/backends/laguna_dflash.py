@@ -686,31 +686,36 @@ class DFlashEngine:
         self,
         slot: int,
         aux_hidden_states: list[torch.Tensor],
-        prompt_len: int,
+        num_positions: int,
+        position_offset: int = 0,
     ) -> None:
         """Precompute draft context KV from captured aux hidden states.
 
-        Uses aux hidden states captured during the initial prefill forward
-        (no re-run needed, avoids KV cache corruption).
+        Args:
+            slot: slot index
+            aux_hidden_states: list of 6 tensors [N, 3072]
+            num_positions: number of positions to precompute
+            position_offset: absolute position offset (for chunked prefill)
         """
-        # Combine hidden states for all positions: [N, 18432] → [N, 3072]
-        combined_input = torch.cat(aux_hidden_states, dim=-1)  # [N, 18432]
-        combined = self.draft_model.combine_hidden_states(combined_input)  # [N, 3072]
+        # Combine hidden states: [N, 18432] → [N, 3072]
+        combined_input = torch.cat(aux_hidden_states, dim=-1)
+        combined = self.draft_model.combine_hidden_states(combined_input)
 
-        # Precompute context KV for all positions
+        # Precompute context KV
         bs = self.block_size
         phys = _physical_slot(slot)
         draft_base = phys * self._draft_blocks_per_slot
 
         context_positions = torch.arange(
-            prompt_len, dtype=torch.long, device=self.device
+            position_offset, position_offset + num_positions,
+            dtype=torch.long, device=self.device
         )
-        # Build slot mappings for all positions
-        slot_mappings = torch.zeros(prompt_len, dtype=torch.long, device=self.device)
-        for pos in range(prompt_len):
+        slot_mappings = torch.zeros(num_positions, dtype=torch.long, device=self.device)
+        for i in range(num_positions):
+            pos = position_offset + i
             bid = draft_base + pos // bs
             off = pos % bs
-            slot_mappings[pos] = bid * bs + off
+            slot_mappings[i] = bid * bs + off
 
         self.draft_model.precompute_and_store_context_kv(
             combined,
@@ -718,7 +723,8 @@ class DFlashEngine:
             slot_mappings,
         )
         logger.info(
-            "DFlash: bulk precomputed context KV for %d positions", prompt_len
+            "DFlash: precomputed context KV for %d positions (offset=%d)",
+            num_positions, position_offset,
         )
 
     def generate(
@@ -743,8 +749,16 @@ class DFlashEngine:
         first_token, aux_hidden_states = backend.prefill_with_aux(slot, prompt_ids)
 
         # Bulk precompute draft context KV from captured aux states
+        # For long prompts (chunked prefill), aux is only from the last chunk.
+        # Precompute draft KV for those positions (offset from prompt start).
         if aux_hidden_states is not None:
-            self._bulk_precompute_context_kv(slot, aux_hidden_states, prompt_len)
+            aux_len = aux_hidden_states[0].shape[0]
+            aux_offset = prompt_len - aux_len
+            self._bulk_precompute_context_kv(slot, aux_hidden_states, aux_len, aux_offset)
+
+        # Free fragmented memory from prefill before decode phase
+        del aux_hidden_states
+        torch.cuda.empty_cache()
         t_prefill = time.perf_counter()
 
         tokens = [first_token]

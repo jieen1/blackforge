@@ -218,7 +218,7 @@ class LagunaBackend:
         # SWA scratch: capped at 256 blocks (4K tokens) to save memory.
         # Prompts longer than 4K use chunked prefill (process in chunks,
         # copy each chunk to ring immediately).
-        self._swa_scratch_blocks = min(blocks_per_slot, 256)
+        self._swa_scratch_blocks = min(blocks_per_slot, 2048)
         if self._swa_layer_names:
             for name in self._swa_layer_names:
                 layer = sfc[name]
@@ -750,41 +750,61 @@ class LagunaBackend:
 
         Same as prefill() but also returns aux hidden states when
         aux_hidden_state_layers is set (for DFlash context precomputation).
+
+        For prompts longer than scratch capacity, uses chunked prefill and
+        only returns aux hidden states from the last chunk (sufficient for
+        DFlash's initial context precompute).
         """
         if self.slot_kv_len[slot] != 0:
             raise RuntimeError(
                 f"slot {slot} is not fresh (kv_len={self.slot_kv_len[slot]})"
             )
-        if self._swa_scratch:
-            # Use SWA scratch path but capture the full forward result
+        prompt_len = len(prompt_ids)
+        scratch_capacity = self._swa_scratch_blocks * self.block_size if self._swa_scratch else prompt_len
+
+        if self._swa_scratch and prompt_len > scratch_capacity:
+            # Chunked prefill: process in chunks, capture aux from last chunk only
             sfc = self.static_forward_context
             bs = self.block_size
-            if self._swa_scratch:
+            chunk_tokens = self._swa_scratch_blocks * bs
+            window = self._swa_window
+            ring_slots = self._ring_slots_per_slot
+            phys = _physical_slot(slot)
+            ring_base = phys * self._ring_blocks_per_slot
+            aux = None
+
+            for chunk_start in range(0, prompt_len, chunk_tokens):
+                chunk_end = min(chunk_start + chunk_tokens, prompt_len)
+                chunk = prompt_ids[chunk_start:chunk_end]
+                chunk_len = len(chunk)
+                is_last_chunk = (chunk_end == prompt_len)
+
+                # Rebind SWA to scratch
                 for name in self._swa_layer_names:
                     sfc[name].kv_cache = self._swa_scratch[name]
 
-            logits, aux = self._forward_with_aux(
-                [slot], prompt_ids, [0], qo_len=len(prompt_ids), is_decode=False
-            )
+                # Forward (capture aux only for last chunk)
+                if is_last_chunk:
+                    logits, aux = self._forward_with_aux(
+                        [slot], chunk, [chunk_start], qo_len=chunk_len, is_decode=False
+                    )
+                else:
+                    logits = self._forward(
+                        [slot], chunk, [chunk_start], qo_len=chunk_len, is_decode=False
+                    )
 
-            # Copy last window from scratch to ring (same as _prefill_with_swa_scratch)
-            if self._swa_scratch:
-                prompt_len = len(prompt_ids)
-                window = self._swa_window
-                ring_slots = self._ring_slots_per_slot
-                phys = _physical_slot(slot)
-                ring_base = phys * self._ring_blocks_per_slot
-                window_start = max(0, prompt_len - window)
-
+                # Copy window from scratch to ring
+                copy_start = max(0, chunk_len - window)
                 slabs: list[tuple[int, int, int]] = []
-                pos = window_start
-                while pos < prompt_len:
-                    ring_slot = pos % ring_slots
-                    until_wrap = ring_slots - ring_slot
+                pos = copy_start
+                while pos < chunk_len:
+                    abs_pos = chunk_start + pos
+                    ring_slot_idx = abs_pos % ring_slots
+                    until_wrap = ring_slots - ring_slot_idx
                     src_off = pos % bs
                     until_block_end = bs - src_off
-                    count = min(until_wrap, until_block_end, prompt_len - pos)
-                    slabs.append((pos, ring_slot, count))
+                    count = min(until_wrap, until_block_end, chunk_len - pos)
+                    slabs.append((pos, ring_slot_idx, count))
                     pos += count
 
                 for name in self._swa_layer_names:
@@ -797,15 +817,58 @@ class LagunaBackend:
                         do = dst_ring_slot % bs
                         ring[db, :, do:do + count] = scratch[sb, :, so:so + count]
 
+                # Rebind SWA back to ring
                 for name in self._swa_layer_names:
                     sfc[name].kv_cache = self.kv_caches[name]
+
+        elif self._swa_scratch:
+            # Short prompt: use scratch path directly
+            sfc = self.static_forward_context
+            bs = self.block_size
+            for name in self._swa_layer_names:
+                sfc[name].kv_cache = self._swa_scratch[name]
+
+            logits, aux = self._forward_with_aux(
+                [slot], prompt_ids, [0], qo_len=prompt_len, is_decode=False
+            )
+
+            # Copy last window from scratch to ring
+            window = self._swa_window
+            ring_slots = self._ring_slots_per_slot
+            phys = _physical_slot(slot)
+            ring_base = phys * self._ring_blocks_per_slot
+            window_start = max(0, prompt_len - window)
+
+            slabs = []
+            pos = window_start
+            while pos < prompt_len:
+                ring_slot_idx = pos % ring_slots
+                until_wrap = ring_slots - ring_slot_idx
+                src_off = pos % bs
+                until_block_end = bs - src_off
+                count = min(until_wrap, until_block_end, prompt_len - pos)
+                slabs.append((pos, ring_slot_idx, count))
+                pos += count
+
+            for name in self._swa_layer_names:
+                scratch = self._swa_scratch[name]
+                ring = self.kv_caches[name]
+                for src_pos, dst_ring_slot, count in slabs:
+                    sb = src_pos // bs
+                    so = src_pos % bs
+                    db = dst_ring_slot // bs + ring_base
+                    do = dst_ring_slot % bs
+                    ring[db, :, do:do + count] = scratch[sb, :, so:so + count]
+
+            for name in self._swa_layer_names:
+                sfc[name].kv_cache = self.kv_caches[name]
         else:
             logits, aux = self._forward_with_aux(
-                [slot], prompt_ids, [0], qo_len=len(prompt_ids), is_decode=False
+                [slot], prompt_ids, [0], qo_len=prompt_len, is_decode=False
             )
 
         first_token = int(logits[-1].argmax(dim=-1).item())
-        self.slot_kv_len[slot] = len(prompt_ids)
+        self.slot_kv_len[slot] = prompt_len
         self.slot_committed_tokens[slot] = list(prompt_ids) + [first_token]
         return first_token, aux
 
