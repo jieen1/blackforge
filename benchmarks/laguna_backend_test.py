@@ -72,7 +72,7 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
     prompt = "The capital of France is"
-    prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
+    prompt_ids = tokenizer.encode(prompt)
     print(f"  Prompt: {prompt!r} -> {len(prompt_ids)} tokens")
 
     # Run 1
@@ -82,7 +82,7 @@ def main():
     for _ in range(49):
         tok = backend.decode(0, tokens_r1[-1])
         tokens_r1.append(tok)
-        if tok in (151643, 151645):
+        if tok in (2, 24):  # Laguna EOS
             break
     text_r1 = tokenizer.decode(tokens_r1, skip_special_tokens=True)
     print(f"  Run 1: {text_r1!r}")
@@ -94,7 +94,7 @@ def main():
     for _ in range(49):
         tok = backend.decode(0, tokens_r2[-1])
         tokens_r2.append(tok)
-        if tok in (151643, 151645):
+        if tok in (2, 24):  # Laguna EOS
             break
     text_r2 = tokenizer.decode(tokens_r2, skip_special_tokens=True)
     print(f"  Run 2: {text_r2!r}")
@@ -105,7 +105,7 @@ def main():
     # ── Step 3: Throughput benchmark ──
     print("\n=== Step 3: Throughput benchmark ===")
     bench_prompt = "Write a detailed explanation of quantum computing:"
-    bench_ids = tokenizer.encode(bench_prompt, add_special_tokens=False)
+    bench_ids = tokenizer.encode(bench_prompt)
 
     # Warmup
     backend.reset_slot(0)
@@ -126,7 +126,7 @@ def main():
         for _ in range(127):
             tok = backend.decode(0, tok)
             n += 1
-            if tok in (151643, 151645):
+            if tok in (2, 24):  # Laguna EOS
                 break
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - t0
@@ -151,7 +151,7 @@ def main():
     first_tokens = []
     for i, bp in enumerate(batch_prompts):
         backend.reset_slot(i)
-        ids = tokenizer.encode(bp, add_special_tokens=False)
+        ids = tokenizer.encode(bp)
         ft = backend.prefill(i, ids)
         first_tokens.append(ft)
 
@@ -171,7 +171,7 @@ def main():
 
     # Check outputs are non-trivial
     for i in range(4):
-        text = tokenizer.decode(backend.slot_committed_tokens[i][len(tokenizer.encode(batch_prompts[i], add_special_tokens=False)):], skip_special_tokens=True)
+        text = tokenizer.decode(backend.slot_committed_tokens[i][len(tokenizer.encode(batch_prompts[i])):], skip_special_tokens=True)
         print(f"  Slot {i}: {text[:80]}...")
 
     # ── Summary ──

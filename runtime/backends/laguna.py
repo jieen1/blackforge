@@ -419,7 +419,7 @@ class LagunaBackend:
             else:
                 tok = self.decode_sampled(slot, tokens[-1], params)
             tokens.append(tok)
-            if tok in (151643, 151645):
+            if tok in (2, 24):  # Laguna EOS (generation_config.json)
                 break
         self.reset_slot(slot)
         return tokens
