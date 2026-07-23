@@ -171,6 +171,19 @@ class LagunaBackend:
         self.slot_kv_len: list[int] = [0] * num_slots
         self.slot_committed_tokens: list[list[int]] = [[] for _ in range(num_slots)]
 
+        # Pre-allocated decode buffers (avoid per-step tensor allocation)
+        max_batch = num_slots
+        self._decode_input_ids = torch.zeros(max_batch, dtype=torch.long, device=self.device)
+        self._decode_positions = torch.zeros(max_batch, dtype=torch.long, device=self.device)
+        self._decode_seq_lens = torch.zeros(max_batch, dtype=torch.int32, device=self.device)
+        self._decode_block_table = torch.zeros(
+            max_batch, blocks_per_slot, dtype=torch.int32, device=self.device
+        )
+        self._decode_slot_mapping = torch.zeros(max_batch, dtype=torch.long, device=self.device)
+        # query_start_loc: [0, 1, 2, ..., batch_size] for decode (qo_len=1)
+        self._decode_qsl_gpu = torch.arange(max_batch + 1, dtype=torch.int32, device=self.device)
+        self._decode_qsl_cpu = torch.arange(max_batch + 1, dtype=torch.int32, pin_memory=True)
+
         # Expose for engine compatibility
         self.num_speculative_tokens = 0
         self.spec = None
@@ -183,6 +196,34 @@ class LagunaBackend:
             num_slots,
             block_size,
         )
+
+    def _fill_decode_buffers(
+        self,
+        slot_ids: list[int],
+        token_ids: list[int],
+        kv_lengths: list[int],
+    ) -> None:
+        """Fill pre-allocated buffers for decode (avoids per-step tensor allocation)."""
+        batch_size = len(slot_ids)
+        for i in range(batch_size):
+            self._decode_input_ids[i] = token_ids[i]
+            self._decode_positions[i] = kv_lengths[i]
+            self._decode_seq_lens[i] = kv_lengths[i] + 1
+
+            phys = _physical_slot(slot_ids[i])
+            base = phys * self.blocks_per_slot
+            new_kv_len = kv_lengths[i] + 1
+            n_blocks = (new_kv_len + self.block_size - 1) // self.block_size
+            self._decode_block_table[i, :n_blocks] = torch.arange(
+                base, base + n_blocks, dtype=torch.int32, device=self.device
+            )
+            if n_blocks < self.blocks_per_slot:
+                self._decode_block_table[i, n_blocks:] = 0
+
+            pos = kv_lengths[i]
+            bid = base + pos // self.block_size
+            off = pos % self.block_size
+            self._decode_slot_mapping[i] = bid * self.block_size + off
 
     def _build_common_attn_metadata(
         self,
@@ -202,37 +243,48 @@ class LagunaBackend:
         # New KV lengths (after this forward)
         new_kv_lens = [kv_len + qo for kv_len, qo in zip(kv_lengths, qo_lens)]
 
-        # query_start_loc
-        qo_indptr = np.zeros(num_reqs + 1, dtype=np.int32)
-        np.cumsum(qo_lens, dtype=np.int32, out=qo_indptr[1:])
-        query_start_loc = torch.from_numpy(qo_indptr).to(self.device)
-        query_start_loc_cpu = torch.from_numpy(qo_indptr)
+        # query_start_loc (use pre-allocated for decode)
+        if is_decode and max(qo_lens) == 1:
+            query_start_loc = self._decode_qsl_gpu[:num_reqs + 1]
+            query_start_loc_cpu = self._decode_qsl_cpu[:num_reqs + 1]
+        else:
+            qo_indptr = np.zeros(num_reqs + 1, dtype=np.int32)
+            np.cumsum(qo_lens, dtype=np.int32, out=qo_indptr[1:])
+            query_start_loc = torch.from_numpy(qo_indptr).to(self.device)
+            query_start_loc_cpu = torch.from_numpy(qo_indptr)
 
-        # seq_lens (new KV lengths)
-        seq_lens_np = np.array(new_kv_lens, dtype=np.int32)
-        seq_lens = torch.from_numpy(seq_lens_np).to(self.device)
+        # Use pre-allocated buffers for decode, allocate for prefill
+        if is_decode and max(qo_lens) == 1:
+            seq_lens = self._decode_seq_lens[:num_reqs]
+            max_blocks = max((kvl + page_size - 1) // page_size for kvl in new_kv_lens)
+            block_table = self._decode_block_table[:num_reqs, :max_blocks]
+            slot_mapping = self._decode_slot_mapping[:num_reqs]
+        else:
+            # seq_lens (new KV lengths)
+            seq_lens_np = np.array(new_kv_lens, dtype=np.int32)
+            seq_lens = torch.from_numpy(seq_lens_np).to(self.device)
 
-        # block_table_tensor: [num_reqs, max_blocks_per_req]
-        max_blocks = max((kvl + page_size - 1) // page_size for kvl in new_kv_lens)
-        block_table = torch.zeros(num_reqs, max_blocks, dtype=torch.int32, device=self.device)
-        for i, (slot, n_blocks) in enumerate(
-            zip(slot_ids, [(kvl + page_size - 1) // page_size for kvl in new_kv_lens])
-        ):
-            phys = _physical_slot(slot)
-            base = phys * self.blocks_per_slot
-            for j in range(n_blocks):
-                block_table[i, j] = base + j
+            # block_table_tensor: [num_reqs, max_blocks_per_req]
+            max_blocks = max((kvl + page_size - 1) // page_size for kvl in new_kv_lens)
+            block_table = torch.zeros(num_reqs, max_blocks, dtype=torch.int32, device=self.device)
+            for i, (slot, n_blocks) in enumerate(
+                zip(slot_ids, [(kvl + page_size - 1) // page_size for kvl in new_kv_lens])
+            ):
+                phys = _physical_slot(slot)
+                base = phys * self.blocks_per_slot
+                for j in range(n_blocks):
+                    block_table[i, j] = base + j
 
-        # slot_mapping
-        mappings = []
-        for slot, kv_len, qo in zip(slot_ids, kv_lengths, qo_lens):
-            phys = _physical_slot(slot)
-            for j in range(qo):
-                pos = kv_len + j
-                bid = phys * self.blocks_per_slot + pos // self.block_size
-                off = pos % self.block_size
-                mappings.append(bid * self.block_size + off)
-        slot_mapping = torch.tensor(mappings, dtype=torch.long, device=self.device)
+            # slot_mapping
+            mappings = []
+            for slot, kv_len, qo in zip(slot_ids, kv_lengths, qo_lens):
+                phys = _physical_slot(slot)
+                for j in range(qo):
+                    pos = kv_len + j
+                    bid = phys * self.blocks_per_slot + pos // self.block_size
+                    off = pos % self.block_size
+                    mappings.append(bid * self.block_size + off)
+            slot_mapping = torch.tensor(mappings, dtype=torch.long, device=self.device)
 
         return CommonAttentionMetadata(
             query_start_loc=query_start_loc,
@@ -259,6 +311,9 @@ class LagunaBackend:
         num_reqs = len(slot_ids)
         qo_lens = [qo_len] * num_reqs
 
+        if is_decode and qo_len == 1:
+            self._fill_decode_buffers(slot_ids, token_ids, kv_lengths)
+
         # Build CommonAttentionMetadata
         common_meta = self._build_common_attn_metadata(
             slot_ids, kv_lengths, qo_lens, is_decode
@@ -278,19 +333,23 @@ class LagunaBackend:
                 attn_metadata_dict[name] = metadata
                 slot_mapping_dict[name] = common_meta.slot_mapping
 
-        # Build input tensors
-        if qo_len == 1:
-            flat_token_ids = token_ids
-        elif num_reqs == 1:
-            flat_token_ids = token_ids
+        # Build input tensors (use pre-allocated buffers for decode)
+        if is_decode and qo_len == 1:
+            input_ids = self._decode_input_ids[:num_reqs]
+            positions = self._decode_positions[:num_reqs]
         else:
-            flat_token_ids = [tok for slot_tokens in token_ids for tok in slot_tokens]
+            if qo_len == 1:
+                flat_token_ids = token_ids
+            elif num_reqs == 1:
+                flat_token_ids = token_ids
+            else:
+                flat_token_ids = [tok for slot_tokens in token_ids for tok in slot_tokens]
 
-        input_ids = torch.tensor(flat_token_ids, dtype=torch.long, device=self.device)
-        positions_list = []
-        for kv_len, qo in zip(kv_lengths, qo_lens):
-            positions_list.extend(range(kv_len, kv_len + qo))
-        positions = torch.tensor(positions_list, dtype=torch.long, device=self.device)
+            input_ids = torch.tensor(flat_token_ids, dtype=torch.long, device=self.device)
+            positions_list = []
+            for kv_len, qo in zip(kv_lengths, qo_lens):
+                positions_list.extend(range(kv_len, kv_len + qo))
+            positions = torch.tensor(positions_list, dtype=torch.long, device=self.device)
 
         with set_forward_context(
             attn_metadata_dict, self.vllm_config, slot_mapping=slot_mapping_dict

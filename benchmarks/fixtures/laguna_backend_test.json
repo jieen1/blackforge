@@ -1,16 +1,16 @@
 {
   "model": "poolside/Laguna-S-2.1-NVFP4",
   "backend": "LagunaBackend (direct forward)",
-  "date": "2026-07-23T10:53:31",
+  "date": "2026-07-23T10:58:49",
   "gpu": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
-  "load_time_s": 73.8,
+  "load_time_s": 67.9,
   "gpu_mem_mib": 72528,
   "greedy_determinism": true,
   "greedy_output": " Paris. \n\nIn the context of the French language, the phrase \"C'est la vie\" translates to \"That is life\" or \"Such is life\" in English. It is commonly used to express acceptance of a situation, often with a",
   "throughput": {
-    "single_tps": 14.4,
-    "batch4_tps": 56.8,
-    "itl_ms": 69.6,
+    "single_tps": 14.2,
+    "batch4_tps": 57.8,
+    "itl_ms": 70.7,
     "reps": 5
   },
   "all_pass": true
