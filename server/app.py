@@ -1092,7 +1092,7 @@ async def anthropic_messages(request: Request):
     )
 
     max_tokens = body.get("max_tokens", DEFAULT_MAX_TOKENS)
-    model_name = body.get("model", "qwen3.6")
+    model_name = body.get("model") or engine.MODEL
     stream = body.get("stream", False)
     sampling_params = _build_sampling_params(
         temperature=body.get("temperature"),

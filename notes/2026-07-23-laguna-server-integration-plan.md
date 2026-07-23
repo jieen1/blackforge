@@ -38,6 +38,11 @@
    - 新增 13 个测试（8 个最终解析 + 5 个流式增量），全仓库 374 passed，零回归。
    - **仍未做**：这是基于 chat_template 的"应然"格式推出的，真实生成是否完全遵循模板仍需 GPU 冒烟核实。
 
+7. **排查 server/formats/ + structured_output.py 里其他 Qwen 专属假设**（CPU-only 代码审查）：
+   - **修复**：`server/app.py` 的 Anthropic `/v1/messages` handler 有个我早前批量替换 `ServerEngine.MODEL` 时漏掉的独立硬编码——`model_name = body.get("model", "qwen3.6")`（字面量字符串，不是 `ServerEngine.MODEL` 引用，所以没被那次批量替换命中）。改为 `body.get("model") or engine.MODEL`，与 OpenAI 侧的 `req.model or engine.MODEL` 写法一致。
+   - **确认无需改动**：C3 结构化输出（`runtime/structured_output.py` 的 xgrammar 集成）本就是通用的——`_ensure_xgrammar(tokenizer)` 完全由传入的 tokenizer 实例决定 vocab/词表，没有硬编码 Qwen 的 vocab_size 或 token id；`server/formats/openai.py`/`anthropic.py`/`content.py` 三个文件排查下来没有任何 Qwen 专属硬编码。
+   - **发现但判定不值得修**：`server/tracing.py`/`server/metrics.py` 的 `render_prometheus`/`render_d2_metrics` 默认参数 `model_name: str = "qwen3.6-27b"`——生产路径永远显式传 `engine.MODEL`，这个默认值只在两个测试里被隐式命中（测试不检查具体模型名字符串，只检查指标名存在），属于死代码路径，改与不改都不影响正确性，未动。
+
 ## 重要发现（非显而易见，需记录）
 
 ### 1. Laguna 当前实现没有 SWA 环形 KV，实际显存开销比 L0 账本高 ~4 倍
