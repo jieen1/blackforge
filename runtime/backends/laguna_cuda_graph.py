@@ -313,10 +313,15 @@ class LagunaCudaGraphDecode:
             with set_forward_context(
                 attn_metadata_dict, backend.vllm_config, slot_mapping=slot_mapping_dict
             ):
-                hidden_states = backend.model.forward(
+                result = backend.model.forward(
                     self._input_ids[:bs], self._positions[:bs]
                 )
 
+        # Handle tuple return when aux_hidden_state_layers is set (DFlash)
+        if isinstance(result, tuple):
+            hidden_states = result[0]
+        else:
+            hidden_states = result
         return backend.model.compute_logits(hidden_states)
 
     def capture(self) -> None:

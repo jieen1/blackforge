@@ -556,6 +556,57 @@ class DFlashEngine:
 
         return accepted
 
+    def _bulk_precompute_context_kv(
+        self,
+        slot: int,
+        prompt_ids: list[int],
+    ) -> None:
+        """Precompute draft context KV for all prompt positions after prefill.
+
+        Runs main model forward with aux hidden state capture for the full
+        prompt, then bulk-precomputes draft KV for all positions.
+        """
+        backend = self.backend
+        prompt_len = len(prompt_ids)
+
+        # Re-run prefill forward to capture aux hidden states
+        # (The initial prefill didn't capture them)
+        logits, aux_hidden_states = self._forward_main_with_aux(
+            [slot], prompt_ids, [0], qo_len=prompt_len
+        )
+
+        if aux_hidden_states is None:
+            logger.warning("No aux hidden states during bulk precompute")
+            return
+
+        # Combine hidden states for all positions: [N, 18432] → [N, 3072]
+        combined_input = torch.cat(aux_hidden_states, dim=-1)  # [N, 18432]
+        combined = self.draft_model.combine_hidden_states(combined_input)  # [N, 3072]
+
+        # Precompute context KV for all positions
+        bs = self.block_size
+        phys = _physical_slot(slot)
+        draft_base = phys * self._draft_blocks_per_slot
+
+        context_positions = torch.arange(
+            prompt_len, dtype=torch.long, device=self.device
+        )
+        # Build slot mappings for all positions
+        slot_mappings = torch.zeros(prompt_len, dtype=torch.long, device=self.device)
+        for pos in range(prompt_len):
+            bid = draft_base + pos // bs
+            off = pos % bs
+            slot_mappings[pos] = bid * bs + off
+
+        self.draft_model.precompute_and_store_context_kv(
+            combined,
+            context_positions,
+            slot_mappings,
+        )
+        logger.info(
+            "DFlash: bulk precomputed context KV for %d positions", prompt_len
+        )
+
     def generate(
         self,
         prompt_ids: list[int],
@@ -573,8 +624,11 @@ class DFlashEngine:
 
         t0 = time.perf_counter()
 
-        # Prefill
+        # Prefill (standard, without aux capture)
         first_token = backend.prefill(slot, prompt_ids)
+
+        # Bulk precompute draft context KV for all prompt positions
+        self._bulk_precompute_context_kv(slot, prompt_ids)
         t_prefill = time.perf_counter()
 
         tokens = [first_token]

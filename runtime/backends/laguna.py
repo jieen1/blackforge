@@ -552,7 +552,13 @@ class LagunaBackend:
         with set_forward_context(
             attn_metadata_dict, self.vllm_config, slot_mapping=slot_mapping_dict
         ):
-            hidden_states = self.model.forward(input_ids, positions)
+            result = self.model.forward(input_ids, positions)
+
+        # Handle tuple return when aux_hidden_state_layers is set (DFlash)
+        if isinstance(result, tuple):
+            hidden_states = result[0]
+        else:
+            hidden_states = result
 
         logits = self.model.compute_logits(hidden_states)
         return logits
@@ -790,7 +796,6 @@ class LagunaBackend:
         self.reset_slot(slot)
         params = SamplingParams(
             temperature=temperature,
-            max_tokens=max_tokens,
             top_p=top_p if top_p < 1.0 else 1.0,
             top_k=top_k if top_k > 0 else 0,
         )

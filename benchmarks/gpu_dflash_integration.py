@@ -29,7 +29,7 @@ def build_vllm_config():
 
     model_path = os.path.expanduser(
         "~/.cache/huggingface/hub/models--poolside--Laguna-S-2.1-NVFP4/"
-        "snapshots/0e860e40a52a5a2e71a348e6bc742a2e6cd64c18/"
+        "snapshots/07614121b31898586430f189d27a25a0be310843/"
     )
     engine_args = EngineArgs(
         model=model_path,
@@ -106,7 +106,13 @@ def test_dflash_engine():
     print("\n  Comparing with non-speculative baseline...")
     backend.reset_slot(0)
     t_base = time.perf_counter()
-    baseline_tokens = backend.generate(prompt, max_tokens=64)
+    baseline_first = backend.prefill(0, prompt)
+    baseline_tokens = [baseline_first]
+    for _ in range(63):
+        tok = backend.decode(0, baseline_tokens[-1])
+        baseline_tokens.append(tok)
+        if tok in (2, 24):
+            break
     t_base_end = time.perf_counter()
     base_ms = (t_base_end - t_base) * 1000
     print(f"  Baseline: {len(baseline_tokens)} tokens in {base_ms:.1f}ms")
