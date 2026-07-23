@@ -69,8 +69,8 @@ class LagunaBackend:
         torch.cuda.set_device(self.device)
 
         # Apply A2 patches before loading
-        from runtime.nvfp4_cutlass_direct_patch import patch_nvfp4_prefer_cutlass_direct
         from runtime.nvfp4_custom_gemm import patch_nvfp4_custom_gemm
+        from runtime.nvfp4_cutlass_direct_patch import patch_nvfp4_prefer_cutlass_direct
 
         patch_nvfp4_prefer_cutlass_direct()
         patch_nvfp4_custom_gemm()

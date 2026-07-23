@@ -5,7 +5,11 @@ Sweeps all 4 configs × 3 M values × 6 shapes = 72 combinations.
 Outputs a JSON autotune table for the runtime to use.
 """
 from __future__ import annotations
-import ctypes, json, os, sys, time
+import ctypes
+import json
+import os
+import sys
+import time
 from datetime import datetime
 from pathlib import Path
 import numpy as np

@@ -32,7 +32,7 @@ MODEL = "poolside/Laguna-S-2.1-NVFP4"
 
 def build_laguna_config(max_model_len: int = 4096):
     """Build VllmConfig for Laguna (FlashInfer backend, no SM120GQA)."""
-    from runtime.compat_vllm import EngineArgs, VllmConfig
+    from runtime.compat_vllm import EngineArgs
 
     args = EngineArgs(
         model=MODEL,

@@ -15,7 +15,6 @@ import torch
 import triton
 import triton.language as tl
 
-
 # FP4 e2m1 lookup table: 4-bit index -> bf16 value
 # e2m1: {0, 0.5, 1, 1.5, 2, 3, 4, 6} × {+, -}
 _FP4_LUT = torch.tensor(
@@ -72,8 +71,8 @@ def _nvfp4_gemm_kernel(
         )  # [M, BLOCK_K/2] uint8
 
         # Unpack FP4: each uint8 -> 2 values (low nibble first)
-        a_lo = (a_packed & 0x0F).to(tl.uint8)  # [M, BLOCK_K/2]
-        a_hi = ((a_packed >> 4) & 0x0F).to(tl.uint8)
+        _a_lo = (a_packed & 0x0F).to(tl.uint8)  # [M, BLOCK_K/2]
+        _a_hi = ((a_packed >> 4) & 0x0F).to(tl.uint8)
         # Interleave to get [M, BLOCK_K] — approximate by processing lo and hi separately
 
         # Load weight block: [BLOCK_N, BLOCK_K/2] packed uint8
@@ -84,8 +83,8 @@ def _nvfp4_gemm_kernel(
             other=0,
         )  # [BLOCK_N, BLOCK_K/2] uint8
 
-        b_lo = (b_packed & 0x0F).to(tl.uint8)
-        b_hi = ((b_packed >> 4) & 0x0F).to(tl.uint8)
+        _b_lo = (b_packed & 0x0F).to(tl.uint8)
+        _b_hi = ((b_packed >> 4) & 0x0F).to(tl.uint8)
 
         # Load block scales: [M, 1] and [BLOCK_N, 1]
         sa = tl.load(
@@ -102,8 +101,8 @@ def _nvfp4_gemm_kernel(
         # Convert scales from fp8 representation to float
         # The scales are stored as fp8_e4m3 but we load them as raw bytes
         # For now, treat as float32 (the actual conversion depends on storage format)
-        sa_f = sa.to(tl.float32)
-        sb_f = sb.to(tl.float32)
+        _sa_f = sa.to(tl.float32)
+        _sb_f = sb.to(tl.float32)
 
         # Compute partial products for low and high nibbles
         # For each pair of FP4 values packed in one byte:

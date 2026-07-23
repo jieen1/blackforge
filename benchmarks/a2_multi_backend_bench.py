@@ -17,9 +17,9 @@ if _REPO_ROOT not in sys.path:
 os.environ.setdefault("USE_LIBUV", "0")
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
-import torch
-from vllm import _custom_ops as ops
-from vllm.scalar_type import scalar_types
+import torch  # noqa: E402
+from vllm import _custom_ops as ops  # noqa: E402
+from vllm.scalar_type import scalar_types  # noqa: E402
 
 FLOAT4_E2M1_MAX = scalar_types.float4_e2m1f.max()
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max

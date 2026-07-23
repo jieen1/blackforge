@@ -11,8 +11,6 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-import torch
-
 from runtime.sampling import SamplingParams
 
 logger = logging.getLogger("qwen_sm120_runtime.vllm_model_runner")
@@ -42,8 +40,8 @@ class VllmModelRunner:
         self._max_model_len = max_model_len
 
         # Apply A2 patches before loading
-        from runtime.nvfp4_cutlass_direct_patch import patch_nvfp4_prefer_cutlass_direct
         from runtime.nvfp4_custom_gemm import patch_nvfp4_custom_gemm
+        from runtime.nvfp4_cutlass_direct_patch import patch_nvfp4_prefer_cutlass_direct
         patch_nvfp4_prefer_cutlass_direct()
         patch_nvfp4_custom_gemm()
 
