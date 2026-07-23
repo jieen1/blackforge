@@ -348,3 +348,30 @@ def compute_causal_conv1d_metadata(
         nums_dict[BLOCK_M]["token_chunk_offset_ptr"] = token_chunk_offset_ptr
 
     return nums_dict, batch_ptr, token_chunk_offset_ptr
+
+
+# ---------------------------------------------------------------------------
+# Re-exported: FlashInfer attention metadata (Laguna backend)
+#
+# Used by runtime/backends/laguna.py for direct model.forward() path.
+# FlashInferMetadataBuilder builds per-group attention metadata.
+# CommonAttentionMetadata is the input dataclass for the builder.
+# init_workspace_manager initializes FlashInfer workspace buffers.
+# ---------------------------------------------------------------------------
+
+def get_flashinfer_metadata_builder():
+    """Lazy import: FlashInferMetadataBuilder."""
+    from vllm.v1.attention.backends.flashinfer import FlashInferMetadataBuilder
+    return FlashInferMetadataBuilder
+
+
+def get_common_attn_metadata_cls():
+    """Lazy import: CommonAttentionMetadata."""
+    from vllm.v1.attention.backends.utils import CommonAttentionMetadata
+    return CommonAttentionMetadata
+
+
+def init_flashinfer_workspace(device):
+    """Lazy import: init_workspace_manager."""
+    from vllm.v1.worker.workspace import init_workspace_manager
+    init_workspace_manager(device)

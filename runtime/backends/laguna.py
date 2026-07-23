@@ -84,9 +84,9 @@ class LagunaBackend:
             self.model = get_model(vllm_config=vllm_config)
 
         # Initialize workspace manager for MoE layers
-        from vllm.v1.worker.workspace import init_workspace_manager
+        from runtime.compat_vllm import init_flashinfer_workspace
 
-        init_workspace_manager(self.device)
+        init_flashinfer_workspace(self.device)
 
         # Discover attention layers from static_forward_context
         sfc = vllm_config.compilation_config.static_forward_context
@@ -134,7 +134,8 @@ class LagunaBackend:
         )
 
         # Create FlashInferMetadataBuilder for each group
-        from vllm.v1.attention.backends.flashinfer import FlashInferMetadataBuilder
+        from runtime.compat_vllm import get_flashinfer_metadata_builder
+        FlashInferMetadataBuilder = get_flashinfer_metadata_builder()
 
         self._metadata_builders: dict[tuple, FlashInferMetadataBuilder] = {}
         with set_current_vllm_config(vllm_config):
@@ -191,7 +192,8 @@ class LagunaBackend:
         is_decode: bool,
     ):
         """Build CommonAttentionMetadata for vLLM's FlashInferMetadataBuilder."""
-        from vllm.v1.attention.backends.utils import CommonAttentionMetadata
+        from runtime.compat_vllm import get_common_attn_metadata_cls
+        CommonAttentionMetadata = get_common_attn_metadata_cls()
 
         num_reqs = len(slot_ids)
         num_actual_tokens = sum(qo_lens)

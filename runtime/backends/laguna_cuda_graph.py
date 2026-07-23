@@ -168,7 +168,8 @@ class LagunaDecodeGraph:
         qo_lens = [1] * batch_size
 
         # Build CommonAttentionMetadata using pre-allocated tensors
-        from vllm.v1.attention.backends.utils import CommonAttentionMetadata
+        from runtime.compat_vllm import get_common_attn_metadata_cls
+        CommonAttentionMetadata = get_common_attn_metadata_cls()
 
         qo_indptr = np.zeros(batch_size + 1, dtype=np.int32)
         np.cumsum(qo_lens, dtype=np.int32, out=qo_indptr[1:])
