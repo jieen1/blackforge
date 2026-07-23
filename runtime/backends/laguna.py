@@ -215,12 +215,16 @@ class LagunaBackend:
         # Allocated once, reused across slots. Not zeroed (causal mask
         # guarantees no read-before-write within the window).
         self._swa_scratch: dict[str, torch.Tensor] = {}
+        # SWA scratch: capped at 256 blocks (4K tokens) to save memory.
+        # Prompts longer than 4K use chunked prefill (process in chunks,
+        # copy each chunk to ring immediately).
+        self._swa_scratch_blocks = min(blocks_per_slot, 256)
         if self._swa_layer_names:
             for name in self._swa_layer_names:
                 layer = sfc[name]
                 backend_cls = layer.get_attn_backend()
                 shape = backend_cls.get_kv_cache_shape(
-                    blocks_per_slot, block_size, layer.num_kv_heads,
+                    self._swa_scratch_blocks, block_size, layer.num_kv_heads,
                     layer.head_size, cache_dtype_str,
                 )
                 self._swa_scratch[name] = torch.empty(
@@ -659,6 +663,143 @@ class LagunaBackend:
         self.slot_kv_len[slot] = len(prompt_ids)
         self.slot_committed_tokens[slot] = list(prompt_ids) + [first_token]
         return first_token
+
+    def prefill_with_aux(
+        self, slot: int, prompt_ids: list[int]
+    ) -> tuple[int, list[torch.Tensor] | None]:
+        """Prefill prompt and return (first_token, aux_hidden_states).
+
+        Same as prefill() but also returns aux hidden states when
+        aux_hidden_state_layers is set (for DFlash context precomputation).
+        """
+        if self.slot_kv_len[slot] != 0:
+            raise RuntimeError(
+                f"slot {slot} is not fresh (kv_len={self.slot_kv_len[slot]})"
+            )
+        if self._swa_scratch:
+            # Use SWA scratch path but capture the full forward result
+            sfc = self.static_forward_context
+            bs = self.block_size
+            if self._swa_scratch:
+                for name in self._swa_layer_names:
+                    sfc[name].kv_cache = self._swa_scratch[name]
+
+            logits, aux = self._forward_with_aux(
+                [slot], prompt_ids, [0], qo_len=len(prompt_ids), is_decode=False
+            )
+
+            # Copy last window from scratch to ring (same as _prefill_with_swa_scratch)
+            if self._swa_scratch:
+                prompt_len = len(prompt_ids)
+                window = self._swa_window
+                ring_slots = self._ring_slots_per_slot
+                phys = _physical_slot(slot)
+                ring_base = phys * self._ring_blocks_per_slot
+                window_start = max(0, prompt_len - window)
+
+                slabs: list[tuple[int, int, int]] = []
+                pos = window_start
+                while pos < prompt_len:
+                    ring_slot = pos % ring_slots
+                    until_wrap = ring_slots - ring_slot
+                    src_off = pos % bs
+                    until_block_end = bs - src_off
+                    count = min(until_wrap, until_block_end, prompt_len - pos)
+                    slabs.append((pos, ring_slot, count))
+                    pos += count
+
+                for name in self._swa_layer_names:
+                    scratch = self._swa_scratch[name]
+                    ring = self.kv_caches[name]
+                    for src_pos, dst_ring_slot, count in slabs:
+                        sb = src_pos // bs
+                        so = src_pos % bs
+                        db = dst_ring_slot // bs + ring_base
+                        do = dst_ring_slot % bs
+                        ring[db, :, do:do + count] = scratch[sb, :, so:so + count]
+
+                for name in self._swa_layer_names:
+                    sfc[name].kv_cache = self.kv_caches[name]
+        else:
+            logits, aux = self._forward_with_aux(
+                [slot], prompt_ids, [0], qo_len=len(prompt_ids), is_decode=False
+            )
+
+        first_token = int(logits[-1].argmax(dim=-1).item())
+        self.slot_kv_len[slot] = len(prompt_ids)
+        self.slot_committed_tokens[slot] = list(prompt_ids) + [first_token]
+        return first_token, aux
+
+    def _forward_with_aux(
+        self,
+        slot_ids: list[int],
+        token_ids: list[int],
+        kv_lengths: list[int],
+        qo_len: int = 1,
+        is_decode: bool = True,
+    ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
+        """Like _forward but also returns aux_hidden_states."""
+        num_reqs = len(slot_ids)
+        qo_lens = [qo_len] * num_reqs
+
+        if is_decode and qo_len == 1:
+            self._fill_decode_buffers(slot_ids, token_ids, kv_lengths)
+
+        common_meta = self._build_common_attn_metadata(
+            slot_ids, kv_lengths, qo_lens, is_decode
+        )
+
+        attn_metadata_dict: dict[str, Any] = {}
+        slot_mapping_dict: dict[str, torch.Tensor] = {}
+
+        swa_meta = None
+        if self._ring_blocks_per_slot > 0 and self._swa_layer_names:
+            swa_meta = self._build_swa_attn_metadata(
+                slot_ids, kv_lengths, qo_lens, is_decode
+            )
+
+        for group_key, builder in self._metadata_builders.items():
+            wl = group_key[0]
+            is_swa_group = wl >= 0
+            meta = swa_meta if (is_swa_group and swa_meta is not None) else common_meta
+            with set_current_vllm_config(self.vllm_config):
+                metadata = builder.build(
+                    common_prefix_len=0,
+                    common_attn_metadata=meta,
+                )
+            for name in self._layer_groups[group_key]:
+                attn_metadata_dict[name] = metadata
+                slot_mapping_dict[name] = meta.slot_mapping
+
+        if is_decode and qo_len == 1:
+            input_ids = self._decode_input_ids[:num_reqs]
+            positions = self._decode_positions[:num_reqs]
+        else:
+            if qo_len == 1:
+                flat_token_ids = token_ids
+            elif num_reqs == 1:
+                flat_token_ids = token_ids
+            else:
+                flat_token_ids = [tok for slot_tokens in token_ids for tok in slot_tokens]
+            input_ids = torch.tensor(flat_token_ids, dtype=torch.long, device=self.device)
+            positions_list = []
+            for kv_len, qo in zip(kv_lengths, qo_lens):
+                positions_list.extend(range(kv_len, kv_len + qo))
+            positions = torch.tensor(positions_list, dtype=torch.long, device=self.device)
+
+        with set_forward_context(
+            attn_metadata_dict, self.vllm_config, slot_mapping=slot_mapping_dict
+        ):
+            result = self.model.forward(input_ids, positions)
+
+        if isinstance(result, tuple):
+            hidden_states, aux_hidden_states = result
+        else:
+            hidden_states = result
+            aux_hidden_states = None
+
+        logits = self.model.compute_logits(hidden_states)
+        return logits, aux_hidden_states
 
     def decode(self, slot: int, token_id: int) -> int:
         kv_len = self.slot_kv_len[slot]

@@ -481,36 +481,38 @@ class DFlashEngine:
         draft_tokens: list[int],
         kv_len: int,
     ) -> tuple[list[int], int]:
-        """Verify draft tokens with main model.
+        """Verify draft tokens with main model using sequential decode.
 
-        Runs main model forward with [bonus_token] + draft_tokens (16 tokens).
+        Runs the main model decode one token at a time for [bonus_token] +
+        draft_tokens, collecting logits for greedy verification.
+        This avoids the qo_len>1 SWA ring metadata issue.
+
         Returns (accepted_tokens, num_accepted).
         """
-        num_tokens = 1 + len(draft_tokens)  # 16
+        backend = self.backend
         verify_tokens = [bonus_token] + draft_tokens
-
-        # Run main model forward with qo_len=num_tokens
-        logits, _ = self._forward_main_with_aux(
-            [slot], verify_tokens, [kv_len], qo_len=num_tokens
-        )
-
-        # Greedy verification:
-        # logits[i] predicts token at position kv_len + i + 1
-        # logits[0] → should match draft_tokens[0]
-        # logits[i] → should match draft_tokens[i]
-        verify_argmax = logits[: num_tokens - 1].argmax(dim=-1).tolist()
-
         accepted = [bonus_token]
         num_accepted = 0
-        for verify_tok, draft_tok in zip(verify_argmax, draft_tokens):
-            if verify_tok == draft_tok:
-                accepted.append(draft_tok)
-                num_accepted += 1
-            else:
-                # Rejection: use verify model's prediction as correction
-                accepted.append(verify_tok)
-                num_accepted += 1
-                break
+
+        for i, token in enumerate(verify_tokens):
+            # Run single decode step
+            current_kv_len = kv_len + i
+            logits, _ = self._forward_main_with_aux(
+                [slot], [token], [current_kv_len], qo_len=1
+            )
+            predicted = int(logits[0].argmax(dim=-1).item())
+
+            if i < len(draft_tokens):
+                # logits predicts what comes after verify_tokens[i]
+                # Should match draft_tokens[i]
+                if predicted == draft_tokens[i]:
+                    accepted.append(draft_tokens[i])
+                    num_accepted += 1
+                else:
+                    # Rejection: use model's prediction as correction
+                    accepted.append(predicted)
+                    num_accepted += 1
+                    break
 
         return accepted, num_accepted
 
@@ -559,26 +561,14 @@ class DFlashEngine:
     def _bulk_precompute_context_kv(
         self,
         slot: int,
-        prompt_ids: list[int],
+        aux_hidden_states: list[torch.Tensor],
+        prompt_len: int,
     ) -> None:
-        """Precompute draft context KV for all prompt positions after prefill.
+        """Precompute draft context KV from captured aux hidden states.
 
-        Runs main model forward with aux hidden state capture for the full
-        prompt, then bulk-precomputes draft KV for all positions.
+        Uses aux hidden states captured during the initial prefill forward
+        (no re-run needed, avoids KV cache corruption).
         """
-        backend = self.backend
-        prompt_len = len(prompt_ids)
-
-        # Re-run prefill forward to capture aux hidden states
-        # (The initial prefill didn't capture them)
-        logits, aux_hidden_states = self._forward_main_with_aux(
-            [slot], prompt_ids, [0], qo_len=prompt_len
-        )
-
-        if aux_hidden_states is None:
-            logger.warning("No aux hidden states during bulk precompute")
-            return
-
         # Combine hidden states for all positions: [N, 18432] → [N, 3072]
         combined_input = torch.cat(aux_hidden_states, dim=-1)  # [N, 18432]
         combined = self.draft_model.combine_hidden_states(combined_input)  # [N, 3072]
@@ -624,11 +614,13 @@ class DFlashEngine:
 
         t0 = time.perf_counter()
 
-        # Prefill (standard, without aux capture)
-        first_token = backend.prefill(slot, prompt_ids)
+        # Prefill with aux hidden state capture (single forward, no re-run)
+        prompt_len = len(prompt_ids)
+        first_token, aux_hidden_states = backend.prefill_with_aux(slot, prompt_ids)
 
-        # Bulk precompute draft context KV for all prompt positions
-        self._bulk_precompute_context_kv(slot, prompt_ids)
+        # Bulk precompute draft context KV from captured aux states
+        if aux_hidden_states is not None:
+            self._bulk_precompute_context_kv(slot, aux_hidden_states, prompt_len)
         t_prefill = time.perf_counter()
 
         tokens = [first_token]
