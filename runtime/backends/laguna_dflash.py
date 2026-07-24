@@ -413,7 +413,7 @@ class DFlashEngine:
 
         with set_forward_context(
             attn_metadata_dict, backend.vllm_config, slot_mapping=slot_mapping_dict
-        ):
+        , skip_compiled=True):
             result = backend.model.forward(input_ids, positions)
 
         # Handle tuple return (hidden_states, aux_hidden_states)
@@ -525,7 +525,7 @@ class DFlashEngine:
         # Run draft model forward
         with set_forward_context(
             attn_metadata_dict, self.vllm_config, slot_mapping=slot_mapping_dict
-        ):
+        , skip_compiled=True):
             draft_hidden = self.draft_model(
                 input_ids=self._draft_input_ids[:num_tokens],
                 positions=self._draft_positions[:num_tokens],
@@ -721,7 +721,7 @@ class DFlashEngine:
 
         with set_forward_context(
             attn_metadata_dict, backend.vllm_config, slot_mapping=slot_mapping_dict
-        ):
+        , skip_compiled=True):
             result = backend.model.forward(input_ids, positions)
 
         if isinstance(result, tuple):
@@ -1159,7 +1159,7 @@ class DFlashEngine:
 
         from runtime.compat_vllm import set_forward_context
         with set_current_vllm_config(backend.vllm_config):
-            with set_forward_context(attn_metadata_dict, backend.vllm_config, slot_mapping=slot_mapping_dict):
+            with set_forward_context(attn_metadata_dict, backend.vllm_config, slot_mapping=slot_mapping_dict, skip_compiled=True):
                 result = backend.model.forward(input_ids, positions)
 
         if isinstance(result, tuple):

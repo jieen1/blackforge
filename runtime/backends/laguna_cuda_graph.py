@@ -314,7 +314,8 @@ class LagunaCudaGraphDecode:
 
         with set_current_vllm_config(backend.vllm_config):
             with set_forward_context(
-                attn_metadata_dict, backend.vllm_config, slot_mapping=slot_mapping_dict
+                attn_metadata_dict, backend.vllm_config, slot_mapping=slot_mapping_dict,
+                skip_compiled=True,
             ):
                 result = backend.model.forward(
                     self._input_ids[:bs], self._positions[:bs]

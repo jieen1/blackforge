@@ -1,0 +1,54 @@
+{
+  "agent_cold": {
+    "prefill_ms": 548.8673569925595,
+    "decode_ms": 5377.887795009883,
+    "total_ms": 5926.755152002443,
+    "num_tokens": 128,
+    "num_steps": 46,
+    "acceptance_rate": 0.1855072463768116,
+    "tokens_per_step": 2.760869565217391,
+    "tok_per_s": 23.61521936509027,
+    "total_s": 21.13125512600527
+  },
+  "agent_warm3": {
+    "prefill_ms": 169.26816599152517,
+    "decode_ms": 842.5573480053572,
+    "total_ms": 1011.8255139968824,
+    "num_tokens": 128,
+    "num_steps": 25,
+    "acceptance_rate": 0.33866666666666667,
+    "tokens_per_step": 5.08,
+    "tok_per_s": 150.73157963746405
+  },
+  "64K": {
+    "prefill_ms": 12787.020368006779,
+    "decode_ms": 1008.8431280018995,
+    "total_ms": 13795.863496008678,
+    "num_tokens": 256,
+    "num_steps": 28,
+    "acceptance_rate": 0.6095238095238096,
+    "tokens_per_step": 9.107142857142858,
+    "tok_per_s": 252.76476879517375
+  },
+  "128K": {
+    "prefill_ms": 30231.884364999132,
+    "decode_ms": 1411.7048699990846,
+    "total_ms": 31643.589234998217,
+    "num_tokens": 256,
+    "num_steps": 36,
+    "acceptance_rate": 0.4777777777777778,
+    "tokens_per_step": 7.083333333333333,
+    "tok_per_s": 180.63265588944617
+  },
+  "date": "2026-07-24T14:37:15",
+  "method": "jit_compile_marlin_cg_v2",
+  "config": {
+    "enforce_eager": false,
+    "cudagraph_mode": "none",
+    "VLLM_USE_AOT_COMPILE": "0",
+    "moe_backend": "marlin",
+    "decode_cg": "eager (skip_compiled)",
+    "verify_cg": "compiled (JIT)",
+    "draft_cg": "compiled (JIT)"
+  }
+}
