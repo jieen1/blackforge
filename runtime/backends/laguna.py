@@ -114,9 +114,12 @@ class LagunaBackend:
 
         init_flashinfer_workspace(self.device)
 
-        # Patch MoE layers with B12x direct kernel (自研 kernel 集成)
+        # Patch MoE layers with direct kernel (自研 kernel 集成)
         self._moe_b12x_kernels: list = []
-        if _os.environ.get("QSR_MOE_B12X", "0") != "0":
+        self._moe_sparkinfer_layers: list = []
+        if _os.environ.get("QSR_MOE_SPARKINFER", "0") != "0":
+            self._patch_moe_sparkinfer()
+        elif _os.environ.get("QSR_MOE_B12X", "0") != "0":
             self._patch_moe_b12x()
 
         # Discover attention layers from static_forward_context
@@ -445,6 +448,127 @@ class LagunaBackend:
             patched += 1
 
         logger.info("Laguna: patched %d MoE layers with B12x direct kernel", patched)
+
+
+    def _patch_moe_sparkinfer(self) -> None:
+        """Replace vLLM FusedMoE expert kernel with sparkinfer.
+
+        Loads MoE weights directly from the NVFP4 checkpoint (zero vLLM
+        weight dependency), prepares them for sparkinfer, and patches each
+        MoE layer's forward to: router → sparkinfer kernel → shared expert.
+
+        After loading sparkinfer weights for a layer, frees vLLM's copy of
+        that layer's expert weights to avoid double memory usage.
+
+        Gated by QSR_MOE_SPARKINFER=1.
+        """
+        from runtime.backends.laguna_sparkinfer_moe import (
+            SparkinferMoELayer,
+            _find_checkpoint,
+            load_moe_layer_weights,
+            prepare_sparkinfer_layer,
+            sparkinfer_version,
+        )
+        from sparkinfer.moe.fused_moe._impl import allocate_tp_moe_workspace_pool
+        from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
+            fused_topk_bias,
+        )
+
+        model = self.model
+        hf_config = self.vllm_config.model_config.hf_config
+        top_k = getattr(hf_config, "num_experts_per_tok", 10)
+        renormalize = getattr(hf_config, "norm_topk_prob", True)
+        softcap = getattr(hf_config, "moe_router_logit_softcapping", 0.0) or 0.0
+        apply_on_input = getattr(hf_config, "moe_apply_router_weight_on_input", False)
+
+        ckpt = _find_checkpoint()
+        workspace = allocate_tp_moe_workspace_pool()
+        logger.info(
+            "sparkinfer MoE patch: ckpt=%s, sparkinfer@%s",
+            ckpt.name, sparkinfer_version(),
+        )
+
+        patched = 0
+        for name, module in model.named_modules():
+            if not hasattr(module, "gate") or not hasattr(module, "experts"):
+                continue
+            experts_obj = module.experts
+            if not hasattr(experts_obj, "routed_experts"):
+                continue
+            routed = experts_obj.routed_experts
+            if not hasattr(routed, "w13_weight"):
+                continue
+
+            # Extract layer index from module name (e.g. "...layers.5.mlp" → 5)
+            parts = name.split(".")
+            layer_idx = None
+            for i, p in enumerate(parts):
+                if p == "layers" and i + 1 < len(parts):
+                    try:
+                        layer_idx = int(parts[i + 1])
+                    except ValueError:
+                        pass
+            if layer_idx is None or layer_idx == 0:
+                continue  # layer 0 is dense MLP
+
+            moe_module = module
+            shared_expert = getattr(moe_module, "shared_expert", None)
+            routed_scaling = getattr(moe_module, "routed_scaling_factor", 1.0)
+            e_bias = getattr(experts_obj, "e_score_correction_bias", None)
+
+            # Load sparkinfer weights from checkpoint
+            raw = load_moe_layer_weights(ckpt, layer_idx, self.device)
+            si_experts = prepare_sparkinfer_layer(raw, self.device)
+            si_layer = SparkinferMoELayer(si_experts, workspace, self.device)
+            self._moe_sparkinfer_layers.append(si_layer)
+            del raw
+
+            # Free vLLM's expert weights to reclaim memory
+            for attr in ("w13_weight", "w13_weight_scale", "w13_weight_scale_2",
+                         "w2_weight", "w2_weight_scale", "w2_weight_scale_2",
+                         "w13_input_scale", "w2_input_scale"):
+                if hasattr(routed, attr):
+                    t = getattr(routed, attr)
+                    if isinstance(t, torch.nn.Parameter):
+                        t.data = torch.empty(0, device=t.device)
+                    elif isinstance(t, torch.Tensor):
+                        setattr(routed, attr, torch.empty(0, device=t.device))
+            torch.cuda.empty_cache()
+
+            def _make_patched_forward(
+                moe_mod, _si_layer, _shared, _scaling,
+                _renorm, _softcap, _e_bias, _top_k, _apply_on_input,
+            ):
+                def _patched_forward(hidden_states: torch.Tensor) -> torch.Tensor:
+                    orig_shape = hidden_states.shape
+                    hs = hidden_states.view(-1, hidden_states.shape[-1])
+                    router_logits, _ = moe_mod.gate(hs)
+                    router_logits = router_logits.float()
+                    if _softcap > 0:
+                        router_logits = torch.tanh(router_logits / _softcap) * _softcap
+                    topk_weights, topk_ids = fused_topk_bias(
+                        hs, router_logits, "sigmoid", _e_bias,
+                        _top_k, _renorm,
+                        routed_scaling_factor=_scaling if not _apply_on_input else 1.0,
+                    )
+                    routed_out = _si_layer.forward(hs, topk_ids, topk_weights)
+                    if _apply_on_input:
+                        routed_out = routed_out * _scaling
+                    if _shared is not None:
+                        shared_out = _shared(hs)
+                        routed_out = routed_out + shared_out
+                    return routed_out.view(orig_shape)
+                return _patched_forward
+
+            moe_module.forward = _make_patched_forward(
+                moe_module, si_layer, shared_expert, routed_scaling,
+                renormalize, softcap, e_bias, top_k, apply_on_input,
+            )
+            patched += 1
+            if patched % 10 == 0:
+                logger.info("sparkinfer MoE: patched %d layers...", patched)
+
+        logger.info("Laguna: patched %d MoE layers with sparkinfer kernel", patched)
 
     def _fill_decode_buffers(
         self,
