@@ -579,8 +579,13 @@ class LagunaBackend:
         kv_lengths: list[int],
         qo_lens: list[int],
         is_decode: bool,
+        swa_mode: str = "auto",
     ):
-        """Build CommonAttentionMetadata for SWA layers (ring block_table)."""
+        """Build CommonAttentionMetadata for SWA layers.
+
+        swa_mode: explicit routing — "decode_ring", "verify_ring",
+                  "prefill_scratch", or "auto" (infer from is_decode/qo).
+        """
         from runtime.compat_vllm import get_common_attn_metadata_cls
         CommonAttentionMetadata = get_common_attn_metadata_cls()
 
@@ -589,7 +594,14 @@ class LagunaBackend:
         bs = self.block_size
         ring_slots = self._ring_slots_per_slot
 
-        if is_decode and max(qo_lens) == 1:
+        # Resolve mode
+        if swa_mode == "auto":
+            if is_decode and max(qo_lens) == 1:
+                swa_mode = "decode_ring"
+            else:
+                swa_mode = "prefill_scratch"
+
+        if swa_mode == "decode_ring":
             query_start_loc = self._decode_qsl_gpu[:num_reqs + 1]
             query_start_loc_cpu = self._decode_qsl_cpu[:num_reqs + 1]
             seq_lens = self._swa_decode_seq_lens[:num_reqs]
@@ -600,7 +612,7 @@ class LagunaBackend:
             block_table = self._swa_decode_block_table[:num_reqs, :max_blocks]
             slot_mapping = self._swa_decode_slot_mapping[:num_reqs]
             max_seq = int(seq_lens.max().item())
-        else:
+        elif swa_mode == "prefill_scratch":
             # Prefill: use full block_table (scratch KV is full-size)
             qo_indptr = np.zeros(num_reqs + 1, dtype=np.int32)
             np.cumsum(qo_lens, dtype=np.int32, out=qo_indptr[1:])
@@ -627,6 +639,53 @@ class LagunaBackend:
                     mappings.append(bid * bs + off)
             slot_mapping = torch.tensor(mappings, dtype=torch.long, device=self.device)
             max_seq = max(new_kv_lens)
+        elif swa_mode == "verify_ring":
+            # Verify (qo>1, ring buffer active): ring block_table + ring slot_mapping
+            qo_indptr = np.zeros(num_reqs + 1, dtype=np.int32)
+            np.cumsum(qo_lens, dtype=np.int32, out=qo_indptr[1:])
+            query_start_loc = torch.from_numpy(qo_indptr).to(self.device)
+            query_start_loc_cpu = torch.from_numpy(qo_indptr)
+
+            window = self._swa_window
+            ring_blocks_per_slot = self._ring_blocks_per_slot
+            new_kv_lens = [kv_len + qo for kv_len, qo in zip(kv_lengths, qo_lens)]
+            max_seq = max(new_kv_lens)
+
+            # seq_lens for SWA = aligned window length (same as decode path)
+            seq_lens_list = []
+            for kv_len, qo in zip(kv_lengths, qo_lens):
+                nkv = kv_len + qo
+                ws = max(0, nkv - window)
+                aligned_start = (ws // bs) * bs
+                seq_lens_list.append(nkv - aligned_start)
+            seq_lens = torch.tensor(seq_lens_list, dtype=torch.int32, device=self.device)
+
+            max_blocks = ring_blocks_per_slot
+            block_table = torch.zeros(num_reqs, max_blocks, dtype=torch.int32, device=self.device)
+            for i, (slot, kv_len, qo) in enumerate(zip(slot_ids, kv_lengths, qo_lens)):
+                phys = _physical_slot(slot)
+                ring_base = phys * ring_blocks_per_slot
+                nkv = kv_len + qo
+                ws = max(0, nkv - window)
+                aligned_start = (ws // bs) * bs
+                aligned_len = nkv - aligned_start
+                n_ring = min((aligned_len + bs - 1) // bs, ring_blocks_per_slot)
+                for j in range(n_ring):
+                    actual_pos = aligned_start + j * bs
+                    ring_block = (actual_pos % ring_slots) // bs
+                    block_table[i, j] = ring_base + ring_block
+
+            # Ring slot_mapping for new tokens
+            mappings = []
+            for slot, kv_len, qo in zip(slot_ids, kv_lengths, qo_lens):
+                phys = _physical_slot(slot)
+                ring_base = phys * ring_blocks_per_slot
+                for j in range(qo):
+                    pos = kv_len + j
+                    ring_block = (pos % ring_slots) // bs
+                    ring_off = pos % bs
+                    mappings.append((ring_base + ring_block) * bs + ring_off)
+            slot_mapping = torch.tensor(mappings, dtype=torch.long, device=self.device)
 
         return CommonAttentionMetadata(
             query_start_loc=query_start_loc,

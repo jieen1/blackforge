@@ -29,7 +29,7 @@ class TestDFlashConstants:
 
     def test_aux_layer_ids(self):
         # 0-indexed, matches dflash_config.target_layer_ids
-        assert AUX_LAYER_IDS == (1, 10, 19, 29, 38, 47)
+        assert AUX_LAYER_IDS == (2, 11, 20, 30, 39, 48)
         assert len(AUX_LAYER_IDS) == 6
 
     def test_mask_token_id(self):

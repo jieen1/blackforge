@@ -6,7 +6,7 @@ Integrates the DFlash draft model with the main Laguna backend to achieve
 Architecture:
 - Main model: 48 layers (12 full + 36 SWA), NVFP4 quantized
 - Draft model: 6 layers (all SWA window=512), bf16, shares embed+lm_head
-- Aux hidden states extracted at layers [1, 10, 19, 29, 38, 47] (0-indexed)
+- Aux hidden states extracted at layers [2, 11, 20, 30, 39, 48] (vLLM post-layer indexing)
 - combine_hidden_states: concat 6×[N,3072] → fc → hidden_norm → [N,3072]
 - precompute_and_store_context_kv: project combined → draft KV cache
 - Draft forward: 16 tokens (1 bonus + 15 mask) → sample 15 draft tokens
@@ -318,8 +318,10 @@ class DFlashEngine:
 
         swa_meta = None
         if backend._ring_blocks_per_slot > 0 and backend._swa_layer_names:
+            # Explicit routing: qo>1 with ring active = verify, not prefill
+            mode = "verify_ring" if qo_len > 1 else "decode_ring"
             swa_meta = backend._build_swa_attn_metadata(
-                slot_ids, kv_lengths, qo_lens, is_decode
+                slot_ids, kv_lengths, qo_lens, is_decode, swa_mode=mode
             )
 
         for group_key, builder in backend._metadata_builders.items():
