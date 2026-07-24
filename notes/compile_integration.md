@@ -63,3 +63,42 @@ Investigation deferred to prefill optimization lane.
 2. MoE kernel: MARLIN optimization / B12x microbench (post-compile)
 3. Prefill: metadata reuse, chunk size tuning
 4. Full-step CG: beyond vLLM (超越 move, fixed slots enable it)
+
+---
+
+# B12x MoE Kernel Microbench (2026-07-24)
+
+## Setup
+- Model loaded WITHOUT `moe_backend="marlin"` (original NVFP4 weights)
+- B12x kernel: `LagunaMoEB12x` from `runtime/backends/laguna_moe_kernel.py`
+- Fixed `intermediate_size` bug: was `w13.shape[1]*2=4096`, correct is `w13.shape[1]//2=1024`
+- Weight loading succeeded with original NVFP4 format
+
+## Results (single MoE layer, eager, no CG)
+
+| M | B12x per layer | B12x ×47 layers | MARLIN ×47 (eager ledger) | Speedup |
+|---|---|---|---|---|
+| 1 | 0.057ms | 2.7ms | 8.73ms + 1.2ms routing | 3.7× |
+| 16 | 0.381ms | 17.9ms | ~25ms (est. from verify CG) | ~1.4× |
+
+## Key Findings
+1. B12x fuses routing+FC1+SiLU+FC2+scatter into ONE kernel (vs MARLIN's 8-9 launches)
+2. At M=1: 3.7× faster (2.7ms vs 9.9ms) — massive launch overhead elimination
+3. At M=16: ~1.4× faster (17.9ms vs ~25ms) — fusion benefit persists but compute grows
+4. Weight format: B12x needs original NVFP4, NOT MARLIN-repacked weights
+
+## Integration Blocker
+MARLIN repacks weights during `process_weights_after_loading`. B12x needs original
+NVFP4 format. Options:
+1. Load without MARLIN → B12x for MoE, default backend for linears (~0.3ms penalty)
+2. Keep original weight copies alongside MARLIN (~5GB extra memory)
+3. Convert MARLIN→NVFP4 at runtime (complex, potentially lossy)
+
+**Recommended**: Option 1. Non-MoE linears are ~1ms total; MARLIN→CUTLASS penalty
+is ~0.3ms. MoE savings from B12x are 7+ms at M=1, 7+ms at M=16. Net win: 6+ms.
+
+## Projected Impact
+- Verify CG (M=16): 28.8ms → ~21ms (MoE 25→17.9ms)
+- Step time: 36ms → ~29ms
+- 64K tok/s: 253 → ~310 (at same acceptance)
+- Combined with compile: ~28ms step → ~330 tok/s
