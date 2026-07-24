@@ -6,10 +6,12 @@ prepares them for sparkinfer, and provides a clean forward() API.
 Dependency: sparkinfer (editable install from jieen1/sparkinfer fork,
 branch blackforge-main, or BF_SPARKINFER_PATH env fallback).
 
-Scale convention (verified cosine=0.954 vs fp32 reference):
-  - Fold weight_global_scale into block scales: bs_new = bs / wgs
-  - Use unit w1_global_scale and unit a1_gscale
-  - Kernel handles dynamic activation quantization internally
+Scale convention (verified cosine≥0.993 vs reference, all M=1..128):
+  - w13 data order: [up, gate] with w13_layout="w13"
+  - Block scales: swizzle checkpoint originals (no folding)
+  - w1_global_scale = 1/checkpoint_gs (fp32 runtime alpha)
+  - a1_gscale = 1/input_scale (reciprocal activation scale, ~2016)
+  - SPARKINFER_ENABLE_DYNAMIC_DOWN_SCALE=1 (prevents FC2 fp8 underflow)
 
 Performance (SM120, E=256, K=3072, I=1024, top_k=10):
   - CUDA graph: ~38μs/layer → 1.8ms for 47 layers
@@ -33,6 +35,11 @@ logger = logging.getLogger("qwen_sm120_runtime.sparkinfer_moe")
 # ---------------------------------------------------------------------------
 # sparkinfer import: editable install preferred, env fallback
 # ---------------------------------------------------------------------------
+# FC2 intermediate quantization scale underflows fp8-e4m3 when w1_alpha is
+# small (~1e-4 for Laguna).  dynamic_down_scale computes a tile-level adaptive
+# scale that prevents the underflow.  Must be set before sparkinfer import.
+os.environ.setdefault("SPARKINFER_ENABLE_DYNAMIC_DOWN_SCALE", "1")
+
 _BF_SPARKINFER_PATH = os.environ.get("BF_SPARKINFER_PATH", "")
 if _BF_SPARKINFER_PATH and _BF_SPARKINFER_PATH not in sys.path:
     sys.path.insert(0, _BF_SPARKINFER_PATH)
