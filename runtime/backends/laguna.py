@@ -182,6 +182,7 @@ class LagunaBackend:
                     vllm_config=vllm_config,
                     device=self.device,
                 )
+                builder.disable_split_kv = True
                 self._metadata_builders[group_key] = builder
 
         # ── Classify layers: full attention vs SWA ──

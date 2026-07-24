@@ -220,6 +220,7 @@ class DFlashVerifyCudaGraph:
                 q_data_type=torch.bfloat16,
                 kv_data_type=kv_dtype,
                 sm_scale=builder_sm_scale,
+                disable_split_kv=True,
             )
 
     def _build_metadata_and_forward(self) -> torch.Tensor:
@@ -439,6 +440,7 @@ class DFlashDraftCudaGraph:
             q_data_type=torch.bfloat16,
             kv_data_type=self._kv_dtype,
             sm_scale=self._sm_scale,
+            disable_split_kv=True,
         )
 
     def _build_metadata_and_forward(self) -> torch.Tensor:

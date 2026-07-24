@@ -286,6 +286,7 @@ class DFlashEngine:
                 vllm_config=self.vllm_config,
                 device=self.device,
             )
+        self._draft_metadata_builder.disable_split_kv = True
         logger.info("DFlash: FlashInfer metadata builder initialized for draft")
 
     def _init_buffers(self) -> None:
@@ -973,7 +974,7 @@ class DFlashEngine:
         backend.reset_slot(slot)
         for kv_tensor in self._draft_kv_caches.values():
             kv_tensor.zero_()
-        torch.cuda.empty_cache()
+        # torch.cuda.empty_cache()
 
         t0 = time.perf_counter()
 
@@ -988,7 +989,7 @@ class DFlashEngine:
             self._bulk_precompute_context_kv(slot, aux_hidden_states, aux_len, aux_offset)
 
         del aux_hidden_states
-        torch.cuda.empty_cache()
+        # torch.cuda.empty_cache()
         t_prefill = time.perf_counter()
 
         # Bootstrap: initial bonus = first_token, run draft to get initial 15 tokens
