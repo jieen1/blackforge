@@ -238,7 +238,7 @@ class LagunaBackend:
         # Chunked prefill copies the last `window` tokens from ring into
         # scratch before each chunk, then processes chunk_tokens new tokens.
         # Total scratch capacity = window + chunk_tokens.
-        self._prefill_chunk_tokens = int(os.environ.get("QSR_PREFILL_CHUNK", "4096"))
+        self._prefill_chunk_tokens = int(os.environ.get("QSR_PREFILL_CHUNK", "8192"))
         _scratch_tokens = (self._swa_window if self._swa_window > 0 else 0) + self._prefill_chunk_tokens
         self._swa_scratch_blocks = min(
             blocks_per_slot,
@@ -548,17 +548,18 @@ class LagunaBackend:
             ):
                 phys = _physical_slot(slot)
                 base = phys * self.blocks_per_slot
-                for j in range(n_blocks):
-                    block_table[i, j] = base + j
+                block_table[i, :n_blocks] = torch.arange(
+                    base, base + n_blocks, dtype=torch.int32, device=self.device
+                )
+            # Vectorized slot_mapping
             mappings = []
             for slot, kv_len, qo in zip(slot_ids, kv_lengths, qo_lens):
                 phys = _physical_slot(slot)
-                for j in range(qo):
-                    pos = kv_len + j
-                    bid = phys * self.blocks_per_slot + pos // self.block_size
-                    off = pos % self.block_size
-                    mappings.append(bid * self.block_size + off)
-            slot_mapping = torch.tensor(mappings, dtype=torch.long, device=self.device)
+                base = phys * self.blocks_per_slot
+                pos = torch.arange(kv_len, kv_len + qo, device=self.device)
+                sm = (base + pos // self.block_size) * self.block_size + pos % self.block_size
+                mappings.append(sm)
+            slot_mapping = torch.cat(mappings) if len(mappings) > 1 else mappings[0]
 
         return CommonAttentionMetadata(
             query_start_loc=query_start_loc,
@@ -627,16 +628,14 @@ class LagunaBackend:
             for i, (slot, n_blocks) in enumerate(
                 zip(slot_ids, [(kvl + bs - 1) // bs for kvl in new_kv_lens])
             ):
-                # Prefill scratch uses contiguous blocks [0, blocks_per_slot)
-                for j in range(n_blocks):
-                    block_table[i, j] = j
+                block_table[i, :n_blocks] = torch.arange(
+                    n_blocks, dtype=torch.int32, device=self.device
+                )
             mappings = []
             for slot, kv_len, qo in zip(slot_ids, kv_lengths, qo_lens):
-                for j in range(qo):
-                    pos = kv_len + j
-                    bid = pos // bs
-                    off = pos % bs
-                    mappings.append(bid * bs + off)
+                pos = torch.arange(kv_len, kv_len + qo, device=self.device)
+                sm = (pos // bs) * bs + pos % bs
+                mappings.append(sm)
             slot_mapping = torch.tensor(mappings, dtype=torch.long, device=self.device)
             max_seq = max(new_kv_lens)
         elif swa_mode == "verify_ring":
@@ -708,7 +707,8 @@ class LagunaBackend:
         qo_len: int = 1,
         is_decode: bool = True,
         swa_kv_lengths: list[int] | None = None,
-    ) -> torch.Tensor:
+        skip_logits: bool = False,
+    ) -> torch.Tensor | None:
         """Run one forward pass for a batch of slots.
 
         swa_kv_lengths: override kv_lengths for SWA layers (used by chunked
@@ -779,6 +779,8 @@ class LagunaBackend:
         else:
             hidden_states = result
 
+        if skip_logits:
+            return None
         logits = self.model.compute_logits(hidden_states)
         return logits
 
@@ -943,12 +945,15 @@ class LagunaBackend:
             try:
                 # Forward: full-attn uses absolute kv_length=chunk_start,
                 # SWA uses relative kv_length=overlap (positions in scratch)
+                is_last_chunk = chunk_end >= prompt_len
                 logits = self._forward(
                     [slot], chunk, [chunk_start],
                     qo_len=chunk_len, is_decode=False,
                     swa_kv_lengths=[overlap],
+                    skip_logits=not is_last_chunk,
                 )
-                all_logits = logits
+                if logits is not None:
+                    all_logits = logits
 
                 # Copy the last `window` tokens from scratch to ring
                 total_in_scratch = overlap + chunk_len
@@ -1101,9 +1106,10 @@ class LagunaBackend:
                             is_decode=False, swa_kv_lengths=swa_kv,
                         )
                     else:
-                        logits = self._forward(
+                        self._forward(
                             [slot], chunk, [chunk_start], qo_len=chunk_len,
                             is_decode=False, swa_kv_lengths=swa_kv,
+                            skip_logits=True,
                         )
 
                     # Copy the last `window` tokens from scratch to ring

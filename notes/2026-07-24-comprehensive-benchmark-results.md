@@ -98,3 +98,48 @@
 - Memory comparison: benchmarks/mem_backend_compare.py
 - Results JSON: benchmarks/fixtures/comprehensive_bench.json
 - Memory JSON: benchmarks/fixtures/mem_backend_compare.json
+
+## P0-A Fix: SWA Verify Metadata Routing (commit edde389)
+
+### Root Cause
+`_build_swa_attn_metadata` had only two branches:
+1. `is_decode and qo==1` → ring buffer (correct for decode)
+2. `else` → scratch blocks `[0, N)` (correct for prefill, WRONG for verify)
+
+Verify (qo=16) fell into the scratch branch, pointing 36/48 SWA layers at
+empty scratch blocks instead of the populated ring buffer.
+
+### Fix
+- Explicit three-state routing: `swa_mode ∈ {decode_ring, verify_ring, prefill_scratch}`
+- DFlash caller passes `swa_mode="verify_ring"` explicitly for qo>1
+- Also fixed AUX_LAYER_IDS off-by-one: (1,10,19,29,38,47) → (2,11,20,30,39,48)
+
+### Verification Results
+- Sequential-parallel equivalence: **15/15 = 100% match**
+- CG vs eager verify: **15/15 argmax match, cosine > 0.995**
+- Eager acceptance (4K context): **6.7% → 44%**, tok/step 2.0 → 7.6
+- CG path confirmed correct (not broken, just architecturally limited at long context)
+
+### E2E Performance After Fix (CG path, MARLIN backend)
+
+| Context | DFlash tok/s | Accept% | Tok/Step | ITL (ms) | Speedup |
+|---------|-------------|---------|----------|----------|---------|
+| 64K     | 38.9        | 11.1%   | 2.63     | 25.71    | 2.63×   |
+| 128K    | 39.8        | 18.8%   | 3.81     | 25.15    | 2.88×   |
+
+### Why CG acceptance is lower than eager at long context
+- Draft model: pure SWA window=512, cannot see beyond 512 tokens
+- Main model: 12 full-attention layers see entire 64K/128K context
+- At 4K context: draft can track the pattern → 44% acceptance
+- At 64K context: main model's full-attn layers diverge from draft's windowed view → 11%
+- This is an architectural limitation, NOT a bug
+- Real agent prompts (code, structured text) should have higher acceptance than synthetic repetitive text
+
+### Prefill Chunk Sweep (chunk=8192 vs 4096)
+
+| Chunk | 64K Prefill | 128K Prefill | Mem (MB) |
+|-------|------------|-------------|----------|
+| 4096  | 15,426 ms  | 47,184 ms   | 82,076   |
+| 8192  | 15,319 ms  | 40,080 ms   | 83,421   |
+
+chunk=8192 saves ~7s on 128K prefill (-15%), costs +1.3 GB peak memory.
