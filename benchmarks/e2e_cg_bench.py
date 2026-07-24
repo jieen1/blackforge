@@ -15,7 +15,7 @@ sys.path.insert(0, "/home/bot/project/qwen-sm120-runtime")
 
 import torch
 
-def build_vllm_config():
+def build_vllm_config(moe_backend="marlin"):
     from runtime.compat_vllm import EngineArgs
     model_path = os.path.expanduser(
         "~/.cache/huggingface/hub/models--poolside--Laguna-S-2.1-NVFP4/"
@@ -24,6 +24,7 @@ def build_vllm_config():
     engine_args = EngineArgs(
         model=model_path, dtype="bfloat16", max_model_len=131072,
         gpu_memory_utilization=0.88, enforce_eager=True, trust_remote_code=True,
+        moe_backend=moe_backend,
     )
     return engine_args.create_engine_config()
 
@@ -47,6 +48,7 @@ def make_prompt(tokenizer, target_len):
     return tokens[:target_len]
 
 def main():
+    moe_backend = os.environ.get("QSR_MOE_BACKEND", "marlin")
     ctx_arg = sys.argv[1] if len(sys.argv) > 1 else "64"
     if ctx_arg == "both":
         ctx_list = [64, 128]
@@ -54,7 +56,7 @@ def main():
         ctx_list = [int(ctx_arg)]
 
     print("=" * 70)
-    print(f"E2E DFlash + CUDA Graph Benchmark ({', '.join(f'{c}K' for c in ctx_list)})")
+    print(f"E2E DFlash + CUDA Graph Benchmark ({', '.join(f'{c}K' for c in ctx_list)}, MoE={moe_backend})")
     print("=" * 70)
 
     # Determine blocks_per_slot based on max context
@@ -64,7 +66,7 @@ def main():
 
     print("\n[1/4] Loading model...")
     t0 = time.perf_counter()
-    vllm_config = build_vllm_config()
+    vllm_config = build_vllm_config(moe_backend)
     from runtime.backends.laguna import LagunaBackend
     backend = LagunaBackend(vllm_config, num_slots=1, blocks_per_slot=blocks_per_slot)
     print(f"  Model loaded in {time.perf_counter()-t0:.1f}s")
