@@ -102,3 +102,22 @@ is ~0.3ms. MoE savings from B12x are 7+ms at M=1, 7+ms at M=16. Net win: 6+ms.
 - Step time: 36ms → ~29ms
 - 64K tok/s: 253 → ~310 (at same acceptance)
 - Combined with compile: ~28ms step → ~330 tok/s
+
+## B12x Kernel: Upstream Bug Confirmed (2026-07-24 15:20)
+
+Direct `B12xMoEWrapper.run()` call (bypassing our LagunaMoEB12x wrapper)
+also produces ALL ZEROS on SM120. Tested with:
+- top_k=8 and top_k=10
+- float32 and bfloat16 topk_weights
+- Correct intermediate_size=1024
+
+Default backend (CUTLASS/FlashInfer) produces correct output (norm=40.08).
+B12x produces norm=0.0000 in every configuration.
+
+Root cause: FlashInfer's `launch_sm120_moe` kernel silently fails on SM120.
+This is why vLLM intentionally excludes B12x from auto-selection:
+"FLASHINFER_B12X is intentionally excluded from auto-selection until
+the upstream CUTLASS SM121 MMA op guard is resolved" (oracle/nvfp4.py:176-178).
+
+**B12x is NOT viable on SM120 until FlashInfer fixes the upstream kernel.**
+MARLIN remains the production MoE backend.
