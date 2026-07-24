@@ -1,28 +1,54 @@
 {
-  "128K": {
+  "64K": {
     "warmup": {
-      "prefill_ms": 68094.9544200048,
-      "decode_ms": 10406.56975699676,
-      "total_ms": 78501.52417700156,
+      "prefill_ms": 11885.611991994665,
+      "decode_ms": 12688.221072006854,
+      "total_ms": 24573.83306400152,
       "num_tokens": 256,
-      "num_steps": 69,
-      "acceptance_rate": 0.17971014492753623,
-      "tokens_per_step": 3.6956521739130435,
-      "tok_per_s": 24.50375156795092
+      "num_steps": 90,
+      "acceptance_rate": 0.18888888888888888,
+      "tokens_per_step": 2.8333333333333335,
+      "tok_per_s": 20.097379967834016
     },
     "measured": {
-      "prefill_ms": 66906.65629099385,
-      "decode_ms": 6370.224760001292,
-      "total_ms": 73276.88105099514,
+      "prefill_ms": 11063.212307009962,
+      "decode_ms": 1883.6087669915287,
+      "total_ms": 12946.821074001491,
       "num_tokens": 256,
-      "num_steps": 69,
-      "acceptance_rate": 0.18067632850241547,
-      "tokens_per_step": 3.6956521739130435,
-      "tok_per_s": 40.029984750482846
+      "num_steps": 51,
+      "acceptance_rate": 0.3333333333333333,
+      "tokens_per_step": 5.0,
+      "tok_per_s": 135.37843126908044
     },
-    "baseline_tps": 13.845445521684093,
-    "baseline_itl_ms": 72.22591706665173,
-    "speedup": 2.891202358767708,
-    "itl_ms": 24.98127356863252
+    "baseline_tps": 11.302706102267006,
+    "baseline_itl_ms": 88.47438754507012,
+    "speedup": 11.977523793344261,
+    "itl_ms": 7.3867010470256025
+  },
+  "128K": {
+    "warmup": {
+      "prefill_ms": 25996.516911996878,
+      "decode_ms": 1640.213603997836,
+      "total_ms": 27636.730515994714,
+      "num_tokens": 256,
+      "num_steps": 42,
+      "acceptance_rate": 0.40476190476190477,
+      "tokens_per_step": 6.071428571428571,
+      "tok_per_s": 155.467555797895
+    },
+    "measured": {
+      "prefill_ms": 26535.746630004724,
+      "decode_ms": 3187.3569839954143,
+      "total_ms": 29723.103614000138,
+      "num_tokens": 256,
+      "num_steps": 82,
+      "acceptance_rate": 0.2073170731707317,
+      "tokens_per_step": 3.1097560975609757,
+      "tok_per_s": 80.0035895823481
+    },
+    "baseline_tps": 11.926612903932895,
+    "baseline_itl_ms": 83.84610182747208,
+    "speedup": 6.707989118684843,
+    "itl_ms": 12.499439152923193
   }
 }
