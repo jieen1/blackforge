@@ -769,7 +769,8 @@ class LagunaBackend:
             positions = torch.tensor(positions_list, dtype=torch.long, device=self.device)
 
         with set_forward_context(
-            attn_metadata_dict, self.vllm_config, slot_mapping=slot_mapping_dict
+            attn_metadata_dict, self.vllm_config, slot_mapping=slot_mapping_dict,
+            skip_compiled=not is_decode,
         ):
             result = self.model.forward(input_ids, positions)
 
@@ -1192,7 +1193,8 @@ class LagunaBackend:
             positions = torch.tensor(positions_list, dtype=torch.long, device=self.device)
 
         with set_forward_context(
-            attn_metadata_dict, self.vllm_config, slot_mapping=slot_mapping_dict
+            attn_metadata_dict, self.vllm_config, slot_mapping=slot_mapping_dict,
+            skip_compiled=True,
         ):
             result = self.model.forward(input_ids, positions)
 

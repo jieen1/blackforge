@@ -20,8 +20,14 @@ must preserve bit-level parity on the greedy fixed-prompt suite.
 
 from __future__ import annotations
 
+import os
 import socket
 from typing import TYPE_CHECKING
+
+# AOT compile bakes fixed input shapes from the first call (M=1 warmup),
+# breaking CUDA Graph capture at M=16 (verify).  JIT torch.compile with
+# dropped guards handles dynamic shapes correctly.
+os.environ.setdefault("VLLM_USE_AOT_COMPILE", "0")
 
 if TYPE_CHECKING:
     import torch
@@ -240,6 +246,7 @@ def set_forward_context(
     vllm_config: VllmConfig,
     *,
     slot_mapping=None,
+    skip_compiled: bool = False,
     **_ignored_kwargs,
 ):
     """Simplified forward context manager for single-GPU BlackForge.
@@ -262,7 +269,7 @@ def set_forward_context(
         cudagraph_runtime_mode=CUDAGraphMode.NONE,
         batch_descriptor=None,
         ubatch_slices=None,
-        skip_compiled=False,
+        skip_compiled=skip_compiled,
         additional_kwargs={},
         is_padding=None,
     )
