@@ -147,34 +147,56 @@ def load_moe_layer_weights(
 def prepare_sparkinfer_layer(
     raw: dict[str, torch.Tensor],
     device: str | torch.device = "cuda",
+    a1_gscale: float | None = None,
+    a2_gscale: float | None = None,
 ):
     """Prepare sparkinfer expert weights from raw checkpoint tensors.
 
-    Scale convention: fold weight_global_scale into block scales,
-    use unit w1_global_scale and unit a1_gscale.
+    Scale convention (sparkinfer benchmark pipeline):
+      - w13 data order: [up, gate] with w13_layout="w13"
+      - Block scales: swizzle checkpoint originals (no folding)
+      - w1_global_scale = 1/checkpoint_gs (fp32 runtime alpha)
+      - a1_gscale = 1/input_scale (reciprocal activation scale, ~2016)
     """
-    gate_sf_f = (raw["gate_sf"].float() / raw["gate_gs"].view(-1, 1, 1)).to(torch.float8_e4m3fn)
-    up_sf_f = (raw["up_sf"].float() / raw["up_gs"].view(-1, 1, 1)).to(torch.float8_e4m3fn)
-    down_sf_f = (raw["down_sf"].float() / raw["down_gs"].view(-1, 1, 1)).to(torch.float8_e4m3fn)
+    num_experts = raw["gate_w"].shape[0]
 
+    gate_sf_sw = swizzle_block_scale(raw["gate_sf"].clone().contiguous())
+    up_sf_sw = swizzle_block_scale(raw["up_sf"].clone().contiguous())
+    down_sf_sw = swizzle_block_scale(raw["down_sf"].clone().contiguous())
+
+    # sparkinfer "w13" layout = [up, gate] data order (alias "up_gate")
     w13_fp4 = torch.cat([raw["up_w"], raw["gate_w"]], dim=1).contiguous()
-    w13_sf = swizzle_block_scale(torch.cat([up_sf_f, gate_sf_f], dim=1).contiguous())
-    w2_sf = swizzle_block_scale(down_sf_f.contiguous())
+    w13_sf = torch.cat([up_sf_sw, gate_sf_sw], dim=1).contiguous()
 
-    ones_E = torch.ones(NUM_EXPERTS, dtype=torch.float32, device=device)
-    ones_0 = torch.ones((), dtype=torch.float32, device=device)
+    w1_alpha = (1.0 / raw["gate_gs"]).float().contiguous()
+    w2_alpha = (1.0 / raw["down_gs"]).float().contiguous()
+
+    if a1_gscale is None:
+        a1_gscale_t = torch.ones((), dtype=torch.float32, device=device)
+    elif isinstance(a1_gscale, (int, float)):
+        a1_gscale_t = torch.tensor(a1_gscale, dtype=torch.float32, device=device)
+    else:
+        a1_gscale_t = a1_gscale
+    if a2_gscale is None:
+        a2_gscale_t = torch.ones((), dtype=torch.float32, device=device)
+    elif isinstance(a2_gscale, (int, float)):
+        a2_gscale_t = torch.tensor(a2_gscale, dtype=torch.float32, device=device)
+    else:
+        a2_gscale_t = a2_gscale
 
     wplan = plan_sparkinfer_fp4_moe_weights(
         quant_modes="nvfp4", source_format="modelopt_nvfp4",
         activation="silu", params_dtype=torch.bfloat16,
-        num_experts=NUM_EXPERTS, hidden_size=HIDDEN_SIZE,
-        intermediate_size=INTERMEDIATE_SIZE, w13_layout="w31",
+        num_experts=num_experts, hidden_size=HIDDEN_SIZE,
+        intermediate_size=INTERMEDIATE_SIZE, w13_layout="w13",
     )
     return prepare_sparkinfer_fp4_moe_weights(
-        plan=wplan, w1_global_scale=ones_E, w2_global_scale=ones_E,
+        plan=wplan,
+        w1_global_scale=w1_alpha, w2_global_scale=w2_alpha,
         w1_fp4=w13_fp4, w1_blockscale=w13_sf,
-        w2_fp4=raw["down_w"].contiguous(), w2_blockscale=w2_sf,
-        a1_gscale=ones_0, a2_gscale=ones_0, params_dtype=torch.bfloat16,
+        w2_fp4=raw["down_w"].clone().contiguous(), w2_blockscale=down_sf_sw,
+        a1_gscale=a1_gscale_t, a2_gscale=a2_gscale_t,
+        params_dtype=torch.bfloat16,
     )
 
 

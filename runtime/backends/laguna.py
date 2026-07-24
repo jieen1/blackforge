@@ -453,9 +453,9 @@ class LagunaBackend:
     def _patch_moe_sparkinfer(self) -> None:
         """Replace vLLM FusedMoE expert kernel with sparkinfer.
 
-        Uses vLLM's already-loaded expert weights (correct scale convention),
-        prepares them for sparkinfer, and patches each MoE layer's forward
-        to: router → sparkinfer kernel → shared expert.
+        Loads weights directly from checkpoint (bypasses vLLM scale reformat),
+        uses runtime-alpha path (Phase 1 validated: cos=0.964 vs bf16 truth).
+        Patches each MoE layer's forward to: router → sparkinfer → shared.
 
         After preparing sparkinfer weights for a layer, frees vLLM's copy of
         that layer's expert weights to avoid double memory usage.
@@ -464,7 +464,9 @@ class LagunaBackend:
         """
         from runtime.backends.laguna_sparkinfer_moe import (
             SparkinferMoELayer,
-            prepare_sparkinfer_layer_from_vllm,
+            _find_checkpoint,
+            load_moe_layer_weights,
+            prepare_sparkinfer_layer,
             sparkinfer_version,
         )
         from sparkinfer.moe.fused_moe._impl import allocate_tp_moe_workspace_pool
@@ -480,8 +482,9 @@ class LagunaBackend:
         apply_on_input = getattr(hf_config, "moe_apply_router_weight_on_input", False)
 
         workspace = allocate_tp_moe_workspace_pool()
+        ckpt = _find_checkpoint()
         logger.info(
-            "sparkinfer MoE patch (vLLM weights): sparkinfer@%s",
+            "sparkinfer MoE patch (checkpoint-direct, alpha path): sparkinfer@%s",
             sparkinfer_version(),
         )
 
@@ -512,25 +515,15 @@ class LagunaBackend:
             routed_scaling = getattr(moe_module, "routed_scaling_factor", 1.0)
             e_bias = getattr(experts_obj, "e_score_correction_bias", None)
 
-            # Prepare sparkinfer weights from vLLM's loaded tensors
-            w13_input = getattr(routed, "w13_input_scale", None)
-            w2_input = getattr(routed, "w2_input_scale", None)
-            if w13_input is None:
-                w13_input = torch.ones(routed.w13_weight_scale_2.shape, dtype=torch.float32, device=self.device)
-            if w2_input is None:
-                w2_input = torch.ones(routed.w2_weight_scale_2.shape, dtype=torch.float32, device=self.device)
-
-            si_experts = prepare_sparkinfer_layer_from_vllm(
-                w13_weight=routed.w13_weight,
-                w13_weight_scale=routed.w13_weight_scale,
-                w13_weight_scale_2=routed.w13_weight_scale_2,
-                w2_weight=routed.w2_weight,
-                w2_weight_scale=routed.w2_weight_scale,
-                w2_weight_scale_2=routed.w2_weight_scale_2,
-                w13_input_scale=w13_input,
-                w2_input_scale=w2_input,
-                device=self.device,
-            )
+            # Load weights directly from checkpoint (alpha path)
+            raw = load_moe_layer_weights(ckpt, layer_idx, self.device)
+            # a1_gscale = 1/input_scale (sparkinfer convention: reciprocal)
+            inp13 = getattr(routed, "w13_input_scale", None)
+            inp2 = getattr(routed, "w2_input_scale", None)
+            a1g = (1.0 / inp13.float().max()).item() if inp13 is not None and inp13.numel() > 0 else None
+            a2g = (1.0 / inp2.float().max()).item() if inp2 is not None and inp2.numel() > 0 else None
+            si_experts = prepare_sparkinfer_layer(raw, self.device, a1_gscale=a1g, a2_gscale=a2g)
+            del raw
             si_layer = SparkinferMoELayer(si_experts, workspace, self.device)
             self._moe_sparkinfer_layers.append(si_layer)
 
@@ -567,7 +560,6 @@ class LagunaBackend:
                         shared_out = _shared(hs)
                         if _scaling != 1.0:
                             routed_out = routed_out * _scaling
-                            shared_out = shared_out / _scaling
                         routed_out = routed_out + shared_out
                     elif _scaling != 1.0:
                         routed_out = routed_out * _scaling
