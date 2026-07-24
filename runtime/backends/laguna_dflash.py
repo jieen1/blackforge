@@ -993,19 +993,22 @@ class DFlashEngine:
                     slot, verify_tokens, kv_len, len(verify_tokens)
                 )
 
-            # Step 2: Accept/reject
-            accepted, num_accepted = self._accept_reject(
-                verify_logits, draft_tokens, bonus_token
-            )
+            # Step 2: Accept/reject (single GPU→CPU sync for all 16 argmax)
+            all_argmax = verify_logits[:NUM_QUERY_PER_REQ].argmax(dim=-1).tolist()
+            accepted = [bonus_token]
+            num_accepted = 0
+            for verify_tok, draft_tok in zip(all_argmax[:NUM_SPECULATIVE_TOKENS], draft_tokens):
+                if verify_tok == draft_tok:
+                    accepted.append(draft_tok)
+                    num_accepted += 1
+                else:
+                    accepted.append(verify_tok)
+                    num_accepted += 1
+                    break
             total_accepted += num_accepted
 
-            # Step 3: Extract new bonus from verify logits
-            # logits[num_accepted] predicts the position after last accepted
-            if num_accepted < len(draft_tokens):
-                new_bonus = int(verify_logits[num_accepted].argmax(dim=-1).item())
-            else:
-                # All 15 accepted: logits[15] predicts next position
-                new_bonus = int(verify_logits[NUM_SPECULATIVE_TOKENS].argmax(dim=-1).item())
+            # Step 3: New bonus from pre-computed argmax (no extra sync)
+            new_bonus = all_argmax[num_accepted]
 
             # Step 4: Precompute draft context KV from verify aux at accepted positions
             if verify_aux is not None and num_accepted > 0:
