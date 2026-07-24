@@ -471,7 +471,13 @@ class DFlashDraftCudaGraph:
                     inputs_embeds=None,
                 )
 
-        return engine.draft_model.compute_logits(draft_hidden)
+        # Position 0's logits are never read (replay() only uses positions
+        # 1..num_tokens-1 -- the 15 draft-token predictions; position 0's
+        # hidden state is a required byproduct of causal attention over the
+        # other 15 positions, but its own vocab projection is pure waste).
+        # Slice before compute_logits, not after, so the vocab-size GEMM
+        # only pays for the 15 positions that matter.
+        return engine.draft_model.compute_logits(draft_hidden[1:self.num_tokens])
 
     def capture(self) -> None:
         if self._captured:
@@ -514,5 +520,7 @@ class DFlashDraftCudaGraph:
         self._fill_buffers(slot, kv_len)
         self._run_plan()
         self._graph.replay()
-        draft_tokens = self._logits[1:self.num_tokens].argmax(dim=-1)
+        # self._logits is already positions [1:num_tokens] -- see
+        # _build_metadata_and_forward, which slices before compute_logits.
+        draft_tokens = self._logits.argmax(dim=-1)
         return draft_tokens.tolist()

@@ -532,10 +532,12 @@ class DFlashEngine:
                 inputs_embeds=None,
             )
 
-        # Compute draft logits and sample greedily
-        draft_logits = self.draft_model.compute_logits(draft_hidden)
-        # Positions 1..15 (mask positions) predict the next tokens
-        draft_tokens = draft_logits[1:num_tokens].argmax(dim=-1)
+        # Compute draft logits and sample greedily. Position 0's logits are
+        # never used (only positions 1..15, the mask positions, predict the
+        # next tokens) -- slice before compute_logits so the vocab-size GEMM
+        # only pays for the 15 positions that matter.
+        draft_logits = self.draft_model.compute_logits(draft_hidden[1:num_tokens])
+        draft_tokens = draft_logits.argmax(dim=-1)
         return draft_tokens.tolist()
 
     def _precompute_context_kv(
