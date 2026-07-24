@@ -276,8 +276,8 @@ class DFlashVerifyCudaGraph:
         logger.info("Capturing DFlash verify CUDA Graph (M=%d)...", self.num_tokens)
         self._init_wrappers()
 
-        # Warmup with dummy data (use large kv_len for grid size headroom)
-        capture_kv = 2048
+        # Warmup with dummy data (use max kv_len for grid size headroom)
+        capture_kv = self.blocks_per_slot * self.block_size - self.num_tokens
         self._input_ids[:self.num_tokens] = 1
         self._fill_buffers(0, capture_kv)
 

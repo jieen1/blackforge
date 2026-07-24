@@ -1,0 +1,34 @@
+{
+  "agent": {
+    "prefill_ms": 554.4954819997656,
+    "decode_ms": 9528.987076999329,
+    "total_ms": 10083.482558999094,
+    "num_tokens": 256,
+    "num_steps": 100,
+    "acceptance_rate": 0.17,
+    "tokens_per_step": 2.55,
+    "tok_per_s": 26.76045186539379
+  },
+  "64K": {
+    "prefill_ms": 10361.15358799725,
+    "decode_ms": 1476.8959770008223,
+    "total_ms": 11838.049564998073,
+    "num_tokens": 256,
+    "num_steps": 39,
+    "acceptance_rate": 0.4512820512820513,
+    "tokens_per_step": 6.538461538461538,
+    "tok_per_s": 172.65941811137998
+  },
+  "128K": {
+    "prefill_ms": 26072.9079369994,
+    "decode_ms": 1488.5239909999655,
+    "total_ms": 27561.431927999365,
+    "num_tokens": 256,
+    "num_steps": 36,
+    "acceptance_rate": 0.4722222222222222,
+    "tokens_per_step": 7.083333333333333,
+    "tok_per_s": 171.31064164353526
+  },
+  "date": "2026-07-24T13:08:52",
+  "method": "verify_only_optimized"
+}

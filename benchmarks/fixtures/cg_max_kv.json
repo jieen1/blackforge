@@ -1,0 +1,34 @@
+{
+  "agent": {
+    "prefill_ms": 492.8772610001033,
+    "decode_ms": 5842.397391999839,
+    "total_ms": 6335.274652999942,
+    "num_tokens": 128,
+    "num_steps": 61,
+    "acceptance_rate": 0.1431693989071038,
+    "tokens_per_step": 2.081967213114754,
+    "tok_per_s": 21.73765176841697
+  },
+  "64K": {
+    "prefill_ms": 11161.640407997766,
+    "decode_ms": 660.1714580028784,
+    "total_ms": 11821.811866000644,
+    "num_tokens": 128,
+    "num_steps": 18,
+    "acceptance_rate": 0.4703703703703704,
+    "tokens_per_step": 7.055555555555555,
+    "tok_per_s": 192.3742665037274
+  },
+  "128K": {
+    "prefill_ms": 26312.527711001167,
+    "decode_ms": 666.1000899985083,
+    "total_ms": 26978.627800999675,
+    "num_tokens": 128,
+    "num_steps": 17,
+    "acceptance_rate": 0.5215686274509804,
+    "tokens_per_step": 7.470588235294118,
+    "tok_per_s": 190.66203699249525
+  },
+  "date": "2026-07-24T13:20:12",
+  "method": "cg_max_kv_capture"
+}
