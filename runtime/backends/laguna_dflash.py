@@ -51,6 +51,34 @@ from runtime.compat_vllm import (
 logger = logging.getLogger("qwen_sm120_runtime.dflash")
 
 
+def _greedy_accept_reject(
+    verify_argmax: list[int],
+    draft_tokens: list[int],
+    bonus_token: int,
+) -> tuple[list[int], int]:
+    """Greedy speculative-decode accept/reject: walk draft_tokens in order,
+    accepting each one that matches the target model's own argmax at that
+    position; on the first mismatch, accept the target's correction instead
+    and stop (everything after a rejection is discarded and redrafted next
+    round). Returns (accepted_tokens including bonus_token, num_accepted).
+
+    Pure function (no GPU/model access) so both the eager (_verify) and
+    CUDA-Graph (_accept_reject) verify paths can share one implementation
+    instead of keeping two copies of this loop in sync by hand.
+    """
+    accepted = [bonus_token]
+    num_accepted = 0
+    for verify_tok, draft_tok in zip(verify_argmax, draft_tokens):
+        if verify_tok == draft_tok:
+            accepted.append(draft_tok)
+            num_accepted += 1
+        else:
+            accepted.append(verify_tok)
+            num_accepted += 1
+            break
+    return accepted, num_accepted
+
+
 class DFlashEngine:
     """DFlash speculative decoding engine wrapping LagunaBackend.
 
@@ -86,8 +114,10 @@ class DFlashEngine:
         # Pre-allocated buffers
         self._init_buffers()
 
-        # CUDA Graph for main model decode (M=1)
+        # CUDA Graph for main model decode (M=1) -- captured lazily on first
+        # use by _ensure_decode_cg(), see there for why.
         self._cuda_graph = None
+        self._decode_cg_attempted = False
         self._verify_cg = None
         self._draft_cg = None
         self._cg_captured = False
@@ -97,7 +127,7 @@ class DFlashEngine:
 
         logger.info(
             "DFlashEngine initialized: K=%d speculative tokens, draft %d layers, cuda_graph=%s",
-            NUM_SPECULATIVE_TOKENS, DRAFT_NUM_LAYERS, self._cuda_graph is not None,
+            NUM_SPECULATIVE_TOKENS, DRAFT_NUM_LAYERS, self._use_cuda_graph,
         )
 
     def _load_draft_model(self, model_path: str | None) -> Any:
@@ -277,23 +307,43 @@ class DFlashEngine:
         self._draft_qsl_cpu = torch.tensor([0, max_tokens], dtype=torch.int32)
 
     def _init_cuda_graph(self) -> None:
-        """Initialize and capture CUDA Graphs for decode, verify, and draft."""
+        """Set up CUDA Graph state for decode, verify, and draft.
+
+        The M=1 main-decode graph (self._cuda_graph) is captured lazily on
+        first use (see _ensure_decode_cg), not here: it's only consumed by
+        speculative_decode_step()/generate_legacy() -- kept for comparison,
+        not the production path (generate() routes to generate_verify_only(),
+        which never touches it). Capturing it eagerly at every __init__ paid
+        a full warmup+capture cycle and a dedicated LagunaCudaGraphDecode's
+        FlashInfer workspace buffers for callers that never use it.
+        """
+        # Verify/Draft CUDA Graph: lazy capture after first prefill
+        # (capture warmup writes to KV cache, must not corrupt fresh state)
+        self._verify_cg = None
+        self._draft_cg = None
+        self._cg_captured = False
+
+    def _ensure_decode_cg(self) -> None:
+        """Lazily capture the M=1 main-decode CUDA Graph on first use.
+
+        Unlike verify/draft's lazy capture, this isn't gated on KV cache
+        state: LagunaCudaGraphDecode.capture() warms up on backend's own
+        reserved slots (never slot 0), so it's safe to capture at any point,
+        including before the first prefill -- lazy here purely to skip the
+        cost entirely for callers (generate_verify_only) that never need it.
+        """
+        if not self._use_cuda_graph or self._cuda_graph is not None:
+            return
         from runtime.backends.laguna_cuda_graph import LagunaCudaGraphDecode
 
         try:
             cg = LagunaCudaGraphDecode(self.backend, batch_size=1)
             cg.capture()
             self._cuda_graph = cg
-            logger.info("DFlash: CUDA Graph captured for main decode (M=1)")
+            logger.info("DFlash: CUDA Graph captured for main decode (M=1, lazy)")
         except Exception as e:
             logger.warning("DFlash: main decode CUDA Graph failed: %s", e)
             self._cuda_graph = None
-
-        # Verify/Draft CUDA Graph: lazy capture after first prefill
-        # (capture warmup writes to KV cache, must not corrupt fresh state)
-        self._verify_cg = None
-        self._draft_cg = None
-        self._cg_captured = False
 
     def _forward_main_with_aux(
         self,
@@ -526,19 +576,7 @@ class DFlashEngine:
         """Greedy accept/reject from verify logits (CUDA Graph path)."""
         num_tokens = 1 + len(draft_tokens)
         verify_argmax = verify_logits[:num_tokens - 1].argmax(dim=-1).tolist()
-
-        accepted = [bonus_token]
-        num_accepted = 0
-        for verify_tok, draft_tok in zip(verify_argmax, draft_tokens):
-            if verify_tok == draft_tok:
-                accepted.append(draft_tok)
-                num_accepted += 1
-            else:
-                accepted.append(verify_tok)
-                num_accepted += 1
-                break
-
-        return accepted, num_accepted
+        return _greedy_accept_reject(verify_argmax, draft_tokens, bonus_token)
 
     def _verify(
         self,
@@ -566,19 +604,7 @@ class DFlashEngine:
         # logits[i] predicts token at position kv_len + i + 1
         # logits[0] → should match draft_tokens[0]
         verify_argmax = logits[:num_tokens - 1].argmax(dim=-1).tolist()
-
-        accepted = [bonus_token]
-        num_accepted = 0
-        for verify_tok, draft_tok in zip(verify_argmax, draft_tokens):
-            if verify_tok == draft_tok:
-                accepted.append(draft_tok)
-                num_accepted += 1
-            else:
-                accepted.append(verify_tok)
-                num_accepted += 1
-                break
-
-        return accepted, num_accepted
+        return _greedy_accept_reject(verify_argmax, draft_tokens, bonus_token)
 
     def _forward_verify(
         self,
@@ -995,16 +1021,9 @@ class DFlashEngine:
 
             # Step 2: Accept/reject (single GPU→CPU sync for all 16 argmax)
             all_argmax = verify_logits[:NUM_QUERY_PER_REQ].argmax(dim=-1).tolist()
-            accepted = [bonus_token]
-            num_accepted = 0
-            for verify_tok, draft_tok in zip(all_argmax[:NUM_SPECULATIVE_TOKENS], draft_tokens):
-                if verify_tok == draft_tok:
-                    accepted.append(draft_tok)
-                    num_accepted += 1
-                else:
-                    accepted.append(verify_tok)
-                    num_accepted += 1
-                    break
+            accepted, num_accepted = _greedy_accept_reject(
+                all_argmax[:NUM_SPECULATIVE_TOKENS], draft_tokens, bonus_token
+            )
             total_accepted += num_accepted
 
             # Step 3: New bonus from pre-computed argmax (no extra sync)
@@ -1025,9 +1044,8 @@ class DFlashEngine:
                     kv_len, kv_len + num_accepted,
                     dtype=torch.long, device=self.device
                 )
-                pos_arange = torch.arange(kv_len, kv_len + num_accepted, dtype=torch.long, device=self.device)
-                ring_blocks = (pos_arange % ring_slots) // bs
-                ring_offs = pos_arange % bs
+                ring_blocks = (context_positions % ring_slots) // bs
+                ring_offs = context_positions % bs
                 slot_mappings = (draft_base + ring_blocks) * bs + ring_offs
                 self.draft_model.precompute_and_store_context_kv(
                     combined, context_positions, slot_mappings

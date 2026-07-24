@@ -143,8 +143,9 @@ class DFlashVerifyCudaGraph:
         self._full_kv_indptr_gpu[:2].copy_(self._full_kv_indptr_cpu[:2], non_blocking=True)
         self._full_last_page_len_gpu[:1].copy_(self._full_last_page_len_cpu[:1], non_blocking=True)
 
-        # Full slot mapping (vectorized)
-        _pos = torch.arange(kv_len, kv_len + self.num_tokens, device=self.device)
+        # Full slot mapping (vectorized) -- reuse self._positions, already
+        # holds this exact arange(kv_len, kv_len+num_tokens) from above.
+        _pos = self._positions[:self.num_tokens]
         self._full_slot_mapping[:self.num_tokens] = (full_base + _pos // bs) * bs + _pos % bs
 
         # SWA ring buffers
@@ -169,8 +170,9 @@ class DFlashVerifyCudaGraph:
             self._swa_kv_indptr_gpu[:2].copy_(self._swa_kv_indptr_cpu[:2], non_blocking=True)
             self._swa_last_page_len_gpu[:1].copy_(self._swa_last_page_len_cpu[:1], non_blocking=True)
 
-            # Vectorized SWA slot mapping
-            _sp = torch.arange(kv_len, kv_len + self.num_tokens, device=self.device)
+            # Vectorized SWA slot mapping -- reuse self._positions (same
+            # arange as above, no need to recompute a third time).
+            _sp = self._positions[:self.num_tokens]
             _rb = (_sp % ring_slots) // bs
             _ro = _sp % bs
             self._swa_slot_mapping[:self.num_tokens] = (ring_base + _rb) * bs + _ro
@@ -307,8 +309,9 @@ class DFlashVerifyCudaGraph:
             return None
 
         num_tokens = len(tokens)
-        for i, t in enumerate(tokens):
-            self._input_ids[i] = t
+        self._input_ids[:num_tokens] = torch.tensor(
+            tokens, dtype=torch.long, device=self.device
+        )
         self._fill_buffers(slot, kv_len)
         self._run_plan()
         self._graph.replay()
@@ -359,9 +362,13 @@ class DFlashDraftCudaGraph:
         from flashinfer.prefill import BatchPrefillWithPagedKVCacheWrapper
         from runtime.backends.dflash_constants import DRAFT_HEAD_DIM, DRAFT_NUM_KV_HEADS, DRAFT_NUM_QO_HEADS
 
-        # Get sm_scale from the first draft attention layer
+        # Get sm_scale and KV cache dtype from the first draft attention layer
+        # (kv_cache_torch_dtype is what _alloc_draft_kv_cache actually allocated
+        # the draft KV cache tensors with -- deriving from it here, rather than
+        # hardcoding, keeps this in sync if that ever stops being fp8).
         first_attn = self.engine._draft_attn_layers[self.engine._draft_layer_names[0]]
         self._sm_scale = first_attn.impl.scale
+        self._kv_dtype = first_attn.kv_cache_torch_dtype
 
         workspace = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=self.device)
         self._wrapper = BatchPrefillWithPagedKVCacheWrapper(
@@ -402,8 +409,9 @@ class DFlashDraftCudaGraph:
         self._kv_indptr_gpu[:2].copy_(self._kv_indptr_cpu[:2], non_blocking=True)
         self._last_page_len_gpu[:1].copy_(self._last_page_len_cpu[:1], non_blocking=True)
 
-        # Vectorized slot mapping
-        _sp = torch.arange(kv_len, kv_len + self.num_tokens, device=self.device)
+        # Vectorized slot mapping -- reuse self._positions (same arange as
+        # above, no need to recompute).
+        _sp = self._positions[:self.num_tokens]
         _rb = (_sp % ring_slots) // bs
         _ro = _sp % bs
         self._slot_mapping[:self.num_tokens] = (draft_base + _rb) * bs + _ro
@@ -425,7 +433,7 @@ class DFlashDraftCudaGraph:
             window_left=DRAFT_WINDOW - 1,
             logits_soft_cap=None,
             q_data_type=torch.bfloat16,
-            kv_data_type=torch.float8_e4m3fn,
+            kv_data_type=self._kv_dtype,
             sm_scale=self._sm_scale,
         )
 
