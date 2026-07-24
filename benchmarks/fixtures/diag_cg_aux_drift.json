@@ -1,0 +1,62 @@
+{
+  "date": "2026-07-24T11:03:55",
+  "results": [
+    {
+      "kv_len": 4096,
+      "actual_kv_len": 4096,
+      "token_match": true,
+      "cg_token": 911,
+      "eager_token": 911,
+      "cg_ms": 29.8,
+      "eager_ms": 84.1,
+      "aux_cosines": [
+        0.999997,
+        0.998141,
+        0.995324,
+        0.996357,
+        0.999025,
+        0.998457
+      ],
+      "avg_aux_cosine": 0.997883,
+      "min_aux_cosine": 0.995324
+    },
+    {
+      "kv_len": 16384,
+      "actual_kv_len": 16384,
+      "token_match": true,
+      "cg_token": 340,
+      "eager_token": 340,
+      "cg_ms": 16.7,
+      "eager_ms": 78.2,
+      "aux_cosines": [
+        0.999288,
+        0.937866,
+        0.89408,
+        0.63176,
+        0.781142,
+        0.839557
+      ],
+      "avg_aux_cosine": 0.847282,
+      "min_aux_cosine": 0.63176
+    },
+    {
+      "kv_len": 65536,
+      "actual_kv_len": 65536,
+      "token_match": false,
+      "cg_token": 350,
+      "eager_token": 290,
+      "cg_ms": 20.9,
+      "eager_ms": 80.6,
+      "aux_cosines": [
+        0.999181,
+        0.959857,
+        0.867962,
+        0.502838,
+        0.608247,
+        0.772485
+      ],
+      "avg_aux_cosine": 0.785095,
+      "min_aux_cosine": 0.502838
+    }
+  ]
+}
