@@ -368,7 +368,11 @@ class DFlashDraftCudaGraph:
         # hardcoding, keeps this in sync if that ever stops being fp8).
         first_attn = self.engine._draft_attn_layers[self.engine._draft_layer_names[0]]
         self._sm_scale = first_attn.impl.scale
-        self._kv_dtype = first_attn.kv_cache_torch_dtype
+        # kv_cache_torch_dtype returns uint8 for FP8 KV (vLLM internal storage),
+        # but FlashInfer plan needs the logical dtype.  Mirror the main-model CG
+        # logic (laguna_cuda_graph.py:241) which reads _cache_dtype_str.
+        _cache_str = getattr(self.engine.backend, "_cache_dtype_str", "")
+        self._kv_dtype = torch.float8_e4m3fn if "fp8" in _cache_str else torch.bfloat16
 
         workspace = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=self.device)
         self._wrapper = BatchPrefillWithPagedKVCacheWrapper(
