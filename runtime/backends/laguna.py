@@ -1504,3 +1504,139 @@ class LagunaBackend:
                 break
         self.reset_slot(slot)
         return tokens
+
+    # ── Prefix cache support ──────────────────────────────────────────────
+
+    def find_prefix_match(self, slot: int, prompt_ids: list[int]) -> int:
+        """Find the longest prefix of prompt_ids that matches cached tokens.
+
+        Returns the number of matching tokens (block-aligned down).
+        The slot's KV cache must still be valid (not reset).
+        """
+        cached = self.slot_committed_tokens[slot]
+        if not cached or self.slot_kv_len[slot] == 0:
+            return 0
+        n = 0
+        for a, b in zip(cached, prompt_ids):
+            if a != b:
+                break
+            n += 1
+        # Align down to block boundary for full-attention KV correctness
+        bs = self.block_size
+        aligned = (n // bs) * bs
+        # Never exceed the cached KV length
+        return min(aligned, self.slot_kv_len[slot])
+
+    def continue_prefill_with_aux(
+        self, slot: int, prompt_ids: list[int], start_pos: int
+    ) -> tuple[int, list[torch.Tensor] | None]:
+        """Continue prefill from start_pos, reusing cached KV for [0, start_pos).
+
+        The slot's KV cache must contain valid data for positions [0, start_pos).
+        Only processes prompt_ids[start_pos:].
+        Returns (first_token, aux_hidden_states_from_last_chunk).
+        """
+        prompt_len = len(prompt_ids)
+        # Invalidate stale KV beyond start_pos (from previous generation)
+        self.slot_kv_len[slot] = start_pos
+        if start_pos >= prompt_len:
+            # No new tokens — decode the last cached token to get logits
+            last_token = prompt_ids[start_pos - 1]
+            logits = self._forward(
+                [slot], [last_token], [start_pos - 1], qo_len=1, is_decode=True
+            )
+            first_token = int(logits[0].argmax(dim=-1).item())
+            self.slot_kv_len[slot] = start_pos
+            self.slot_committed_tokens[slot] = list(prompt_ids) + [first_token]
+            return first_token, None
+
+        PREFILL_CHUNK = self._prefill_chunk_tokens
+        suffix_len = prompt_len - start_pos
+
+        if suffix_len <= PREFILL_CHUNK and self._swa_scratch:
+            # Short suffix: single chunk with scratch
+            sfc = self.static_forward_context
+            window = self._swa_window
+            bs = self.block_size
+
+            # Copy overlap from ring to scratch
+            overlap = min(window, start_pos)
+            if overlap > 0:
+                self._copy_ring_to_scratch(slot, start_pos - overlap, overlap)
+
+            for name in self._swa_layer_names:
+                sfc[name].kv_cache = self._swa_scratch[name]
+            try:
+                suffix = prompt_ids[start_pos:]
+                logits, aux = self._forward_with_aux(
+                    [slot], suffix, [start_pos], qo_len=suffix_len,
+                    is_decode=False, swa_kv_lengths=[overlap],
+                )
+                # Copy last window from scratch to ring
+                total_in_scratch = overlap + suffix_len
+                copy_count = min(window, total_in_scratch)
+                copy_scratch_start = total_in_scratch - copy_count
+                copy_abs_start = start_pos + suffix_len - copy_count
+                self._copy_scratch_to_ring(
+                    slot, copy_scratch_start, copy_abs_start, copy_count
+                )
+            finally:
+                for name in self._swa_layer_names:
+                    sfc[name].kv_cache = self.kv_caches[name]
+
+        elif suffix_len <= PREFILL_CHUNK:
+            suffix = prompt_ids[start_pos:]
+            logits, aux = self._forward_with_aux(
+                [slot], suffix, [start_pos], qo_len=suffix_len, is_decode=False
+            )
+
+        else:
+            # Long suffix: chunked prefill
+            sfc = self.static_forward_context
+            window = self._swa_window
+            aux = None
+            logits = None
+
+            for chunk_start in range(start_pos, prompt_len, PREFILL_CHUNK):
+                chunk_end = min(chunk_start + PREFILL_CHUNK, prompt_len)
+                chunk = prompt_ids[chunk_start:chunk_end]
+                chunk_len = len(chunk)
+                is_last = (chunk_end == prompt_len)
+
+                overlap = min(window, chunk_start) if self._swa_scratch else 0
+                if overlap > 0:
+                    self._copy_ring_to_scratch(slot, chunk_start - overlap, overlap)
+
+                if self._swa_scratch:
+                    for name in self._swa_layer_names:
+                        sfc[name].kv_cache = self._swa_scratch[name]
+                try:
+                    swa_kv = [overlap] if self._swa_scratch else None
+                    if is_last:
+                        logits, aux = self._forward_with_aux(
+                            [slot], chunk, [chunk_start], qo_len=chunk_len,
+                            is_decode=False, swa_kv_lengths=swa_kv,
+                        )
+                    else:
+                        self._forward(
+                            [slot], chunk, [chunk_start], qo_len=chunk_len,
+                            is_decode=False, swa_kv_lengths=swa_kv,
+                            skip_logits=True,
+                        )
+                    if self._swa_scratch:
+                        total_in_scratch = overlap + chunk_len
+                        copy_count = min(window, total_in_scratch)
+                        copy_scratch_start = total_in_scratch - copy_count
+                        copy_abs_start = chunk_start + chunk_len - copy_count
+                        self._copy_scratch_to_ring(
+                            slot, copy_scratch_start, copy_abs_start, copy_count
+                        )
+                finally:
+                    if self._swa_scratch:
+                        for name in self._swa_layer_names:
+                            sfc[name].kv_cache = self.kv_caches[name]
+
+        first_token = int(logits[-1].argmax(dim=-1).item())
+        self.slot_kv_len[slot] = prompt_len
+        self.slot_committed_tokens[slot] = list(prompt_ids) + [first_token]
+        return first_token, aux

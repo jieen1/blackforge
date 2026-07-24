@@ -865,13 +865,18 @@ class DFlashEngine:
         max_tokens: int = 128,
         temperature: float = 0.0,
         eos_tokens: tuple[int, ...] = (2, 24),
+        slot: int = 0,
+        enable_prefix_cache: bool = True,
     ) -> tuple[list[int], dict[str, float]]:
         """Generate tokens using DFlash speculative decoding (verify-only).
 
         Uses verify-only design: no redundant M=1 decode forward.
         Returns (tokens, stats).
         """
-        return self.generate_verify_only(prompt_ids, max_tokens, temperature, eos_tokens)
+        return self.generate_verify_only(
+            prompt_ids, max_tokens, temperature, eos_tokens,
+            slot=slot, enable_prefix_cache=enable_prefix_cache,
+        )
 
     def generate_legacy(
         self,
@@ -933,7 +938,6 @@ class DFlashEngine:
                 break
 
         t_total = time.perf_counter()
-        backend.reset_slot(slot)
 
         # Lazy-capture verify/draft CGs after first generate completes
         # (capture warmup writes to KV cache; must not corrupt active session)
@@ -961,35 +965,72 @@ class DFlashEngine:
         max_tokens: int = 128,
         temperature: float = 0.0,
         eos_tokens: tuple[int, ...] = (2, 24),
+        slot: int = 0,
+        enable_prefix_cache: bool = True,
     ) -> tuple[list[int], dict[str, float]]:
         """Generate using verify-only speculative decoding (no redundant decode).
 
         Eliminates the M=1 decode forward by extracting bonus_token and aux
         from the verify (M=16) forward. ~50% step latency reduction.
 
+        Prefix cache: if enable_prefix_cache and the slot has a matching
+        cached prefix, skip re-prefilling the prefix and only process the
+        suffix. This is the core optimization for agent workloads where
+        each turn re-sends the full conversation history.
+
         Returns (tokens, stats).
         """
         backend = self.backend
-        slot = 0
-        backend.reset_slot(slot)
-        for kv_tensor in self._draft_kv_caches.values():
-            kv_tensor.zero_()
-        # torch.cuda.empty_cache()
+        prompt_len = len(prompt_ids)
+
+        # Prefix cache: find matching prefix in cached KV
+        prefix_len = 0
+        if enable_prefix_cache:
+            prefix_len = backend.find_prefix_match(slot, prompt_ids)
+
+        if prefix_len > 0 and prefix_len < prompt_len:
+            # Partial match: continue from cached prefix
+            logger.info(
+                "Prefix cache HIT: %d/%d tokens cached, prefilling %d suffix",
+                prefix_len, prompt_len, prompt_len - prefix_len,
+            )
+        elif prefix_len >= prompt_len:
+            # Full match: no prefill needed
+            logger.info(
+                "Prefix cache FULL HIT: %d/%d tokens cached",
+                prefix_len, prompt_len,
+            )
+        else:
+            # No match: full reset and prefill
+            backend.reset_slot(slot)
+            for kv_tensor in self._draft_kv_caches.values():
+                kv_tensor.zero_()
 
         t0 = time.perf_counter()
 
-        # Prefill with aux
-        prompt_len = len(prompt_ids)
-        first_token, aux_hidden_states = backend.prefill_with_aux(slot, prompt_ids)
+        # Always zero draft KV — it will be recomputed from aux hidden states
+        for kv_tensor in self._draft_kv_caches.values():
+            kv_tensor.zero_()
+
+        if prefix_len > 0:
+            # Continue from cached prefix
+            first_token, aux_hidden_states = backend.continue_prefill_with_aux(
+                slot, prompt_ids, prefix_len
+            )
+        else:
+            # Full prefill
+            first_token, aux_hidden_states = backend.prefill_with_aux(slot, prompt_ids)
 
         # Bulk precompute draft context KV from prefill aux
         if aux_hidden_states is not None:
             aux_len = aux_hidden_states[0].shape[0]
-            aux_offset = prompt_len - aux_len
+            if prefix_len > 0:
+                aux_offset = prompt_len - aux_len
+            else:
+                aux_offset = prompt_len - aux_len
             self._bulk_precompute_context_kv(slot, aux_hidden_states, aux_len, aux_offset)
 
         del aux_hidden_states
-        # torch.cuda.empty_cache()
         t_prefill = time.perf_counter()
 
         # Bootstrap: initial bonus = first_token, run draft to get initial 15 tokens
@@ -1081,7 +1122,7 @@ class DFlashEngine:
                 draft_tokens = self._draft_forward(slot, bonus_token, new_kv_len + 1)
 
         t_total = time.perf_counter()
-        backend.reset_slot(slot)
+        # Prefix cache: preserve slot KV for next turn
 
         if self._use_cuda_graph and not self._cg_captured:
             self._lazy_capture_cg()
