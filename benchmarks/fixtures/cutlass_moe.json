@@ -1,0 +1,34 @@
+{
+  "agent": {
+    "prefill_ms": 730.964895003126,
+    "decode_ms": 4009.1958129996783,
+    "total_ms": 4740.160708002804,
+    "num_tokens": 128,
+    "num_steps": 36,
+    "acceptance_rate": 0.25925925925925924,
+    "tokens_per_step": 3.5277777777777777,
+    "tok_per_s": 31.677175654081775
+  },
+  "64K": {
+    "prefill_ms": 10444.518901997071,
+    "decode_ms": 1880.689314006304,
+    "total_ms": 12325.208216003375,
+    "num_tokens": 256,
+    "num_steps": 47,
+    "acceptance_rate": 0.3773049645390071,
+    "tokens_per_step": 5.425531914893617,
+    "tok_per_s": 135.58858345230394
+  },
+  "128K": {
+    "prefill_ms": 24769.64129100088,
+    "decode_ms": 1488.4251679977751,
+    "total_ms": 26258.066458998655,
+    "num_tokens": 256,
+    "num_steps": 35,
+    "acceptance_rate": 0.5009523809523809,
+    "tokens_per_step": 7.285714285714286,
+    "tok_per_s": 171.32201570000674
+  },
+  "date": "2026-07-24T13:38:32",
+  "method": "verify_only_cutlass_moe"
+}
