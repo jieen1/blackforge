@@ -1,0 +1,25 @@
+{
+  "64K": {
+    "prefill_ms": 13325.348779995693,
+    "decode_ms": 1778.7453180062585,
+    "total_ms": 15104.094098001951,
+    "num_tokens": 128,
+    "num_steps": 19,
+    "acceptance_rate": 0.47368421052631576,
+    "tokens_per_step": 6.684210526315789,
+    "tok_per_s": 71.3986419047053
+  },
+  "128K": {
+    "prefill_ms": 29018.276549999428,
+    "decode_ms": 647.2664960019756,
+    "total_ms": 29665.543046001403,
+    "num_tokens": 128,
+    "num_steps": 17,
+    "acceptance_rate": 0.5254901960784314,
+    "tokens_per_step": 7.470588235294118,
+    "tok_per_s": 196.2097540726291
+  },
+  "date": "2026-07-24T13:41:53",
+  "method": "chunk16384_marlin",
+  "chunk_size": 16384
+}

@@ -43,3 +43,36 @@
 2. MoE: optimize MARLIN path (routing, shared expert fusion)
 3. Memory: reduce load residue, optimize KV allocation
 4. Production: multi-slot, streaming, EOS handling
+
+## Update: MoE Backend Comparison (2026-07-24 13:40)
+
+| Backend | 64K tok/s | 64K step | 128K tok/s | 128K step | Memory |
+|---------|-----------|----------|------------|-----------|--------|
+| **MARLIN** | **192** | **36.7ms** | **191** | **39.2ms** | 86.9GB |
+| CUTLASS | 136 | 40.0ms | 171 | 42.5ms | 86.5GB |
+| TRTLLM | ❌ SM100 only | | | | |
+
+- TRTLLM: `is_device_capability_family(100)` — SM120 not supported
+- CUTEDSL: same SM100 restriction
+- vLLM referent (377 tok/s) used CUTLASS (auto), not TRTLLM
+- Referent advantage is from vLLM native compile + CG, not MoE backend
+
+## Update: Prefill Chunk Size (2026-07-24 13:42)
+
+| Chunk | 64K prefill | 128K prefill | Memory |
+|-------|-------------|--------------|--------|
+| 8192 | 11.2s | 26.3s | 86.9GB |
+| 16384 | 13.3s | 29.0s | 88.5GB |
+
+chunk=16384 is SLOWER (+15-20%) and uses +1.6GB. Keeping 8192.
+
+## Update: Memory Audit (2026-07-24 13:44)
+
+No load residue. Backend init = 79.4 GB:
+- Model params (MARLIN): 71.90 GB = 66.96 GiB checkpoint
+- KV cache (48 layers): 6.72 GB
+- SWA scratch: 0.64 GB
+- Buffers: 0.10 GB
+- Unaccounted: 0.04 GB
+
+Generate peak (~87 GB) = backend 79.4 + draft ~2 + CG ~3 + activations ~2.
