@@ -1,89 +1,87 @@
-"""Patch Laguna MoE layers to use LagunaMoEB12x kernel.
+"""B12x MoE kernel monkey-patch: correct runtime alpha computation.
 
-Replaces vLLM's RoutedExperts.forward_modular with our B12x fused kernel
-on every MoE layer.  The model must be loaded WITHOUT moe_backend="marlin"
-so weights stay in original NVFP4 format.
+Root cause (verified against sparkinfer reference):
+  vLLM's FlashInferB12xExperts.process_weights_after_loading passes
+  w1_alpha = g1_alphas = 1/w_gs (~7.4e-05) to the kernel.
+  The kernel expects w1_alpha = w_gs * input_scale = 1/(g1_alphas * a1_gscale)
+  (~1.3-6.7). Off by ~235,000x.
+
+  The old code also baked 1/w_gs into fp8 block scales (causing underflow)
+  and set alpha=1.0, compounding the error.
+
+Fix:
+  1. Keep original fp8 block scales (no bake-in)
+  2. Compute correct runtime alpha: 1/(g1_alphas * a1_gscale)
+  3. Set fc2_input_scale = a2_gscale (sparkinfer convention)
+
+Status: Alpha fix is correct but the FlashInfer B12x wrapper itself produces
+  wrong output on SM120 (6.7% acceptance vs MARLIN's 47%). The wrapper is
+  excluded from vLLM auto-selection ("CUTLASS SM121 MMA op guard").
+  Full fix requires sparkinfer integration — see notes/b12x_investigation.md.
 
 Usage:
-    backend = LagunaBackend(vllm_config, ...)  # no moe_backend="marlin"
-    patch_moe_b12x(backend.model)
+  import runtime.backends.laguna_moe_patch  # auto-patches on import
 """
 from __future__ import annotations
 
-import logging
-from typing import Any
-
 import torch
+from vllm.model_executor.layers.fused_moe.experts.flashinfer_b12x_moe import (
+    FlashInferB12xExperts,
+)
+from flashinfer.cute_dsl.utils import (
+    convert_sf_to_mma_layout as _convert_sf,
+)
 
-logger = logging.getLogger("qwen_sm120_runtime.moe_patch")
+_orig_process = FlashInferB12xExperts.process_weights_after_loading
 
 
-def patch_moe_b12x(model: Any, max_num_tokens: int = 16) -> int:
-    """Replace all MoE routed-expert forwards with B12x kernel.
+def _correct_process_weights(self: FlashInferB12xExperts, layer: torch.nn.Module) -> None:
+    """Fix alpha computation per sparkinfer reference implementation.
 
-    Returns the number of patched layers.
+    sparkinfer: w1_runtime = w1_global_scale / a1_gscale
+    vLLM:       g1_alphas = 1/w1_global_scale, a1_gscale = 1/a1_input_scale
+    Therefore:  w1_runtime = 1 / (g1_alphas * a1_gscale)
     """
-    from runtime.backends.laguna_moe_kernel import LagunaMoEB12x
+    qc = self.quant_config
 
-    patched = 0
-    for name, module in model.named_modules():
-        # Find RoutedExperts modules (have w13_weight + w2_weight + quant_method)
-        if not (hasattr(module, "w13_weight") and hasattr(module, "w2_weight")):
-            continue
-        if not hasattr(module, "forward_modular"):
-            continue
+    # FC1 alpha: w_gs * a1_scale = 1/(g1_alphas * a1_gscale)
+    a1_gscale = qc.a1_gscale
+    if a1_gscale is not None and self.g1_alphas is not None:
+        self.g1_alphas.copy_(1.0 / (self.g1_alphas * a1_gscale))
 
-        w13 = module.w13_weight
-        num_experts = w13.shape[0]
-        intermediate_size = w13.shape[1] // 2  # w13 is fused gate+up
-        hidden_size = w13.shape[2] * 2  # packed uint8 → 2× int4
+    # FC2 alpha: w_gs * a2_scale = 1/(g2_alphas * a2_gscale)
+    a2_gscale = qc.a2_gscale
+    if a2_gscale is not None and self.g2_alphas is not None:
+        self.g2_alphas.copy_(1.0 / (self.g2_alphas * a2_gscale))
 
-        # Detect top_k from RoutedExperts.moe_config or direct attribute
-        top_k = getattr(module, "top_k", None)
-        if top_k is None and hasattr(module, "moe_config"):
-            top_k = getattr(module.moe_config, "experts_per_token", None)
-        if top_k is None:
-            top_k = 10  # Laguna-S-2.1 actual value
-            logger.warning("Could not detect top_k for %s, using default %d", name, top_k)
-
-        b12x = LagunaMoEB12x(
-            num_experts=num_experts,
-            top_k=top_k,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            device=w13.device,
-            use_cuda_graph=False,
-            max_num_tokens=max_num_tokens,
+    # FC2 input scale: use a2_gscale (sparkinfer convention)
+    if a2_gscale is not None:
+        self._fc2_input_scale = a2_gscale.to(torch.float32).contiguous()
+    else:
+        self._fc2_input_scale = torch.ones(
+            self.num_local_experts,
+            device=layer.w13_weight.device,
+            dtype=torch.float32,
         )
 
-        b12x.load_weights(
-            w13_weight=module.w13_weight,
-            w13_weight_scale=module.w13_weight_scale,
-            w13_weight_scale_2=module.w13_weight_scale_2,
-            w2_weight=module.w2_weight,
-            w2_weight_scale=module.w2_weight_scale,
-            w2_weight_scale_2=module.w2_weight_scale_2,
-        )
+    # Block scales: keep ORIGINAL fp8 values (no bake-in), convert to MMA layout
+    assert self.w1_scale is not None
+    num_experts_w1, m1, k1_sf = self.w1_scale.shape
+    self.w1_sf_mma = _convert_sf(
+        self.w1_scale.reshape(num_experts_w1 * m1, k1_sf),
+        m=m1,
+        k=k1_sf * 16,
+        num_groups=num_experts_w1,
+    )
 
-        # Monkey-patch forward_modular
-        original_forward = module.forward_modular
+    assert self.w2_scale is not None
+    num_experts_w2, m2, k2_sf = self.w2_scale.shape
+    self.w2_sf_mma = _convert_sf(
+        self.w2_scale.reshape(num_experts_w2 * m2, k2_sf),
+        m=m2,
+        k=k2_sf * 16,
+        num_groups=num_experts_w2,
+    )
 
-        def make_b12x_forward(b12x_inst: LagunaMoEB12x):
-            def b12x_forward_modular(
-                x: torch.Tensor,
-                topk_weights: torch.Tensor,
-                topk_ids: torch.Tensor,
-                shared_experts: Any = None,
-                shared_experts_input: torch.Tensor | None = None,
-            ) -> torch.Tensor:
-                return b12x_inst.forward(
-                    x, topk_ids.to(torch.int32), topk_weights.to(torch.float32)
-                )
-            return b12x_forward_modular
 
-        module.forward_modular = make_b12x_forward(b12x)
-        module._b12x_kernel = b12x  # prevent GC
-        patched += 1
-
-    logger.info("B12x MoE patch: %d layers patched (max_num_tokens=%d)", patched, max_num_tokens)
-    return patched
+FlashInferB12xExperts.process_weights_after_loading = _correct_process_weights
