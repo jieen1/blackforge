@@ -837,10 +837,21 @@ class DFlashEngine:
         temperature: float = 0.0,
         eos_tokens: tuple[int, ...] = (2, 24),
     ) -> tuple[list[int], dict[str, float]]:
-        """Generate tokens using DFlash speculative decoding.
+        """Generate tokens using DFlash speculative decoding (verify-only).
 
+        Uses verify-only design: no redundant M=1 decode forward.
         Returns (tokens, stats).
         """
+        return self.generate_verify_only(prompt_ids, max_tokens, temperature, eos_tokens)
+
+    def generate_legacy(
+        self,
+        prompt_ids: list[int],
+        max_tokens: int = 128,
+        temperature: float = 0.0,
+        eos_tokens: tuple[int, ...] = (2, 24),
+    ) -> tuple[list[int], dict[str, float]]:
+        """Legacy generate with separate decode+verify (kept for comparison)."""
         backend = self.backend
         slot = 0
         backend.reset_slot(slot)
@@ -1011,12 +1022,10 @@ class DFlashEngine:
                     kv_len, kv_len + num_accepted,
                     dtype=torch.long, device=self.device
                 )
-                slot_mappings = torch.zeros(num_accepted, dtype=torch.long, device=self.device)
-                for i in range(num_accepted):
-                    pos = kv_len + i
-                    ring_block = (pos % ring_slots) // bs
-                    ring_off = pos % bs
-                    slot_mappings[i] = (draft_base + ring_block) * bs + ring_off
+                pos_arange = torch.arange(kv_len, kv_len + num_accepted, dtype=torch.long, device=self.device)
+                ring_blocks = (pos_arange % ring_slots) // bs
+                ring_offs = pos_arange % bs
+                slot_mappings = (draft_base + ring_blocks) * bs + ring_offs
                 self.draft_model.precompute_and_store_context_kv(
                     combined, context_positions, slot_mappings
                 )

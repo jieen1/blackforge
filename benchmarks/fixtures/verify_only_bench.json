@@ -1,0 +1,26 @@
+{
+  "date": "2026-07-24T12:17:07",
+  "method": "verify_only",
+  "results": {
+    "64K": {
+      "prefill_ms": 9849.956976999238,
+      "decode_ms": 861.2998800017522,
+      "total_ms": 10711.25685700099,
+      "num_tokens": 256,
+      "num_steps": 25,
+      "acceptance_rate": 0.6986666666666667,
+      "tokens_per_step": 10.2,
+      "tok_per_s": 296.06413041585614
+    },
+    "128K": {
+      "prefill_ms": 23873.00010099716,
+      "decode_ms": 1153.2230430020718,
+      "total_ms": 25026.223143999232,
+      "num_tokens": 256,
+      "num_steps": 33,
+      "acceptance_rate": 0.5292929292929293,
+      "tokens_per_step": 7.7272727272727275,
+      "tok_per_s": 221.11941098244418
+    }
+  }
+}
