@@ -636,7 +636,7 @@ class LagunaBackend:
                 pos = torch.arange(kv_len, kv_len + qo, device=self.device)
                 sm = (pos // bs) * bs + pos % bs
                 mappings.append(sm)
-            slot_mapping = torch.tensor(mappings, dtype=torch.long, device=self.device)
+            slot_mapping = torch.cat(mappings) if len(mappings) > 1 else mappings[0]
             max_seq = max(new_kv_lens)
         elif swa_mode == "verify_ring":
             # Verify (qo>1, ring buffer active): ring block_table + ring slot_mapping

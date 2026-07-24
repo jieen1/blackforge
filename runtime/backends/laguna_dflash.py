@@ -88,6 +88,9 @@ class DFlashEngine:
 
         # CUDA Graph for main model decode (M=1)
         self._cuda_graph = None
+        self._verify_cg = None
+        self._draft_cg = None
+        self._cg_captured = False
         self._use_cuda_graph = os.environ.get("QSR_DFLASH_CUDA_GRAPH", "1") != "0"
         if self._use_cuda_graph:
             self._init_cuda_graph()
