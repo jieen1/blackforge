@@ -12,6 +12,7 @@ Roadmap ref: E3 Laguna L2 = "LagunaBackend — 过质量链"
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 import numpy as np
@@ -237,7 +238,7 @@ class LagunaBackend:
         # Chunked prefill copies the last `window` tokens from ring into
         # scratch before each chunk, then processes chunk_tokens new tokens.
         # Total scratch capacity = window + chunk_tokens.
-        self._prefill_chunk_tokens = 2048
+        self._prefill_chunk_tokens = int(os.environ.get("QSR_PREFILL_CHUNK", "4096"))
         _scratch_tokens = (self._swa_window if self._swa_window > 0 else 0) + self._prefill_chunk_tokens
         self._swa_scratch_blocks = min(
             blocks_per_slot,
@@ -960,7 +961,7 @@ class LagunaBackend:
                 f"slot {slot} is not fresh (kv_len={self.slot_kv_len[slot]})"
             )
         prompt_len = len(prompt_ids)
-        PREFILL_CHUNK = 2048  # tokens per chunk (limits peak logits to ~400 MB)
+        PREFILL_CHUNK = self._prefill_chunk_tokens
 
         if prompt_len <= PREFILL_CHUNK and self._swa_scratch:
             # Short prompt: use scratch path (single forward)

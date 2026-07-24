@@ -1,26 +1,26 @@
 {
   "moe_backend": "marlin",
-  "load_time_s": 76.40286563299742,
+  "load_time_s": 79.82341037800506,
   "64K": {
-    "dflash_tps": 48.88506368698316,
-    "dflash_itl_ms": 20.45614599999538,
-    "acceptance": 0.15411255411255412,
-    "tok_per_step": 3.311688311688312,
-    "prefill_ms": 21836.014734995842,
-    "baseline_tps": 14.914267771433503,
-    "baseline_itl_ms": 67.04988909448042,
-    "speedup": 3.277738098588833,
-    "gpu_mem_mb": 81691.6201171875
+    "dflash_tps": 44.95677798242389,
+    "dflash_itl_ms": 22.2435869490237,
+    "acceptance": 0.1475,
+    "tok_per_step": 3.1875,
+    "prefill_ms": 17070.891233997827,
+    "baseline_tps": 13.850963115983005,
+    "baseline_itl_ms": 72.19714554333574,
+    "speedup": 3.245751043156489,
+    "gpu_mem_mb": 82075.9951171875
   },
   "128K": {
-    "dflash_tps": 44.10818374721777,
-    "dflash_itl_ms": 22.671529749013466,
-    "acceptance": 0.19895833333333332,
-    "tok_per_step": 3.984375,
-    "prefill_ms": 71357.11042500043,
-    "baseline_tps": 14.975635575419684,
-    "baseline_itl_ms": 66.77512917323881,
-    "speedup": 2.9453296673174196,
-    "gpu_mem_mb": 81691.6201171875
+    "dflash_tps": 39.734218956231025,
+    "dflash_itl_ms": 25.167224278437274,
+    "acceptance": 0.17370892018779344,
+    "tok_per_step": 3.591549295774648,
+    "prefill_ms": 48443.74180900195,
+    "baseline_tps": 15.259024366240252,
+    "baseline_itl_ms": 65.5349893937154,
+    "speedup": 2.603981617864166,
+    "gpu_mem_mb": 82075.9951171875
   }
 }
