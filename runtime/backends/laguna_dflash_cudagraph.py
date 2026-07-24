@@ -78,6 +78,7 @@ class DFlashVerifyCudaGraph:
 
         # Graph state
         self._graph: torch.cuda.CUDAGraph | None = None
+        self._aux_hidden_states: list[torch.Tensor] | None = None
         self._logits: torch.Tensor | None = None
         self._captured = False
 
@@ -261,9 +262,10 @@ class DFlashVerifyCudaGraph:
                 )
 
         if isinstance(result, tuple):
-            hidden_states = result[0]
+            hidden_states, self._aux_hidden_states = result
         else:
             hidden_states = result
+            self._aux_hidden_states = None
         return backend.model.compute_logits(hidden_states)
 
     def capture(self) -> None:
@@ -311,6 +313,11 @@ class DFlashVerifyCudaGraph:
         self._run_plan()
         self._graph.replay()
         return self._logits
+
+    def replay_with_aux(self, slot: int, tokens: list[int], kv_len: int) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
+        """Replay verify graph and return (logits, aux_hidden_states)."""
+        logits = self.replay(slot, tokens, kv_len)
+        return logits, self._aux_hidden_states
 
 
 class DFlashDraftCudaGraph:

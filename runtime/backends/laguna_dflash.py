@@ -914,3 +914,227 @@ class DFlashEngine:
         }
 
         return tokens, stats
+
+    def generate_verify_only(
+        self,
+        prompt_ids: list[int],
+        max_tokens: int = 128,
+        temperature: float = 0.0,
+        eos_tokens: tuple[int, ...] = (2, 24),
+    ) -> tuple[list[int], dict[str, float]]:
+        """Generate using verify-only speculative decoding (no redundant decode).
+
+        Eliminates the M=1 decode forward by extracting bonus_token and aux
+        from the verify (M=16) forward. ~50% step latency reduction.
+
+        Returns (tokens, stats).
+        """
+        backend = self.backend
+        slot = 0
+        backend.reset_slot(slot)
+        for kv_tensor in self._draft_kv_caches.values():
+            kv_tensor.zero_()
+        torch.cuda.empty_cache()
+
+        t0 = time.perf_counter()
+
+        # Prefill with aux
+        prompt_len = len(prompt_ids)
+        first_token, aux_hidden_states = backend.prefill_with_aux(slot, prompt_ids)
+
+        # Bulk precompute draft context KV from prefill aux
+        if aux_hidden_states is not None:
+            aux_len = aux_hidden_states[0].shape[0]
+            aux_offset = prompt_len - aux_len
+            self._bulk_precompute_context_kv(slot, aux_hidden_states, aux_len, aux_offset)
+
+        del aux_hidden_states
+        torch.cuda.empty_cache()
+        t_prefill = time.perf_counter()
+
+        # Bootstrap: initial bonus = first_token, run draft to get initial 15 tokens
+        bonus_token = first_token
+        kv_len = backend.slot_kv_len[slot]  # = prompt_len
+
+        if self._draft_cg is not None:
+            draft_tokens = self._draft_cg.replay(slot, bonus_token, kv_len + 1)
+        else:
+            draft_tokens = self._draft_forward(slot, bonus_token, kv_len + 1)
+
+        tokens = [first_token]
+        total_draft = 0
+        total_accepted = 0
+        num_steps = 0
+
+        while len(tokens) < max_tokens:
+            num_steps += 1
+            total_draft += NUM_SPECULATIVE_TOKENS
+            kv_len = backend.slot_kv_len[slot]
+
+            # Step 1: Verify (M=16 full model forward) — replaces decode+verify
+            verify_tokens = [bonus_token] + draft_tokens
+            if self._verify_cg is not None:
+                verify_logits, verify_aux = self._verify_cg.replay_with_aux(
+                    slot, verify_tokens, kv_len
+                )
+            else:
+                verify_logits, verify_aux = self._forward_verify_with_aux(
+                    slot, verify_tokens, kv_len, len(verify_tokens)
+                )
+
+            # Step 2: Accept/reject
+            accepted, num_accepted = self._accept_reject(
+                verify_logits, draft_tokens, bonus_token
+            )
+            total_accepted += num_accepted
+
+            # Step 3: Extract new bonus from verify logits
+            # logits[num_accepted] predicts the position after last accepted
+            if num_accepted < len(draft_tokens):
+                new_bonus = int(verify_logits[num_accepted].argmax(dim=-1).item())
+            else:
+                # All 15 accepted: logits[15] predicts next position
+                new_bonus = int(verify_logits[NUM_SPECULATIVE_TOKENS].argmax(dim=-1).item())
+
+            # Step 4: Precompute draft context KV from verify aux at accepted positions
+            if verify_aux is not None and num_accepted > 0:
+                # aux[0:num_accepted] at positions kv_len to kv_len+num_accepted-1
+                aux_slice = [a[:num_accepted] for a in verify_aux]
+                combined_input = torch.cat(aux_slice, dim=-1)
+                combined = self.draft_model.combine_hidden_states(combined_input)
+                # Precompute at positions kv_len to kv_len+num_accepted-1
+                bs = self.block_size
+                phys = _physical_slot(slot)
+                draft_base = phys * self._draft_blocks_per_slot
+                ring_slots = self._draft_blocks_per_slot * bs
+                context_positions = torch.arange(
+                    kv_len, kv_len + num_accepted,
+                    dtype=torch.long, device=self.device
+                )
+                slot_mappings = torch.zeros(num_accepted, dtype=torch.long, device=self.device)
+                for i in range(num_accepted):
+                    pos = kv_len + i
+                    ring_block = (pos % ring_slots) // bs
+                    ring_off = pos % bs
+                    slot_mappings[i] = (draft_base + ring_block) * bs + ring_off
+                self.draft_model.precompute_and_store_context_kv(
+                    combined, context_positions, slot_mappings
+                )
+
+            # Step 5: Update state
+            new_tokens = accepted[1:]  # skip anchor (already committed)
+            backend.slot_kv_len[slot] += 1 + num_accepted  # anchor + accepted drafts
+            for tok in new_tokens:
+                backend.slot_committed_tokens[slot].append(tok)
+            tokens.extend(new_tokens)
+
+            # Check EOS
+            found_eos = False
+            for tok in new_tokens:
+                if tok in eos_tokens:
+                    idx = len(tokens) - len(new_tokens) + new_tokens.index(tok)
+                    tokens = tokens[:idx + 1]
+                    found_eos = True
+                    break
+            if found_eos:
+                break
+
+            # Step 6: Draft next 15 tokens
+            bonus_token = new_bonus
+            new_kv_len = backend.slot_kv_len[slot]
+            if self._draft_cg is not None:
+                draft_tokens = self._draft_cg.replay(slot, bonus_token, new_kv_len + 1)
+            else:
+                draft_tokens = self._draft_forward(slot, bonus_token, new_kv_len + 1)
+
+        t_total = time.perf_counter()
+        backend.reset_slot(slot)
+
+        if self._use_cuda_graph and not self._cg_captured:
+            self._lazy_capture_cg()
+
+        tokens = tokens[:max_tokens]
+        stats = {
+            "prefill_ms": (t_prefill - t0) * 1000,
+            "decode_ms": (t_total - t_prefill) * 1000,
+            "total_ms": (t_total - t0) * 1000,
+            "num_tokens": len(tokens),
+            "num_steps": num_steps,
+            "acceptance_rate": total_accepted / max(total_draft, 1),
+            "tokens_per_step": (len(tokens) - 1) / max(num_steps, 1),
+            "tok_per_s": (len(tokens) - 1) / max(t_total - t_prefill, 1e-6),
+        }
+        return tokens, stats
+
+    def _forward_verify_with_aux(
+        self,
+        slot: int,
+        tokens: list[int],
+        kv_len: int,
+        num_tokens: int,
+    ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
+        """Eager verify forward that returns (logits, aux_hidden_states)."""
+        backend = self.backend
+        input_ids = torch.tensor(tokens, dtype=torch.long, device=self.device)
+        positions = torch.arange(kv_len, kv_len + num_tokens, dtype=torch.long, device=self.device)
+
+        # Build metadata (reuse existing _forward_verify logic)
+        from runtime.compat_vllm import get_common_attn_metadata_cls, set_current_vllm_config
+        CommonAttentionMetadata = get_common_attn_metadata_cls()
+
+        phys = _physical_slot(slot)
+        new_kv_len = kv_len + num_tokens
+        bs = backend.block_size
+        n_blocks_full = (new_kv_len + bs - 1) // bs
+        full_base = phys * backend.blocks_per_slot
+
+        full_bt = torch.zeros(1, n_blocks_full, dtype=torch.int32, device=self.device)
+        full_bt[0, :n_blocks_full] = torch.arange(
+            full_base, full_base + n_blocks_full, dtype=torch.int32, device=self.device
+        )
+        full_sm = torch.zeros(num_tokens, dtype=torch.long, device=self.device)
+        for j in range(num_tokens):
+            pos = kv_len + j
+            full_sm[j] = (full_base + pos // bs) * bs + pos % bs
+
+        qsl = torch.tensor([0, num_tokens], dtype=torch.int32, device=self.device)
+        qsl_cpu = torch.tensor([0, num_tokens], dtype=torch.int32)
+        seq_lens = torch.tensor([new_kv_len], dtype=torch.int32, device=self.device)
+
+        full_meta = CommonAttentionMetadata(
+            query_start_loc=qsl, query_start_loc_cpu=qsl_cpu,
+            seq_lens=seq_lens, num_reqs=1, num_actual_tokens=num_tokens,
+            max_query_len=num_tokens, max_seq_len=new_kv_len,
+            block_table_tensor=full_bt, slot_mapping=full_sm, causal=True,
+        )
+
+        # SWA ring metadata
+        swa_meta = None
+        if backend._ring_blocks_per_slot > 0:
+            swa_meta = backend._build_swa_attn_metadata(
+                [slot], [kv_len], [num_tokens], False, swa_mode="verify_ring"
+            )
+
+        attn_metadata_dict = {}
+        slot_mapping_dict = {}
+        for group_key, builder in backend._metadata_builders.items():
+            wl = group_key[0]
+            is_swa = wl >= 0
+            meta = swa_meta if (is_swa and swa_meta is not None) else full_meta
+            with set_current_vllm_config(backend.vllm_config):
+                metadata = builder.build(common_prefix_len=0, common_attn_metadata=meta)
+            for name in backend._layer_groups[group_key]:
+                attn_metadata_dict[name] = metadata
+                slot_mapping_dict[name] = full_sm if not is_swa else swa_meta.slot_mapping
+
+        from runtime.compat_vllm import set_forward_context
+        with set_current_vllm_config(backend.vllm_config):
+            with set_forward_context(attn_metadata_dict, backend.vllm_config, slot_mapping=slot_mapping_dict):
+                result = backend.model.forward(input_ids, positions)
+
+        if isinstance(result, tuple):
+            hidden_states, aux = result
+        else:
+            hidden_states, aux = result, None
+        logits = backend.model.compute_logits(hidden_states)
+        return logits, aux
