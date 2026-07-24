@@ -259,3 +259,51 @@ class SparkinferMoEModel:
         if layer_idx not in self.layers:
             self.load_layer(layer_idx)
         return self.layers[layer_idx].forward(hidden, topk_ids, topk_weights)
+
+
+def prepare_sparkinfer_layer_from_vllm(
+    w13_weight: torch.Tensor,
+    w13_weight_scale: torch.Tensor,
+    w13_weight_scale_2: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w2_weight_scale: torch.Tensor,
+    w2_weight_scale_2: torch.Tensor,
+    w13_input_scale: torch.Tensor,
+    w2_input_scale: torch.Tensor,
+    device: str | torch.device = "cuda",
+):
+    """Prepare sparkinfer weights from vLLM's already-loaded expert tensors.
+
+    vLLM's CUTLASS reformat stores:
+      w13_weight_scale_2 = (1/checkpoint_global_scale) * input_scale
+    sparkinfer computes runtime_alpha = w_global_scale / a_gscale,
+    so passing ws2 as w_global_scale and input_scale as a_gscale
+    yields runtime_alpha = 1/checkpoint_global_scale (correct dequant).
+
+    Block scales are used as-is (no folding).
+    """
+    num_experts = w13_weight.shape[0]
+
+    # vLLM's block scales are already in sparkinfer-compatible format;
+    # applying swizzle_block_scale would double-swizzle and corrupt them.
+    w13_sf = w13_weight_scale.clone().contiguous()
+    w2_sf = w2_weight_scale.clone().contiguous()
+
+    wplan = plan_sparkinfer_fp4_moe_weights(
+        quant_modes="nvfp4", source_format="modelopt_nvfp4",
+        activation="silu", params_dtype=torch.bfloat16,
+        num_experts=num_experts, hidden_size=HIDDEN_SIZE,
+        intermediate_size=INTERMEDIATE_SIZE, w13_layout="w13",
+    )
+    return prepare_sparkinfer_fp4_moe_weights(
+        plan=wplan,
+        w1_global_scale=w13_weight_scale_2.float().clone().contiguous(),
+        w2_global_scale=w2_weight_scale_2.float().clone().contiguous(),
+        w1_fp4=w13_weight.clone().contiguous(),
+        w1_blockscale=w13_sf,
+        w2_fp4=w2_weight.clone().contiguous(),
+        w2_blockscale=w2_sf,
+        a1_gscale=w13_input_scale.float().clone().contiguous(),
+        a2_gscale=w2_input_scale.float().clone().contiguous(),
+        params_dtype=torch.bfloat16,
+    )
