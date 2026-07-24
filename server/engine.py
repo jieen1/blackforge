@@ -19,10 +19,11 @@ Architecture (vLLM V1 / SGLang inspired, optimized for maximum throughput):
 
 from __future__ import annotations
 
+import os
+
 import asyncio
 import collections
 import logging
-import os
 import sys
 import threading
 import time
@@ -399,6 +400,7 @@ class ServerEngine:
             dtype="bfloat16",
             disable_log_stats=True,
             async_scheduling=False,
+            moe_backend=os.environ.get("QSR_MOE_BACKEND", "marlin"),
         )
         vllm_config = args.create_engine_config()
         self._prefill_chunk_size = 512  # unused: Laguna prefill is one-shot (see LagunaBackend)
